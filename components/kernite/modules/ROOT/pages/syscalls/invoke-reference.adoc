@@ -1,0 +1,166 @@
+= Capability Invocations
+:description: Complete reference of invoke labels organized by object type — verified against lib/trona/uapi/consts/kernel.rs
+
+Syscall 9 (`Invoke`) dispatches to object-type-specific operations based on the `label` field of the message info word.
+The caller provides a capability address in argument 1; the kernel resolves the capability, checks rights, and dispatches to the handler identified by the label.
+
+NOTE: All invoke label values in this page are verified against `lib/trona/uapi/consts/kernel.rs`.
+
+== CNode Operations (0x10-0x18)
+
+[cols="1,2,4"]
+|===
+| Label | Name | Description
+
+| `0x10` | `CNODE_COPY` | Copy a capability from source to destination with reduced rights.  Requires `GRANT` on source.
+| `0x11` | `CNODE_MINT` | Create a badged copy of an endpoint/notification capability.  Destination cannot have `GRANT`.
+| `0x12` | `CNODE_MOVE` | Transfer a `CapRef` from source to destination.  Source becomes null.  No refcount change.
+| `0x13` | `CNODE_MUTATE` | Move an endpoint capability and overwrite its badge.
+| `0x14` | `CNODE_DELETE` | Delete a single capability slot.  Fails if the slot has CDT children.
+| `0x15` | `CNODE_REVOKE` | Recursively delete all CDT descendants, then delete the target slot.
+| `0x16` | `CNODE_SAVE_CALLER` | Save the reply capability from the current thread's `reply_tcb` into a CNode slot.
+| `0x17` | `CNODE_SET_GUARD` | Set guard bits and guard value on a CNode (for multi-level CSpace configuration).
+| `0x18` | `CNODE_GET_INFO` | Return type, rights, badge, depth, and child count for a capability.
+|===
+
+== Untyped Operations (0x20)
+
+[cols="1,2,4"]
+|===
+| Label | Name | Description
+
+| `0x20` | `UNTYPED_RETYPE`
+| Carve typed kernel objects from untyped memory.  Arguments: object type, size_bits, destination CNode, destination offset, count.
+|===
+
+Retype constraints:
+
+* Device untyped can only produce `Frame` or `Untyped`.
+* All destination slots must be empty.
+* Alignment is type-specific (CNode: `align_of::<CNode>()`, VSpace: `PAGE_SIZE`, others: object size).
+* `Frame` minimum size is 4 KiB even if smaller bits are requested.
+
+== SchedContext Operations (0x30-0x31)
+
+[cols="1,2,4"]
+|===
+| Label | Name | Description
+
+| `0x30` | `SC_CONFIGURE` | Set budget, period, and deadline on a SchedContext.
+| `0x31` | `SC_BIND` | Bind a SchedContext to a TCB.
+|===
+
+== TCB Operations (0x40-0x4F)
+
+[cols="1,2,4"]
+|===
+| Label | Name | Description
+
+| `0x40` | `TCB_CONFIGURE` | Set VSpace root, CSpace root, IPC buffer address, and fault endpoint.
+| `0x41` | `TCB_RESUME` | Transition thread from Inactive to Ready.
+| `0x42` | `TCB_SUSPEND` | Transition thread to Inactive.
+| `0x43` | `TCB_SET_SPACE` | Set CSpace root and VSpace root separately (without full configure).
+| `0x46` | `TCB_WRITE_REGISTERS` | Write saved register state (instruction pointer, stack pointer, arguments).
+| `0x48` | `TCB_SET_IPC_BUFFER` | Set IPC buffer virtual address.
+| `0x49` | `TCB_BIND_NOTIFICATION` | Bind a notification for combined endpoint+notification wait.
+| `0x4B` | `TCB_SET_FAULT_HANDLER` | Set fault handler endpoint.
+| `0x4C` | `TCB_COPY_FPU` | Copy FPU/SIMD state from another TCB.
+| `0x4D` | `TCB_SET_TLS_BASE` | Set TLS base register (`FS` on x86_64, `TPIDR_EL0` on aarch64).
+| `0x4E` | `TCB_SET_NOTIFICATION_DISPATCHER` | Set notification dispatcher entry point for Call interruption.
+| `0x4F` | `TCB_GET_SPACE_INFO` | Return VSpace, CSpace, and IPC buffer configuration.
+|===
+
+NOTE: Labels 0x44, 0x45, 0x47, 0x4A are not assigned.  The numbering is sparse.
+
+== VSpace Operations (0x50-0x5F)
+
+[cols="1,2,4"]
+|===
+| Label | Name | Description
+
+| `0x50` | `VSPACE_MAP` | Map a frame capability into a VSpace at a given virtual address.
+| `0x51` | `VSPACE_UNMAP` | Unmap a page from a VSpace.
+| `0x52` | `VSPACE_MAP_PT` | Map a page table page into a VSpace.
+| `0x53` | `VSPACE_WALK` | Walk page tables and return physical addresses for a VA range.
+| `0x54` | `VSPACE_COPY_PAGE` | Copy a page from one VSpace mapping to another.
+| `0x55` | `VSPACE_MAP_DEVICE` | Map device memory (uncached) into a VSpace.
+| `0x56` | `VSPACE_CLONE_COW_PAGE` | Clone a single page with COW semantics.
+| `0x57` | `VSPACE_MAP_DEVICE_RANGE` | Map a contiguous range of device pages.
+| `0x58` | `VSPACE_PROTECT` | Change page permissions on an existing mapping.
+| `0x59` | `VSPACE_MAP_DEMAND` | Install a demand-page marker (PRESENT=0, DEMAND=1) for a single page.
+| `0x5A` | `VSPACE_MAP_DEMAND_RANGE` | Install demand-page markers for a range.
+| `0x5B` | `VSPACE_COW_RESOLVE` | Manually resolve a COW page (force copy).
+| `0x5C` | `VSPACE_SET_COW_POOL` | Set the COW frame pool for a VSpace.
+| `0x5D` | `VSPACE_SET_COW_NOTIF` | Set notification for COW pool depletion.
+| `0x5E` | `VSPACE_REPLENISH_COW_POOL` | Add frames to the COW pool.
+| `0x5F` | `VSPACE_PROTECT_RANGE` | Change permissions on a range of pages.
+|===
+
+== VSpace MemoryObject Mapping (0x97-0x9A)
+
+[cols="1,2,4"]
+|===
+| Label | Name | Description
+
+| `0x97` | `VSPACE_MAP_MO` | Map a MemoryObject page range into a VSpace.  Adds reverse map entry on the MO.
+| `0x98` | `VSPACE_UNMAP_MO` | Unmap a MemoryObject range.  Removes reverse map entry.
+| `0x99` | `VSPACE_SHARE_RO_PAGE` | Share a single read-only page between MemoryObjects.
+| `0x9A` | `VSPACE_FORK_RANGE` | Bulk COW fork: clone MO ranges and remap for fork.
+|===
+
+NOTE: Label `0x97` is shared between `MO_HAS_PAGE` (MemoryObject context) and `VSPACE_MAP_MO` (VSpace context).  The kernel dispatches based on the invoked capability's object type.
+
+== IRQ Operations (0x60-0x64)
+
+[cols="1,2,4"]
+|===
+| Label | Name | Description
+
+| `0x60` | `IRQ_CONTROL_GET` | Create a new IRQ handler for a given IRQ number.  Requires the IRQ control capability.
+| `0x61` | `IRQ_HANDLER_ACK` | Acknowledge an interrupt, re-enabling delivery for this handler.
+| `0x62` | `IRQ_HANDLER_SET_NOTIFICATION` | Bind a notification to an IRQ handler.  Signals arrive on the notification when the IRQ fires.
+| `0x63` | `IRQ_HANDLER_CLEAR` | Unbind the notification from this handler.
+| `0x64` | `DEVICE_UNTYPED_CREATE` | Create a device untyped capability for an MMIO region.
+|===
+
+== IoPort Operations (0x70-0x77)
+
+[cols="1,2,4"]
+|===
+| Label | Name | Description
+
+| `0x70` | `IOPORT_IN8` | Read 8-bit value from I/O port.
+| `0x71` | `IOPORT_OUT8` | Write 8-bit value to I/O port.
+| `0x72` | `IOPORT_IN16` | Read 16-bit value from I/O port.
+| `0x73` | `IOPORT_OUT16` | Write 16-bit value to I/O port.
+| `0x74` | `IOPORT_IN32` | Read 32-bit value from I/O port.
+| `0x75` | `IOPORT_OUT32` | Write 32-bit value to I/O port.
+| `0x76` | `IOPORT_CONFIGURE` | Configure I/O port range.
+| `0x77` | `IOPORT_CREATE` | Create a new IoPort capability for a given port range.
+|===
+
+NOTE: On aarch64, I/O port operations are emulated via MMIO-mapped PCI I/O windows.
+
+== MemoryObject Operations (0x90-0x97)
+
+[cols="1,2,4"]
+|===
+| Label | Name | Description
+
+| `0x90` | `MO_COMMIT` | Allocate physical pages for a range of page indices.  Dual-source: untyped (primary), PMM (fallback).
+| `0x91` | `MO_DECOMMIT` | Release physical pages for a range.  Unmaps from all VSpaces via reverse map.
+| `0x92` | `MO_GET_SIZE` | Return the MO's page count.
+| `0x93` | `MO_CLONE` | Create a copy-on-write child MO.
+| `0x94` | `MO_RESIZE` | Grow or shrink the MO page count.
+| `0x95` | `MO_READ` | Read data from MO pages (kernel-mediated read).
+| `0x96` | `MO_WRITE` | Write data to MO pages (kernel-mediated write).
+| `0x97` | `MO_HAS_PAGE` | Check whether a page is committed at a given index.
+|===
+
+== Related Pages
+
+* xref:syscalls/syscall-reference.adoc[Syscall ABI] -- calling convention and dispatch flow
+* xref:../concepts/capabilities.adoc[Capabilities] -- rights checking and address resolution
+* xref:../concepts/cspace.adoc[CSpace] -- CNode operations and initial CSpace layout
+* xref:../memory/memory-objects.adoc[Memory Objects] -- MO commit/decommit/clone semantics
+* xref:../scheduling/threads.adoc[Threads] -- TCB operations and SchedContext binding

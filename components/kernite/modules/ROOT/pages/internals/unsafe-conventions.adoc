@@ -1,0 +1,208 @@
+= Unsafe Code Conventions
+:description: SAFETY comment format, unsafe fn documentation, Rust 2024 edition rules, FFI patterns, and repr(C) requirements
+
+Kernite is written in Rust 2024 edition with `#![no_std]` and no `alloc` crate.
+Unsafe code is unavoidable in a kernel (hardware access, raw pointer manipulation, inline assembly), but every unsafe operation follows strict documentation conventions.
+
+== SAFETY Comments
+
+Every `unsafe {}` block must carry a `// SAFETY:` comment immediately above or inside the block explaining the invariant that makes the operation sound:
+
+[source,rust]
+----
+// SAFETY: COM1 is a standard x86 serial port; outb to 0x3F8 is
+// always valid in ring 0.
+unsafe {
+    arch::outb(SERIAL_PORT, c);
+}
+----
+
+The comment answers: "Why is this not undefined behavior?"
+It must cite the specific invariant, not restate the operation:
+
+[cols="1,1"]
+|===
+| Bad | Good
+
+| `// SAFETY: this is safe`
+| `// SAFETY: slot index is validated by caller (cap system invariant)`
+
+| `// SAFETY: we need to do this`
+| `// SAFETY: pointer is non-null (checked above) and aligned (repr(C) struct)`
+
+| `// SAFETY: see above`
+| `// SAFETY: single-threaded boot — no concurrent access possible`
+|===
+
+== Unsafe Functions
+
+Every `unsafe fn` must carry a `# Safety` documentation section listing caller obligations:
+
+[source,rust]
+----
+/// Release object (called by delete_capability)
+///
+/// Decrements reference count and destroys object if it reaches zero.
+///
+/// # Safety
+/// `obj` must be a valid pointer to a KernelObject.
+pub unsafe fn release_object(obj: *mut KernelObject, obj_type: ObjectType) {
+    // ...
+}
+----
+
+The `# Safety` section answers: "What must the caller guarantee for this call to be sound?"
+
+== Rust 2024 Edition Rules
+
+Kernite uses `--edition=2024`.  Three rules affect unsafe code:
+
+=== `unsafe_op_in_unsafe_fn`
+
+Every unsafe operation inside an `unsafe fn` requires an explicit `unsafe {}` block.
+The function signature alone does not permit unsafe operations:
+
+[source,rust]
+----
+// Correct (Rust 2024):
+pub unsafe fn init_slots(num_slots: usize) {
+    unsafe {
+        core::ptr::write_bytes(bitmap_virt, 0, bitmap_words);
+    }
+}
+
+// Wrong (compiles in Rust 2021, warning in 2024):
+pub unsafe fn init_slots(num_slots: usize) {
+    core::ptr::write_bytes(bitmap_virt, 0, bitmap_words); // no unsafe block
+}
+----
+
+=== No `static mut` References
+
+Taking `&` or `&mut` of a `static mut` is disallowed.
+Use `core::ptr::addr_of!` / `addr_of_mut!` for raw pointer access:
+
+[source,rust]
+----
+// Correct:
+static mut SLOT_STATE: SlotArrayState = SlotArrayState { ... };
+
+unsafe {
+    let state = &mut *(&raw mut SLOT_STATE);
+    state.num_slots = num_slots;
+}
+
+// Wrong:
+unsafe {
+    SLOT_STATE.num_slots = num_slots;  // implicit &mut of static mut
+}
+----
+
+=== `unsafe extern` Blocks
+
+Items declared in `extern` blocks require explicit `unsafe` or `safe` annotation:
+
+[source,rust]
+----
+unsafe extern "C" {
+    static _text_start: u8;    // accessing requires unsafe
+    safe fn memset(...);        // marked safe, no unsafe needed to call
+}
+----
+
+== `#[repr(C)]` Requirements
+
+All structures that cross boundaries must use `#[repr(C)]`:
+
+FFI boundaries::
+Any struct passed to or from C code or assembly.
+
+Assembly interop::
+Register save areas, context switch frames, IPC buffers.
+
+Hardware-defined layouts::
+Page table entries, GDT/IDT entries, APIC registers.
+
+Pointer casts::
+Any struct where `*mut Specific` is cast to `*mut KernelObject` (the `KernelObject` header must be the first field).
+
+[source,rust]
+----
+#[repr(C)]
+pub struct Endpoint {
+    pub header: KernelObject,  // MUST be first for refcount via pointer cast
+    // ...
+}
+
+// Safe because header is at offset 0:
+let obj = endpoint_ptr as *mut KernelObject;
+unsafe { (*obj).ref_count.fetch_sub(1, AcqRel) };
+----
+
+== `#[unsafe(no_mangle)]`
+
+Functions called from assembly use `#[unsafe(no_mangle)]` (Rust 2024 syntax):
+
+[source,rust]
+----
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fastpath_call_rust(
+    cap_ptr: u64, msg_info: u64,
+    mr0: u64, mr1: u64, mr2: u64, mr3: u64,
+) -> FastpathResult {
+    // ...
+}
+----
+
+The `unsafe` in `#[unsafe(no_mangle)]` acknowledges that the attribute has safety implications (symbol name collisions, ABI requirements).
+
+== Atomic Ordering Conventions
+
+[cols="1,3"]
+|===
+| Pattern | Ordering
+
+| Reference count increment/decrement | `AcqRel` — ensures destruction observes all prior writes.
+| Reference count read | `Acquire` — synchronized with the last `AcqRel` modification.
+| Spinlock acquire | `Acquire` (via `compare_exchange`).
+| Spinlock release | `Release` (via `store`).
+| Notification bits | `SeqCst` — strongest ordering for cross-thread signal visibility.
+| `NEXT_WAKEUP_NS` cache | `Release` on write, `Acquire` on read — publish/consume pattern.
+|===
+
+== Common Unsafe Patterns
+
+=== Pointer-to-Reference Conversion
+
+[source,rust]
+----
+// SAFETY: obj is validated non-null above, and kernel objects are
+// never freed (untyped lifetime), so the pointer remains valid.
+let endpoint = unsafe { &mut *(obj as *mut Endpoint) };
+----
+
+=== Per-CPU State Access
+
+[source,rust]
+----
+// SAFETY: current_cpu() returns a valid CPU index (< MAX_CPUS),
+// and IRQs are disabled so no preemption can change the CPU.
+let cpu = crate::arch::current_cpu() as usize;
+unsafe { *(&raw mut EP_IRQ_FLAGS[cpu]) = irq; }
+----
+
+=== Inline Assembly (x86_64)
+
+[source,rust]
+----
+// SAFETY: reading CR2 is always valid in ring 0 after a page fault.
+let fault_addr: u64;
+unsafe {
+    core::arch::asm!("mov {}, cr2", out(reg) fault_addr, options(nomem, nostack));
+}
+----
+
+== Related Pages
+
+* xref:../architecture.adoc[Architecture] -- safety model overview
+* xref:internals/lock-ordering.adoc[Lock Ordering] -- IRQ save/restore and lock hierarchy

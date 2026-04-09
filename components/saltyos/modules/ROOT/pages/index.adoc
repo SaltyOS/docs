@@ -1,10 +1,134 @@
 = SaltyOS
+:description: A capability-based microkernel operating system — overview, component map, and entry points for learners and developers
 
-This component is the placeholder for system-wide SaltyOS documentation.
+SaltyOS is an operating system built on a capability-based microkernel.
+All resource access is mediated through unforgeable capability tokens.
+The kernel provides only scheduling, IPC, memory management, and capabilities -- everything else runs in user space.
 
-Planned scope:
+== Components
 
-* onboarding and build flow
-* boot and runtime flow
-* architecture and design overviews
-* integration notes and runbooks
+SaltyOS is documented across four components:
+
+[cols="1,3"]
+|===
+| Component | Scope
+
+| *xref:saltyos::index.adoc[SaltyOS]* (this component)
+| System-wide documentation: learning guides, build instructions, architecture overview.
+
+| *xref:kernite::index.adoc[kernite]*
+| The microkernel: capability system, IPC, memory management, scheduling, syscalls, architecture backends.
+
+| *xref:trona::index.adoc[trona]*
+| System library: kernel ABI wrappers, POSIX compatibility, ELF/PE loaders, Win32 shim.
+
+| *xref:basalt::index.adoc[basalt]*
+| C/C++ standard library: libc.so (basaltc), optional libc++.
+|===
+
+== New to OS Development?
+
+Start with the *Learning Guides*.
+They explain operating system concepts from scratch, using SaltyOS as a concrete example.
+No prior kernel experience required -- just programming knowledge.
+
+. xref:guides/what-is-microkernel.adoc[What Is a Microkernel?] -- monolithic vs micro, trust boundaries, where SaltyOS fits.
+. xref:guides/capabilities-101.adoc[Capabilities 101] -- capability-based access control explained with analogies.
+. xref:guides/ipc-explained.adoc[IPC Explained] -- how processes communicate in a microkernel.
+. xref:guides/memory-explained.adoc[Memory Explained] -- physical memory, virtual memory, page tables, and the four-tier model.
+. xref:guides/threads-and-scheduling.adoc[Threads and Scheduling] -- CPU sharing, EDF, budget enforcement.
+. xref:guides/building-and-running.adoc[Building and Running] -- custom toolchain, bootstrap, QEMU, UTM.
+
+After the learning guides, continue with the kernel reference:
+
+* xref:kernite::guides/syscall-walkthrough.adoc[Syscall Walkthrough] -- follow a syscall through the kernel step by step.
+* xref:kernite::guides/first-contribution.adoc[First Contribution] -- make your first kernel change.
+
+== System Architecture
+
+----
+┌─────────────────────────────────────────────────────────┐
+│                    Applications                          │
+│   bash · nano · python · test_runner · hello_pe          │
+├──────────────────────────┬──────────────────────────────┤
+│   POSIX Personality      │   Win32 Personality          │
+│   posix_ttysrv           │   win32_csrss                │
+│   posix_getty             │   kernel32.dll shim          │
+├──────────────────────────┴──────────────────────────────┤
+│                  System Servers                          │
+│   init · objsrv · procmgr · vfs · mmsrv · namesrv       │
+│   netsrv · dnssrv · pcidrv · blkdrv · netdrv · dispdrv  │
+├─────────────────────────────────────────────────────────┤
+│         Libraries: trona (Rust) · basalt (C/C++)         │
+│         Runtime linkers: ld-trona.so · ld-trona-pe.so    │
+├─────────────────────────────────────────────────────────┤
+│                    kernite                               │
+│   cap/ · ipc/ · mm/ · sched/ · syscall/ · arch/         │
+├─────────────────────────────────────────────────────────┤
+│              Hardware (x86_64 / aarch64)                 │
+└─────────────────────────────────────────────────────────┘
+----
+
+=== Kernel (kernite)
+
+The kernel is ~27,000 lines of Rust (`#![no_std]`, no `alloc`).
+It provides four services:
+
+* *xref:kernite::concepts/capabilities.adoc[Capabilities]* -- unforgeable tokens that mediate all resource access.
+* *xref:kernite::ipc/endpoints.adoc[IPC]* -- synchronous endpoints and asynchronous notifications.
+* *xref:kernite::memory/pmm.adoc[Memory]* -- four-tier model: PMM / Untyped / MemoryObject / VSpace.
+* *xref:kernite::scheduling/scheduler.adoc[Scheduling]* -- EDF with budget enforcement and priority inheritance.
+
+=== System Servers
+
+All OS services run as unprivileged user-space programs:
+
+[cols="1,3"]
+|===
+| Server | Role
+
+| `init` | Service-based multi-phase bootstrap.  Reads `.service` files from the initrd.
+| `objsrv` | Object authority server: allocates kernel objects (TCB, SchedContext, CNode, etc.) from untyped memory, manages CSpace expansion for child processes.  Starts before `procmgr`.
+| `mmsrv` | Memory manager: MO lifecycle, demand paging, VSpace mapping.
+| `procmgr` | Process manager: spawn, fork, exec, exit, waitpid, signal delivery.
+| `namesrv` | Name service: endpoint discovery for servers.
+| `vfs` | Virtual filesystem: ramfs, devfs, pipes, sockets, shm, procfs, poll.
+| `console` | Serial console I/O via IoPort capabilities.
+| `netsrv` | TCP/UDP/ICMP network stack (smoltcp).
+| `dnssrv` | Caching DNS resolver.
+| `pcidrv` | PCI enumeration (I/O port + ECAM).
+| `blkdrv` | Block device driver (virtio-blk).
+| `netdrv` | Network device driver (virtio-net).
+| `dispdrv` | Framebuffer display driver.
+| `saltyfs` | SaltyFS filesystem server (COW, B-tree, snapshots).
+|===
+
+=== Multi-Personality
+
+SaltyOS runs POSIX and Win32 applications side by side:
+
+* *POSIX*: `posix_ttysrv` (PTY/line discipline), `posix_getty` (login prompt).  Full signal, socket, pipe, mmap support.
+* *Win32*: `win32_csrss` (console subsystem + import resolver), PE/COFF loader, kernel32.dll shim.
+
+=== Libraries
+
+* *trona* (Rust): 5-crate system library -- substrate (kernel ABI), posix (POSIX API), loader (ELF/PE), uapi (constants/protocols), win32 (Win32 shim).
+* *basalt* (C/C++): `libc.so` (40 Rust modules implementing POSIX stdio, stdlib, string, etc.), optional `libc++.so`.
+
+=== Custom Toolchain
+
+SaltyOS builds a patched LLVM/Clang/LLD and Rust compiler that target `x86_64-unknown-saltyos` and `aarch64-unknown-saltyos`.
+See xref:guides/building-and-running.adoc[Building and Running] for setup instructions.
+
+== Quick Start
+
+[source,bash]
+----
+git clone --recursive https://github.com/SaltyOS/saltyos.git
+cd saltyos
+just bootstrap        # Build toolchain + OS (~2 hours from scratch)
+just run              # Boot in QEMU
+just run --utm        # Boot in UTM (macOS)
+----
+
+See xref:guides/building-and-running.adoc[Building and Running] for detailed instructions, prerequisites, and troubleshooting.

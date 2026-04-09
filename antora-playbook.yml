@@ -5,17 +5,20 @@ site:
 content:
   sources:
     - url: https://github.com/SaltyOS/docs.git
-      branches: main
+      branches: vNext
       start_path: portal
     - url: https://github.com/SaltyOS/docs.git
-      branches: main
+      branches: vNext
       start_path: components/saltyos
     - url: https://github.com/SaltyOS/docs.git
-      branches: main
+      branches: vNext
       start_path: components/trona
     - url: https://github.com/SaltyOS/docs.git
-      branches: main
+      branches: vNext
       start_path: components/basalt
+    - url: https://github.com/SaltyOS/docs.git
+      branches: vNext
+      start_path: components/kernite
 
 antora:
   extensions:

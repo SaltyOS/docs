@@ -1,0 +1,300 @@
+= CSpace
+:description: Global capability slot array, CNode structure, and multi-level address resolution
+
+A thread's _CSpace_ (capability space) is the namespace through which it addresses capabilities.
+A CSpace is a tree of CNodes rooted at the thread's CSpace root capability (slot 2 in the initial CSpace layout).
+The kernel resolves capability addresses by walking this tree using a guard-and-radix scheme inherited from seL4.
+
+[[global-slot-array]]
+== Global Slot Array
+
+All live capabilities are stored in a single, boot-time allocated array of `CapSlotStorage` entries.
+CNodes do not embed capability payloads; they store `CapRef` indices into this global array.
+
+=== Sizing
+
+`cap::init()` allocates the array during boot based on available physical memory:
+
+----
+num_slots = clamp(free_frames / 4, 768, 131_072)
+----
+
+The floor of 768 covers the standard 6-service boot with test forks.
+Above approximately 3,000 frames the linear term dominates.
+
+The array is allocated as contiguous physical frames mapped through the direct physical map.
+A companion bitmap tracks which slots are free.
+
+=== Slot Storage
+
+Each entry in the array stores both the capability payload and its metadata:
+
+[source,rust]
+----
+#[repr(C)]
+pub struct CapSlotStorage {
+    pub cap: Capability,       // 32 bytes
+    pub meta: CapSlotMeta,     // CDT + untyped tracking + state
+}
+----
+
+[source,rust]
+----
+#[repr(C)]
+pub struct CapSlotMeta {
+    pub cdt_parent: CapSlot,      // CDT parent slot
+    pub cdt_first_child: CapSlot, // CDT first child
+    pub cdt_next: CapSlot,        // CDT next sibling
+    pub cdt_prev: CapSlot,        // CDT previous sibling
+    pub ut_first_child: CapSlot,  // Untyped child list head
+    pub ut_next: CapSlot,         // Untyped child list next
+    pub ut_parent: CapSlot,       // Parent untyped slot
+    pub state: SlotState,         // Free | Occupied
+}
+----
+
+`CapSlot` is `u32`.  `INVALID_SLOT = 0xFFFF_FFFF` serves as the null marker.
+
+The metadata carries two independent linked-list structures:
+
+CDT links (`cdt_parent`, `cdt_first_child`, `cdt_next`, `cdt_prev`)::
+Track the xref:concepts/capabilities.adoc#derivation[Capability Derivation Tree].
+
+Untyped links (`ut_first_child`, `ut_next`, `ut_parent`)::
+Track which objects were retyped from which untyped memory.
+
+These structures are related but distinct.
+A retyped object has both a CDT parent (the source untyped capability that was invoked) and an untyped parent (the untyped memory region that physically backs it).
+
+=== Slot Allocation
+
+The allocator uses a bitmap with a `NEXT_SLOT` cursor for first-fit-with-wrap allocation.
+`alloc_slot()` returns `None` when all slots are exhausted.
+Slot pressure is a system-wide resource, not per-process.
+
+== CNode Structure
+
+A CNode is a kernel object that stores an array of `CapRef` entries.
+Each `CapRef` is a 4-byte index into the global slot array.
+
+=== Memory Layout
+
+[source,rust]
+----
+#[repr(C)]
+pub struct CNode {
+    pub header: KernelObject,  // 12 bytes (size_bits = log2 of slot count)
+    pub guard_bits: u8,        //  1 byte
+    _pad: [u8; 3],             //  3 bytes
+    pub guard: u64,            //  8 bytes
+    // CapRef[2^size_bits] follows contiguously in memory
+}
+----
+
+The `CapRef` array begins immediately after the `guard` field and is accessed via pointer arithmetic.
+
+=== Size Constraints
+
+[cols="1h,3"]
+|===
+| `size_bits = 0` | Default to 10 (1,024 slots)
+| `size_bits 1-3` | Rejected (`InvalidArgument`)
+| `size_bits 4-16` | Accepted as-is (16 to 65,536 slots)
+| `size_bits > 16` | Rejected (`InvalidArgument`)
+|===
+
+`CNode::init_at()` writes the header, sets `guard_bits = 0` and `guard = 0` (flat mode), and fills every slot with `CapRef::null()` (`INVALID_SLOT`).
+
+=== CapRef
+
+[source,rust]
+----
+#[repr(C)]
+pub struct CapRef {
+    pub slot: u32,  // index into global slot array
+}
+----
+
+A null `CapRef` has `slot = INVALID_SLOT = 0xFFFF_FFFF`.
+
+Because CNodes store references rather than embedded payloads:
+
+* Multiple CNodes can point to the same global slot via the same `CapRef`.
+* Move operations transfer CSpace visibility without copying capability state.
+* CDT and untyped tracking remain attached to the actual global slot.
+
+Deleting a CNode entry (setting it to `CapRef::null()`) does _not_ delete the capability.
+It only removes one CSpace-level reference to a global slot.
+
+== Address Resolution
+
+Capability addresses are resolved by walking the CNode tree from a thread's CSpace root.
+Each CNode level consumes a portion of the address bits.
+
+=== Algorithm
+
+Given a capability address `cap_addr` and a total address width `addr_bits`:
+
+. Check recursion depth against `MAX_RESOLVE_DEPTH = 8`.
+. Read the current CNode's `guard_bits` and `radix` (from `header.size_bits`).
+. Verify that `bits_remaining >= guard_bits + radix`.
+. If `guard_bits > 0`, extract and compare the guard prefix from the most significant remaining bits.  Fail with `GuardMismatch` if they differ.
+. Extract the radix-width slice to compute a slot index.
+. If no address bits remain, the resolution is complete -- return the capability at this slot.
+. If bits remain and the slot contains a CNode, recurse into that CNode with the remaining bits.
+. If bits remain but the slot does not contain a CNode, fail with `InvalidSlot`.
+
+=== Address Bit Interpretation
+
+A capability address is consumed left-to-right as a sequence of guard-then-radix segments:
+
+----
+[guard₁][radix₁][guard₂][radix₂]...[guardₙ][radixₙ]
+----
+
+For example, a two-level CSpace with a 10-bit root CNode (`guard_bits=0`, `size_bits=10`) containing a 6-bit second-level CNode (`guard_bits=0`, `size_bits=6`) at slot 5:
+
+----
+Address: 0x0005_002A (16 bits)
+         [  10 bits  ][ 6 bits ]
+         [root index ][ L2 idx ]
+         [    5      ][  42    ]
+----
+
+Resolution follows slot 5 in the root CNode to find the L2 CNode, then indexes slot 42 in L2.
+
+[plantuml]
+....
+@startuml
+skinparam defaultFontSize 11
+
+rectangle "CSpace Root\n(CNode, 10 bits)" as ROOT {
+  rectangle "slot 0" as R0
+  rectangle "slot 5" as R5
+  rectangle "slot 1023" as R1023
+}
+
+rectangle "L2 CNode\n(CNode, 6 bits)" as L2 {
+  rectangle "slot 0" as L0
+  rectangle "slot 42" as L42
+  rectangle "slot 63" as L63
+}
+
+rectangle "Global Slot Array" as GSA {
+  rectangle "Slot N\n(Capability)" as SN
+}
+
+R5 --> L2 : "CNode\ncap"
+L42 --> SN : "CapRef"
+@enduml
+....
+
+=== Error Types
+
+Address resolution distinguishes specific failure modes:
+
+[cols="1,3"]
+|===
+| `InvalidSlot` | Slot index out of bounds, or remaining bits but no CNode to follow.
+| `SlotEmpty` | The addressed slot contains `CapRef::null()`.
+| `GuardMismatch` | The guard prefix in the address does not match the CNode's guard value.
+| `DepthExceeded` | Resolution exceeded `MAX_RESOLVE_DEPTH` (8) levels.
+|===
+
+== Initial CSpace
+
+The init task receives a statically-backed CNode with 4,096 slots (`size_bits = 12`).
+The kernel populates well-known slots during bootstrap:
+
+[cols="1h,1,3"]
+|===
+| Slot | Name | Description
+
+| 0 | `CAP_SELF_TCB` | Thread's own TCB
+| 1 | `CAP_SELF_VSPACE` | Thread's page table root
+| 2 | `CAP_SELF_CSPACE` | Thread's CNode root
+| 6 | `CAP_KBD_IOPORT` | PS/2 keyboard I/O port (x86_64)
+| 7 | `CAP_KBD_IRQ` | PS/2 keyboard IRQ handler (x86_64)
+| 8 | `CAP_COM1_IOPORT` | COM1 serial I/O port
+| 9 | `CAP_COM1_IRQ` | COM1 IRQ handler
+| 10 | `CAP_COM1_NOTIFICATION` | COM1 IRQ notification
+| 11 | `CAP_IRQ_CONTROL` | IRQ control capability
+| 12 | `CAP_INITRD_UNTYPED` | Initrd device untyped
+| 13 | `CAP_FB_UNTYPED` | Framebuffer device untyped
+| 15 | `CAP_PCI_IOPORT` | PCI config space I/O port
+| 16+ | `CAP_UNTYPED_START` | Untyped memory capabilities (one per available region)
+|===
+
+On aarch64, I/O port slots are reused for MMIO-oriented objects (PL011 device untyped, interrupt handler).
+
+Child processes spawned by `procmgr` receive a different well-known slot layout:
+
+[cols="1h,1,3"]
+|===
+| Slot | Name | Description
+
+| 0 | `CAP_SELF_TCB` | Thread's own TCB
+| 1 | `CAP_SELF_VSPACE` | Thread's page table root
+| 2 | `CAP_SELF_CSPACE` | Thread's CNode root
+| 3 | `CAP_PROCMGR_EP` | Process manager endpoint
+| 4 | `CAP_VFS_EP` | VFS server endpoint
+| 5 | `CAP_NAMESRV_EP` | Name service endpoint
+| 7 | `CAP_MMSRV_EP` | Memory manager server endpoint
+| 8 | `CAP_COM1_IOPORT` | Serial port I/O
+| 11 | `CAP_CONSOLE_EP` | Console server endpoint
+| 15 | `CAP_PCI_IOPORT` | PCI config space I/O port
+| 16+ | `CAP_UNTYPED_START` | Untyped memory capabilities
+|===
+
+== Error Conditions and Edge Cases
+
+=== Global Slot Exhaustion
+
+When `alloc_slot()` returns `None`, no new capabilities can be created.
+This affects `copy`, `mint`, `save_caller`, and `retype` — all operations that allocate global slots.
+
+Slot count is fixed at boot (`clamp(free_frames / 4, 768, 131_072)`).
+A system with heavy capability derivation (deep fork chains, many services) can exhaust slots before physical memory.
+There is no runtime slot expansion.
+
+=== Multi-Level Resolution Failure Modes
+
+Address resolution can fail at any level in the CNode tree:
+
+[cols="1,3"]
+|===
+| Error | Scenario
+
+| `GuardMismatch` | The address bits intended as the guard prefix do not match the CNode's `guard` value.  Common cause: using a flat-mode address against a guarded CNode (or vice versa).
+| `DepthExceeded` | The CNode tree is deeper than `MAX_RESOLVE_DEPTH` (8).  This prevents infinite loops in malformed CSpace trees but limits maximum CSpace depth.
+| `InvalidSlot` | The address has remaining bits but the current slot does not contain a CNode — resolution cannot continue.  Also returned when the slot index exceeds the CNode's capacity.
+| `SlotEmpty` | The addressed slot contains `CapRef::null()`.  The address is valid but nothing is stored there.
+|===
+
+=== CNode Destruction Cascade
+
+Destroying a CNode object triggers recursive capability deletion:
+
+. `destroy_object(CNode)` iterates every `CapRef` in the CNode.
+. For each non-null `CapRef`, `CDT::delete_capability()` runs the full deletion lifecycle.
+. If a deleted capability is itself a CNode, its destruction triggers another recursive walk.
+
+Recursion depth is bounded by `MAX_RESOLVE_DEPTH` (8) and `MAX_DERIVATION_DEPTH` (64).
+In practice, CNode trees rarely exceed 2-3 levels.
+
+WARNING: Deleting a CNode that contains the only references to critical objects (endpoints, VSpaces) will destroy those objects.
+This is the intended authority model: CNode ownership implies authority over everything it names.
+
+=== Slot 0 Is Not Special
+
+Slot 0 in a CNode is a valid, usable slot.
+The init CSpace places `CAP_SELF_TCB` at slot 0 by convention, not by kernel requirement.
+A CNode with all slots occupied at indices 0 through `num_slots - 1` is fully valid.
+
+== Related Pages
+
+* xref:concepts/capabilities.adoc[Capabilities] -- capability structure and operations
+* xref:concepts/objects.adoc[Object Model] -- kernel object types and lifecycle
+* xref:concepts/patterns.adoc[Design Patterns] -- capability delegation and confinement patterns
+* xref:../syscalls/invoke-reference.adoc[Capability Invocations] -- CNode invoke labels
+* xref:../boot.adoc[Boot Sequence] -- init task CSpace setup

@@ -1,0 +1,163 @@
+= Threads and Scheduling
+:description: What threads are, how the CPU is shared, EDF scheduling, budget enforcement, and multi-core support — explained for OS development beginners
+
+== What Is a Thread?
+
+A _thread_ is an execution context: a set of CPU registers (instruction pointer, stack pointer, general-purpose registers) plus a reference to an address space.
+
+A _process_ is one or more threads that share an address space.
+In SaltyOS, the kernel only knows about threads.
+Processes are a user-space concept managed by `procmgr`.
+
+Each thread is represented by a _Thread Control Block_ (TCB) -- a kernel object that stores the thread's saved registers, its address space pointer, its capability space, and its scheduling parameters.
+
+== What Does the Scheduler Do?
+
+A single CPU core can only run one thread at a time.
+The _scheduler_ decides which thread runs next when:
+
+* A thread blocks (waiting for IPC, sleeping, etc.).
+* A thread's time quota expires.
+* A higher-priority thread becomes ready.
+* A thread explicitly yields.
+
+The scheduler must be fair (no thread starves), responsive (high-priority work runs promptly), and efficient (switching between threads should be fast).
+
+== EDF: Earliest Deadline First
+
+Most operating systems use _priority-based_ scheduling: each thread has a priority number, and the highest-priority ready thread runs.
+This is simple but does not inherently prevent starvation or guarantee timing.
+
+SaltyOS uses _Earliest Deadline First_ (EDF):
+
+* Each thread has a _deadline_ -- an absolute time by which it should complete its current work.
+* The thread with the earliest (soonest) deadline always runs first.
+* When a deadline passes, the thread gets a new deadline (pushed forward by its _period_).
+
+=== Why EDF?
+
+EDF is _optimal_ for real-time scheduling: if any scheduling algorithm can meet all deadlines, EDF can too.
+It naturally provides:
+
+* *Temporal isolation*: each thread gets a guaranteed CPU time budget per period.
+* *No starvation*: every thread's deadline eventually becomes the earliest.
+* *Real-time capability*: you can mathematically prove whether all deadlines will be met.
+
+=== Example
+
+Three threads:
+
+[cols="1,1,1,1"]
+|===
+| Thread | Budget | Period | Meaning
+
+| Audio | 2 ms | 10 ms | needs 2 ms of CPU time every 10 ms
+| Network | 1 ms | 5 ms | needs 1 ms every 5 ms
+| Background | 5 ms | 100 ms | needs 5 ms every 100 ms
+|===
+
+The scheduler always picks whichever thread's deadline is soonest.
+The audio thread runs every 10 ms, the network thread every 5 ms, and the background thread gets the remaining time.
+
+If you add up the utilization: 2/10 + 1/5 + 5/100 = 0.45.
+As long as total utilization is under 1.0, EDF guarantees all deadlines are met.
+
+== Budget Enforcement
+
+Each thread is bound to a _SchedContext_ that defines:
+
+* *Budget*: maximum CPU time per period (in timer ticks).
+* *Period*: how often the budget is replenished.
+* *Deadline*: when the current period ends.
+
+On each timer tick (every ~10 ms):
+
+. The current thread's remaining budget is decremented.
+. If the budget reaches zero, the thread is _preempted_ -- removed from the CPU and its budget will be replenished at the next period boundary.
+. The scheduler picks the next thread with the earliest deadline.
+
+This prevents any thread from monopolizing the CPU, even if it has a bug (infinite loop).
+
+== Context Switching
+
+When the scheduler decides to switch from thread A to thread B:
+
+. Save A's registers (instruction pointer, stack pointer, general-purpose registers, etc.) into A's TCB.
+. Switch the page tables from A's address space to B's address space.
+. Restore B's registers from B's TCB.
+. Resume execution at B's saved instruction pointer.
+
+This whole operation takes a few microseconds.
+It is implemented in architecture-specific assembly code (`context.rs`).
+
+=== Lazy FPU Switching
+
+Saving and restoring floating-point/SIMD registers (512-832 bytes) is expensive.
+SaltyOS uses _lazy switching_:
+
+. After a context switch, the FPU is disabled (via a CPU control register).
+. If the new thread uses an FPU instruction, the CPU raises a trap.
+. The kernel saves the _previous_ thread's FPU state and restores the _current_ thread's.
+. The FPU is re-enabled.
+
+If a thread never uses floating-point, its FPU state is never saved or restored.
+
+== Priority Inheritance
+
+A classic problem with priority-based (and deadline-based) scheduling:
+
+. High-priority thread A wants to send a message to server B.
+. Server B is low-priority and is not running because a medium-priority thread C is using the CPU.
+. Thread A is blocked, thread C runs, thread B waits -- even though A is the most urgent.
+
+This is _priority inversion_.
+SaltyOS solves it with _Priority Inheritance Protocol_ (PIP):
+
+. When thread A blocks waiting for thread B, the kernel temporarily boosts B's priority to match A's.
+. Now B runs before C (it inherited A's urgency).
+. When B replies to A, B's priority reverts to its original value.
+
+This is automatic -- servers do not need to do anything special.
+
+== Multi-Core (SMP)
+
+On a system with multiple CPU cores, SaltyOS runs a thread on each core simultaneously.
+
+Each core has its own:
+
+* Ready queue (sorted by deadline).
+* Current thread pointer.
+* Idle thread (runs when nothing else is ready).
+
+When a thread is woken on a different core than where it last ran, the kernel sends an _IPI_ (Inter-Processor Interrupt) to that core, telling it to check its ready queue.
+
+Thread affinity: by default, threads can run on any core.
+You can pin a thread to a specific core for cache locality or real-time requirements.
+
+== Thread States
+
+A thread is always in one of these states:
+
+----
+[Inactive] --resume--> [Ready] --scheduled--> [Running]
+                           ^                      |
+                           |                      |
+                           +---preempt/yield------+
+                           |                      |
+                           +<--event arrives------+-- [Blocked]
+                                                  |
+                                                  +-- IPC wait
+                                                  +-- sleep
+                                                  +-- page fault
+----
+
+* *Inactive*: newly created or explicitly suspended.  Not in any queue.
+* *Ready*: in the ready queue, waiting for the scheduler to pick it.
+* *Running*: currently executing on a CPU core.
+* *Blocked*: waiting for an event (IPC message, timer, page fault resolution).
+
+== What to Read Next
+
+* xref:kernite::guides/syscall-walkthrough.adoc[Syscall Walkthrough] -- follow the journey of a system call through the kernel.
+* xref:guides/building-and-running.adoc[Building and Running] -- build SaltyOS and watch threads in action.
+* For the full technical reference: xref:kernite::scheduling/scheduler.adoc[Scheduler], xref:kernite::scheduling/threads.adoc[Threads].

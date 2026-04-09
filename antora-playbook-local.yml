@@ -16,6 +16,9 @@ content:
     - url: .
       branches: HEAD
       start_path: components/basalt
+    - url: .
+      branches: HEAD
+      start_path: components/kernite
 
 antora:
   extensions:

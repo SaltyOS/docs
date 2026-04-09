@@ -1,0 +1,196 @@
+= Memory Explained
+:description: Virtual and physical memory for beginners — page tables, address spaces, copy-on-write, and SaltyOS's four-tier memory model
+
+This page explains how memory works in an operating system, from the hardware level up to SaltyOS's design.
+
+== Physical vs Virtual Memory
+
+Your computer has physical RAM -- actual hardware chips with a fixed number of bytes.
+A machine with 4 GB RAM has addresses from `0x0` to `0xFFFF_FFFF`.
+
+If programs used physical addresses directly, they would step on each other.
+Program A writes to address `0x1000`, program B writes to `0x1000`, and they corrupt each other's data.
+
+The solution: _virtual memory_.
+Each program gets its own view of memory (an _address space_) where address `0x1000` in program A maps to a different physical location than `0x1000` in program B.
+
+----
+Program A's view:         Physical RAM:         Program B's view:
+0x1000 → "hello"    →    0x5A000: "hello"      0x1000 → "world"
+                          0x7B000: "world"  ←
+----
+
+The CPU's _Memory Management Unit_ (MMU) translates virtual addresses to physical addresses on every memory access, using a data structure called a _page table_.
+
+== Pages and Page Tables
+
+Memory is managed in fixed-size chunks called _pages_ (4 KB = 4,096 bytes on most systems).
+
+A _page table_ is a lookup table stored in RAM that maps virtual page numbers to physical page numbers (called _frames_):
+
+----
+Virtual page 0  →  Physical frame 42
+Virtual page 1  →  Physical frame 7
+Virtual page 2  →  (not mapped -- access causes a page fault)
+Virtual page 3  →  Physical frame 128
+----
+
+On x86_64, page tables have 4 levels (PML4 -> PDPT -> PD -> PT), each with 512 entries.
+On aarch64, the structure is similar (4 levels, 512 entries each, using TTBR0/TTBR1).
+
+The kernel manages page tables.
+User programs never see them -- they just use virtual addresses, and the MMU translates transparently.
+
+== Page Faults
+
+What happens when a program accesses an address that is not mapped?
+
+The CPU raises a _page fault_ exception.
+The kernel handles it:
+
+* If the page is supposed to exist but has not been loaded yet (demand paging), the kernel allocates a frame and maps it.
+* If the page is copy-on-write, the kernel makes a private copy.
+* If the address is invalid (segmentation fault), the kernel kills the program.
+
+Page faults are not errors -- they are a normal part of memory management.
+Most page allocations in SaltyOS happen via page faults, not upfront allocation.
+
+== Copy-on-Write (COW)
+
+When a process calls `fork()`, the child gets a copy of the parent's entire address space.
+Copying all the memory would be extremely slow.
+
+Instead, the kernel uses _copy-on-write_:
+
+. Both parent and child share the same physical pages.
+. Both page tables are marked _read-only_.
+. When either process writes to a shared page, a page fault occurs.
+. The kernel copies just that one page and gives the writer its own private copy.
+. The writer's page table is updated to point to the new copy, now writable.
+
+This means `fork()` is nearly instant, and only pages that are actually modified get copied.
+
+[plantuml]
+....
+@startuml
+skinparam defaultFontSize 11
+
+rectangle "Before write" {
+  rectangle "Parent PTE\n(read-only)" as PPTE
+  rectangle "Child PTE\n(read-only)" as CPTE
+  rectangle "Shared\nPhysical Page" as SHARED
+  PPTE --> SHARED
+  CPTE --> SHARED
+}
+
+rectangle "After child writes" {
+  rectangle "Parent PTE\n(read-only)" as PPTE2
+  rectangle "Child PTE\n(read-write)" as CPTE2
+  rectangle "Original Page" as ORIG
+  rectangle "New Copy" as COPY
+  PPTE2 --> ORIG
+  CPTE2 --> COPY
+}
+@enduml
+....
+
+In SaltyOS, COW is handled entirely in the kernel -- no IPC to any server.
+This is the xref:kernite::memory/page-faults.adoc[COW fast-path].
+
+== How SaltyOS Organizes Memory
+
+Most operating systems have a kernel memory allocator (like `kmalloc` in Linux) that hands out chunks of memory from a big pool.
+
+SaltyOS does not have a kernel heap.
+Instead, it uses a four-tier model where each tier has a specific responsibility:
+
+=== Tier 1: PMM (Physical Memory Manager)
+
+The lowest tier.
+The PMM is a bitmap-based allocator that tracks every 4 KB physical frame in the system.
+Each frame is tagged with an owner (who is using it and why).
+
+Think of the PMM as a warehouse clerk who tracks every box on every shelf.
+Nothing enters or leaves without the PMM knowing about it.
+
+=== Tier 2: Untyped Memory
+
+Raw physical memory exposed to user space through xref:guides/capabilities-101.adoc[capabilities].
+When the system boots, most RAM is wrapped in "untyped" capabilities and given to the init process.
+
+To create a kernel object (an endpoint, a thread, an address space), you _retype_ untyped memory:
+
+----
+"Take this raw 4 KB and turn it into an Endpoint object."
+----
+
+After retyping, the memory is a typed kernel object.
+It can be un-retyped back to raw memory later (if nothing depends on it).
+
+This is like buying raw land and building a specific structure on it.
+The land (untyped) exists first; the building (endpoint) is created from it.
+
+=== Tier 3: MemoryObject (MO)
+
+A MemoryObject is a named collection of pages.
+It is the abstraction that programs interact with (indirectly, through the memory manager server).
+
+When a program calls `mmap()`, the memory manager creates a MemoryObject, commits physical frames to it, and maps it into the program's address space.
+
+Key features:
+
+* Pages are stored in a 4-level tree (like page tables, but for tracking pages within the MO).
+* Supports COW cloning (for `fork()`).
+* Tracks which address spaces have mapped its pages (reverse maps).
+
+=== Tier 4: VSpace (Virtual Address Space)
+
+A VSpace is the address space of a process.
+It wraps the hardware page tables and tracks which MO pages are mapped where.
+
+The VSpace does not _own_ any physical pages.
+It _borrows_ views of MO pages.
+If the MO decommits a page, the VSpace mapping disappears.
+
+----
+┌─────────────────────────────────────────┐
+│          Your Program                    │
+│   (sees virtual addresses)               │
+├─────────────────────────────────────────┤
+│   VSpace                                │
+│   "I map MO pages into page tables"     │
+├─────────────────────────────────────────┤
+│   MemoryObject                          │
+│   "I manage pages and COW"              │
+├─────────────────────────────────────────┤
+│   Untyped Memory                        │
+│   "I provide raw frames for MOs"        │
+├─────────────────────────────────────────┤
+│   PMM                                   │
+│   "I own all physical frames"           │
+└─────────────────────────────────────────┘
+----
+
+== Why Four Tiers?
+
+You might wonder: why not just a simple "allocate page, map page" model?
+
+The four-tier model separates _ownership_ from _mapping_ from _policy_:
+
+* *PMM* answers: "is this frame free or used, and who owns it?"
+* *Untyped* answers: "where does the raw memory for kernel objects come from?"
+* *MO* answers: "which pages belong to this logical memory region, and who is observing them?"
+* *VSpace* answers: "at what virtual address does this program see this page?"
+
+This separation enables:
+
+* COW without the page allocator knowing about it (MO handles cloning).
+* Multiple address spaces sharing the same physical page (MO tracks reverse maps).
+* Memory accounting and revocation through capabilities (untyped controls allocation authority).
+* Page fault handling without user-space IPC in the common case (kernel resolves COW and demand faults internally).
+
+== What to Read Next
+
+* xref:guides/threads-and-scheduling.adoc[Threads and Scheduling] -- how the CPU is shared between programs.
+* xref:kernite::guides/syscall-walkthrough.adoc[Syscall Walkthrough] -- follow a memory allocation from user space through the kernel.
+* For the full technical reference: xref:kernite::memory/pmm.adoc[Physical Memory], xref:kernite::memory/memory-objects.adoc[Memory Objects], xref:kernite::memory/vspace.adoc[Virtual Address Spaces].

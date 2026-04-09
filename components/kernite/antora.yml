@@ -1,5 +1,5 @@
-name: basalt
-title: basalt
+name: kernite
+title: kernite
 version: vNext
 nav:
   - modules/ROOT/nav.adoc

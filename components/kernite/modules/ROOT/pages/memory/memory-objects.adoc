@@ -1,0 +1,349 @@
+= Memory Objects
+:description: MemoryObject — page-granular memory abstraction with 4-level radix tree, COW cloning, reverse mappings, dual-source commit, and destruction
+
+A _MemoryObject_ (MO) is a page-granular memory abstraction that manages physical pages independently of any address space.
+xref:memory/vspace.adoc[VSpaces] map MO pages into hardware page tables; the MO tracks which VSpaces observe which pages via reverse maps.
+MOs support copy-on-write cloning for efficient fork.
+
+== MemoryObject Structure
+
+[source,rust]
+----
+#[repr(C)]
+pub struct MemoryObject {
+    pub header: KernelObject,           // obj_type = MemoryObject (11)
+    pub kind: MoKind,                   // Anon | CowChild | FileBacked | Shm
+    pub page_count: u32,                // total pages in this MO
+    pub pages: RadixTree,               // 4-level radix tree: page_idx → PhysAddr
+    pub reverse_maps: ReverseMaps,      // VSpace observer tracking
+    pub cow_parent: u64,                // parent MO cap slot (0 = none)
+    pub first_child: *mut MemoryObject, // head of COW child list
+    pub next_sibling: *mut MemoryObject,// sibling in parent's child list
+    pub untyped_phys: u64,              // backing untyped physical address
+    pub commit_lock: SpinLock,          // protects radix tree mutations
+}
+----
+
+The struct size is computed by `MemoryObject::required_bytes()` and rounded up to 64-byte cache-line alignment.
+Radix tree internal nodes are allocated separately from the PMM, not from the MO's untyped allocation.
+
+== MO Kinds
+
+[cols="1,3"]
+|===
+| Kind | Description
+
+| `Anon` | Anonymous memory.  The standard kind for heap, stack, and general-purpose allocations.
+| `CowChild` | Copy-on-write child.  Shares pages with a parent MO until a write fault triggers a private copy.
+| `FileBacked` | File-backed pages (reserved, not yet implemented).  Will integrate with the page cache.
+| `Shm` | Shared memory.  Multiple VSpaces map the same MO without COW semantics.
+|===
+
+== Page Storage: 4-Level Radix Tree
+
+MO pages are stored in a radix tree with the same structural design as hardware page tables.
+
+=== Node Structure
+
+Each node is one physical page (4,096 bytes) containing 512 entries of 8 bytes each.
+Each level consumes 9 bits of the page index.
+
+[cols="1h,3"]
+|===
+| Entries per node | 512 (4096 / 8)
+| Bits per level | 9
+| Maximum levels | 4
+| Maximum capacity | 512^4^ = 68 billion entries (256 TB at 4 KB pages)
+|===
+
+=== Adaptive Depth
+
+The tree depth adapts to the maximum page index used:
+
+[cols="1,1,1"]
+|===
+| Max index | Levels | Capacity
+
+| ≤ 512 | 1 | 2 MB
+| ≤ 262,144 | 2 | 1 GB
+| ≤ 134,217,728 | 3 | 512 GB
+| > 134,217,728 | 4 | 256 TB
+|===
+
+When an insertion requires a higher index than the current depth supports, the tree grows by inserting new root nodes above the current root.
+The old root becomes entry 0 of the new root.
+
+=== Leaf Entries
+
+Leaf entries store physical addresses with tag bits in the low 12 bits (always zero for page-aligned addresses):
+
+[cols="1,1,3"]
+|===
+| Bit | Name | Meaning
+
+| 0 | `PHYS_TAG_UNTYPED` | Page was allocated from an untyped source (not PMM).
+| 1 | `PHYS_TAG_BUSY` | Commit in-progress sentinel.  Another thread reserved this slot and is allocating a frame.
+|===
+
+=== Node Allocation
+
+Internal nodes are allocated from the PMM with `FrameOwner::MoMeta { subkind: Radix }`.
+This is separate from the MO's data page allocation -- the MO's untyped provides data pages, while the PMM provides tree metadata pages.
+
+=== Memory Overhead
+
+For an MO with N committed pages:
+
+* Best case (dense, 1 level): 1 node = 4 KB overhead for up to 512 pages.
+* Typical (2 levels): 1 root + ceil(N/512) leaf nodes.
+* Worst case (sparse, 4 levels): up to 3 intermediate nodes per leaf path, but sharing reduces this dramatically.
+
+== Page Commit and Decommit
+
+=== Commit (`MO_COMMIT`, label `0x90`)
+
+Allocates physical pages for a range of page indices.
+The dual-source allocation and BUSY sentinel are key to the design.
+
+For each page in the requested range:
+
+. Acquire `commit_lock`.
+. Read the radix tree leaf entry.
+.. If already committed (non-zero, non-BUSY): skip.
+.. If BUSY: another thread is committing this page; skip.
+. Write `PHYS_TAG_BUSY` sentinel into the leaf to reserve the slot.
+. Release `commit_lock`.
+. *Allocate a frame* from the dual source:
+.. First, try the MO's untyped source (if configured).
+.. If untyped allocation fails, fall back to the PMM.
+. Reacquire `commit_lock`.
+. Write the physical address (with `PHYS_TAG_UNTYPED` if from untyped) into the radix tree leaf, replacing the BUSY sentinel.
+. Set `FrameOwner::MoData { mo, page_idx }` on the allocated frame via `pmm_transfer`.
+. Release `commit_lock`.
+
+The BUSY sentinel prevents two threads from committing the same page concurrently.
+The lock is released during frame allocation (step 5) to avoid holding `commit_lock` across potentially slow untyped operations.
+
+=== Decommit (`MO_DECOMMIT`, label `0x91`)
+
+Releases physical pages back to their source.
+
+For each committed page in the range:
+
+. Read the physical address from the radix tree.
+. Iterate the reverse map and unmap the page from all VSpaces that reference it.
+. Free the frame: to the untyped source (if `PHYS_TAG_UNTYPED`) or PMM.
+. Clear the radix tree leaf entry.
+
+== Reverse Mappings
+
+The reverse map tracks which VSpaces have mapped regions of this MO.
+It enables the kernel to find and update all page table entries that reference an MO page.
+
+=== Structure
+
+[source,rust]
+----
+pub struct ReverseMapEntry {    // 32 bytes
+    pub vspace: *mut VSpace,   // observing VSpace
+    pub va_start: u64,         // virtual address of mapping start
+    pub page_count: u32,       // pages in this mapping
+    pub mo_offset: u32,        // starting page index within the MO
+    pub perms: u8,             // mapping permissions
+    pub _pad: [u8; 7],
+}
+----
+
+=== Storage Layout
+
+Each MO has 8 inline reverse map slots (`RMAP_INLINE`).
+If those are exhausted, overflow pages are allocated from the PMM with `FrameOwner::MoMeta { subkind: Rmap }`:
+
+* Each overflow page holds `(4096 - 8) / 32 = 127` entries, linked as a singly-linked list.
+* The 8-byte overhead per page is the `next` pointer.
+
+For the common case (MO mapped into 1-2 VSpaces), no overflow allocation is needed.
+
+=== Operations
+
+`add(entry)`::
+Insert into the first empty inline slot, or the first empty slot in an overflow page.
+
+`remove(vspace, va_start)`::
+Scan inline slots and overflow pages for a matching entry and clear it.
+
+`for_each(callback)`::
+Iterate all non-empty entries (inline + overflow).  Used during decommit and destruction.
+
+== COW Cloning
+
+`MO_CLONE` (invoke label `0x93`) creates a copy-on-write child MO.
+
+=== Clone Operation
+
+. Create a new `MemoryObject` with `kind = CowChild`.
+. Set `cow_parent` to the parent MO's capability slot.
+. Link the child into the parent's `first_child` / `next_sibling` list.
+. Increment the parent MO's reference count.
+. The child's radix tree starts _empty_ -- all pages are shared with the parent.
+. Mark both parent and child VSpace mappings as read-only to trap write faults.
+
+=== Page Resolution with COW Chain
+
+When resolving a page in a `CowChild`:
+
+. Check the child's own radix tree.  If a local entry exists (non-zero, non-BUSY), return it at depth 0.
+. Walk the `cow_parent` chain, checking each ancestor's radix tree.
+. Return the first matching entry with the chain depth.
+
+[source,rust]
+----
+pub fn resolve_page_depth(&self, index: usize) -> Option<(u64, usize)> {
+    // Check own radix tree first
+    let entry = self.pages.get(index);
+    if entry != 0 && (entry & PHYS_TAG_BUSY) == 0 {
+        return Some((entry & !PHYS_TAG_MASK, 0));
+    }
+    // Walk parent chain
+    let mut depth = 0;
+    let mut parent_slot = self.cow_parent;
+    while parent_slot != 0 {
+        let parent = deref_cow_parent(parent_slot);
+        depth += 1;
+        // check parent's radix tree...
+        parent_slot = parent.cow_parent;
+    }
+    None
+}
+----
+
+=== COW Flatten Threshold
+
+If `depth > COW_FLATTEN_THRESHOLD` (8), the kernel proactively copies the page into the child's own radix tree.
+This bounds the worst-case chain walk length and prevents deep fork chains from degrading read performance.
+
+=== Write Fault Resolution (Kernel Fast-Path)
+
+When a thread writes to a COW-shared page, the page table entry is read-only but the VmArea allows writes:
+
+. The page fault handler identifies this as a COW fault (PTE has `COW` bit set).
+. Allocate a new frame from the MO's source (untyped or PMM).
+. Copy the original page's 4,096 bytes to the new frame.
+. Update the child MO's radix tree with the new frame's physical address.
+. Update the faulting VSpace's page table entry: set the new physical address with write permission, clear the COW bit.
+. Issue a TLB invalidation for the faulting address.
+
+IMPORTANT: COW write faults are resolved entirely in the kernel without IPC to mmsrv.
+This is critical for fork performance -- a deep fork tree with many touched pages would be extremely slow if each fault required an IPC round-trip.
+
+== Invoke Labels
+
+[cols="1,1,3"]
+|===
+| Label | Name | Description
+
+| `0x90` | `MO_COMMIT` | Commit (allocate) pages for a range.
+| `0x91` | `MO_DECOMMIT` | Decommit (free) pages for a range.
+| `0x92` | `MO_GET_SIZE` | Return the page count.
+| `0x93` | `MO_CLONE` | Create a COW child MO.
+| `0x94` | `MO_RESIZE` | Grow or shrink the MO.
+| `0x95` | `MO_READ` | Read data from MO pages (kernel-mediated read).
+| `0x96` | `MO_WRITE` | Write data to MO pages (kernel-mediated write).
+| `0x97` | `MO_HAS_PAGE` / `VSPACE_MAP_MO` | Check if page is committed (MO context) / Map MO pages into VSpace (VSpace context).  Label shared by object type dispatch.
+| `0x98` | `VSPACE_UNMAP_MO` | Unmap MO pages from a VSpace.
+| `0x99` | `VSPACE_SHARE_RO_PAGE` | Share a single read-only page between MOs.
+| `0x9A` | `VSPACE_FORK_RANGE` | Bulk COW fork: clone MO range and remap.
+|===
+
+== Destruction
+
+When the last capability to an MO is deleted (`release_object` triggers `destroy()`):
+
+. Iterate the reverse map and unmap all pages from all observing VSpaces.
+. Walk the radix tree and free every committed page to its source (untyped or PMM).
+. Free radix tree internal nodes back to PMM.
+. Free reverse map overflow pages back to PMM.
+. Unlink from the COW parent's child list (if `CowChild`).
+. Decrement the parent MO's reference count.
+
+== Lock Ordering
+
+MemoryObject operations participate in the kernel lock hierarchy:
+
+----
+CAP_LOCK → endpoint.lock → ... → commit_lock → ut.alloc_lock
+----
+
+`commit_lock` protects the radix tree during commit/decommit.
+`ut.alloc_lock` (on the backing untyped) protects the untyped watermark during frame allocation.
+
+`MemoryObject::destroy()` runs after `release_object()` decrements the refcount to zero.
+At this point, no concurrent accessors exist.
+The destroy path acquires `VSpace.lock` per reverse-map entry without holding `CAP_LOCK` (which was released before `release_object`).
+
+== Error Conditions and Edge Cases
+
+=== Commit Exhaustion (Both Sources Fail)
+
+`MO_COMMIT` tries the untyped source first, then the PMM.
+If both are exhausted:
+
+* The BUSY sentinel in the radix tree leaf is cleared (slot reverts to uncommitted).
+* The commit returns `NotEnoughMemory`.
+* The caller (mmsrv or fault handler) must handle the failure — typically by reporting out-of-memory to the application.
+
+The xref:memory/pmm.adoc[emergency reserve] provides a last-resort pool for fault-path commits, but it is small (32 frames) and restricted to fault handlers.
+
+=== Concurrent Commit to the Same Page
+
+Two threads faulting on the same COW page simultaneously:
+
+. Thread A acquires `commit_lock`, writes BUSY sentinel, releases lock, starts allocating.
+. Thread B acquires `commit_lock`, sees BUSY, treats page as uncommitted, releases lock.
+. Thread B either retries (if in a fault loop) or returns to userspace (where the fault will re-trigger after A completes).
+. Thread A finishes allocation, writes the physical address, replaces BUSY.
+
+The BUSY sentinel prevents double allocation.  No frame is wasted.
+
+=== Deep COW Chain
+
+A chain of fork-without-exec creates increasingly deep COW parent chains:
+
+----
+shell → fork → fork → fork → ... → fork (depth N)
+----
+
+Page resolution walks the chain until it finds the page.
+When `depth > COW_FLATTEN_THRESHOLD` (8), the kernel copies the page into the child's own radix tree (flattening).
+This bounds worst-case resolution to 8 parent hops.
+
+Without flattening, a depth-100 fork chain would require 100 pointer dereferences per page access.
+
+=== Destruction with Active Mappings
+
+When the last capability to an MO is deleted while VSpaces still map its pages:
+
+. `destroy()` iterates the reverse map.
+. For each mapping: acquires `VSpace.lock`, clears the PTEs, issues TLB invalidation, removes the VmArea.
+. After all mappings are removed: frees all committed pages to their sources.
+. Frees radix tree nodes and reverse map overflow pages.
+
+Threads that access the unmapped pages after destruction take a page fault.
+The fault handler finds no VmArea and delivers a VM fault to mmsrv, which typically sends SIGSEGV.
+
+=== Resize Race with Active Commit
+
+`MO_RESIZE` (shrink) while a commit is in progress on a page that will be truncated:
+
+* Resize acquires `commit_lock` before modifying `page_count`.
+* Any in-flight commit that holds `commit_lock` must complete before resize proceeds.
+* After resize, pages beyond the new `page_count` are decommitted.
+
+== Related Pages
+
+* xref:memory/pmm.adoc[Physical Memory] -- PMM frame ownership and allocation
+* xref:memory/vspace.adoc[Virtual Address Spaces] -- page tables, fault handling, MAP_MO/UNMAP_MO
+* xref:memory/page-faults.adoc[Page Fault Handling] -- COW and demand fault resolution
+* xref:../concepts/untyped.adoc[Untyped Memory] -- primary frame source for MO commit
+* xref:../concepts/patterns.adoc[Design Patterns] -- fork and memory allocation patterns
+* xref:../concepts/objects.adoc[Object Model] -- MemoryObject as kernel object type 11

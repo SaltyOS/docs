@@ -1,0 +1,136 @@
+= Memory Layout
+:description: Kernel virtual address space layout, direct physical map, user/kernel split, and per-architecture address space organization
+
+This page describes the kernel's virtual address space layout and the direct physical mapping scheme.
+
+== Address Space Split
+
+=== x86_64
+
+The 48-bit virtual address space (256 TB) is split into two halves:
+
+----
+0x0000_0000_0000_0000 — 0x0000_7FFF_FFFF_FFFF   User space (128 TB)
+  (canonical lower half: sign bit 47 = 0)
+
+0xFFFF_8000_0000_0000 — 0xFFFF_FFFF_FFFF_FFFF   Kernel space (128 TB)
+  (canonical upper half: sign bit 47 = 1)
+----
+
+Non-canonical addresses (bits 48-63 do not match bit 47) trigger a general protection fault.
+
+PML4 entries 0-255 (lower half) map user pages.
+PML4 entries 256-511 (upper half) map kernel pages.
+The upper-half entries are shared across all VSpaces: when a new VSpace is created, the kernel copies its PML4 entries 256-511 into the new page table root.
+
+=== aarch64
+
+TTBR0_EL1 (user) and TTBR1_EL1 (kernel) each address a separate 48-bit address space:
+
+----
+0x0000_0000_0000_0000 — 0x0000_FFFF_FFFF_FFFF   TTBR0 (user, 256 TB)
+0xFFFF_0000_0000_0000 — 0xFFFF_FFFF_FFFF_FFFF   TTBR1 (kernel, 256 TB)
+----
+
+No PML4-level sharing is needed because the hardware provides separate translation registers.
+
+== Kernel Address Space
+
+=== Direct Physical Map
+
+All physical memory is identity-mapped at a fixed offset:
+
+----
+PHYS_MAP_OFFSET = 0xFFFF_8000_0000_0000
+----
+
+`phys_to_virt(phys)` returns `phys + PHYS_MAP_OFFSET`.
+`virt_to_phys(virt)` returns `virt - PHYS_MAP_OFFSET`.
+
+The direct physical map is established during `arch::init()` and covers all physical memory reported by the boot info memory map.
+It uses 2 MB large pages where possible to minimize TLB pressure.
+
+The direct map allows the kernel to access any physical frame without temporary mappings.
+All kernel data structures (capability slot array, per-frame metadata, radix tree nodes, page tables) are accessed through the direct map.
+
+=== Kernel Image
+
+----
+0xFFFF_FFFF_8000_0000   Kernel text (.text)     — executable, read-only
+                        Kernel rodata (.rodata)  — read-only
+                        Kernel data (.data)      — read-write
+                        Kernel BSS (.bss)        — read-write, zero-initialized
+----
+
+The kernel image is loaded at the high end of the address space.
+The linker script (`kernite/arch/x86_64.ld` or `kernite/arch/aarch64.ld`) defines the section layout.
+
+=== Kernel Stacks
+
+Each thread has a dedicated kernel stack allocated from the PMM (`FrameOwner::KernelPrivate { KernelStack }`).
+Kernel stacks are used for syscall entry: the `syscall` instruction (x86_64) or `svc #0` (aarch64) switches to the per-thread kernel stack.
+
+On x86_64, the kernel stack pointer is stored in the TCB's `kernel_stack` field and loaded into the TSS RSP0 on context switch.
+User RSP is saved on the per-thread kernel stack (not per-CPU `%gs:16`) to prevent corruption when another thread's syscall overwrites the per-CPU slot.
+
+=== Per-CPU Data
+
+On x86_64, per-CPU data is accessed through `%gs`-relative addressing:
+
+* `%gs:0` — pointer to the per-CPU data structure itself.
+* `%gs:8` — current CPU ID.
+* `%gs:16` — saved RSP (used transiently during syscall entry, not for long-term storage).
+
+On aarch64, per-CPU data is accessed through `TPIDR_EL1` (kernel thread-local pointer).
+
+== User Address Space
+
+=== Layout
+
+User programs are loaded by the ELF loader into the lower half.
+The typical layout:
+
+----
+0x0000_0000_0040_0000   Program text (.text)
+0x0000_0000_0060_0000   Program data (.data, .bss)
+0x0000_0000_1000_0000   Heap (grows up via mmap)
+  ...
+0x0000_7FFF_XXXX_XXXX   Stack (grows down)
+0x0000_7FFF_FFFF_F000   IPC buffer (one page, per-thread)
+----
+
+The exact addresses depend on the ELF binary's program headers and the procmgr's layout decisions.
+The trona substrate's `layout.rs` module plans VA placement for child processes.
+
+=== IPC Buffer
+
+Each thread's IPC buffer is a single page mapped at a thread-specific virtual address.
+The address is stored in the TCB's `ipc_buffer` field and configured via `TCB_SET_IPC_BUFFER` (invoke label `0x4D`) or `TCB_CONFIGURE` (invoke label `0x40`).
+
+=== Shared Libraries
+
+`libtrona.so` (system library) and `libc.so` (C standard library) are loaded by the runtime dynamic linker (`ld-trona.so`) into the user address space.
+The `init` process is statically linked (embeds trona substrate directly); all other programs use shared libraries.
+
+== VSpace Object Size
+
+A VSpace kernel object occupies:
+
+----
+VSPACE_OBJECT_SIZE = PAGE_SIZE + VSPACE_TRACKING_SIZE
+                   = 4096 + ceil(sizeof(VSpaceTracking) / 64) * 64
+----
+
+The first page is the hardware page table root (PML4 or TTBR0 level-0 table).
+The `VSpaceTracking` structure immediately follows, containing the Maple tree root, per-VSpace lock, ASID, lifecycle state, and deferred free list.
+
+== Page Table Page Allocation
+
+Page table intermediate pages (PDPT, PD, PT on x86_64; level-1/2/3 tables on aarch64) are allocated from the PMM with `FrameOwner::KernelPrivate { PageTable }`.
+They are freed back to the PMM during VSpace cleanup, subject to the deferred free mechanism (quiescent generation tracking) to prevent use-after-free during concurrent page table walks.
+
+== Related Pages
+
+* xref:../memory/pmm.adoc[Physical Memory] -- frame allocation and ownership tracking
+* xref:../memory/vspace.adoc[Virtual Address Spaces] -- page tables and region tracking
+* xref:../boot.adoc[Boot Sequence] -- direct map establishment during arch::init()

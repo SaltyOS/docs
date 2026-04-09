@@ -1,0 +1,176 @@
+= Syscall Walkthrough
+:description: Follow a system call from user-space invocation through the kernel and back — step by step for beginners
+
+This page traces the journey of a single system call from the moment a user program invokes it to the moment the result is returned.
+We will follow a `Call` syscall (client RPC) on x86_64.
+
+== The Starting Point
+
+A user program wants to read a file.
+The trona system library prepares an IPC message and invokes the `Call` syscall:
+
+[source,rust]
+----
+// User space (trona library)
+let msg = Message {
+    label: VFS_READ,      // "I want to read"
+    length: 2,            // 2 message registers used
+    regs: [fd, size, ...], // file descriptor and size
+    ..
+};
+// cap_slot 4 = VFS server endpoint
+syscall(SYS_CALL, cap_slot=4, msg_info, mr0, mr1, mr2, mr3);
+----
+
+== Step 1: The `syscall` Instruction
+
+On x86_64, the `syscall` instruction is a hardware-level trap from user mode (ring 3) to kernel mode (ring 0).
+
+What the CPU does automatically:
+
+. Saves the return address in `RCX` (so the kernel knows where to go back).
+. Saves the flags register in `R11`.
+. Loads the kernel code segment from the `STAR` MSR.
+. Loads the kernel entry point from the `LSTAR` MSR.
+. Disables interrupts (clears IF via `SFMASK` MSR).
+. Jumps to the kernel entry point.
+
+At this point, the thread is running kernel code but still using the user stack.
+
+== Step 2: Assembly Entry (`syscall.S`)
+
+The kernel's assembly entry point does:
+
+. *Switch stacks*: load the per-thread kernel stack pointer from the TCB.  The user stack pointer is saved on the kernel stack (not in a per-CPU global, to prevent corruption during context switches).
+. *Check syscall number*: is it 2 (Call) or 3 (ReplyRecv)?
+.. *Yes*: jump to the xref:../ipc/fastpath.adoc[fastpath].
+.. *No*: save all user registers and call `syscall_handle_rust()`.
+
+For our `Call` example, the syscall number is 2, so we go to the fastpath.
+
+== Step 3: Fastpath Attempt
+
+The fastpath function (`fastpath_call_rust`) checks eligibility:
+
+[source]
+----
+1. extra_caps == 0?  ✓ (no capabilities to transfer)
+2. length <= 4?      ✓ (only 2 message registers)
+3. Valid endpoint?   → look up capability in slot 4
+4. Receiver waiting? → check if VFS server is in RecvBlocked
+5. Receiver on this CPU? → check locality
+6. Valid VSpace?     → check receiver has page tables
+----
+
+If all checks pass (common case), the fastpath handles everything:
+
+. *Transfer message*: copy MR0-MR3 from the sender's registers directly into the receiver's register save area.
+. *Set badge*: write the sender's badge into the receiver's badge register.
+. *Save reply cap*: record the sender's TCB in the receiver's `reply_tcb` field.
+. *Switch threads*: the sender is blocked (waiting for reply), the receiver is activated.
+
+No general dispatch, no message buffering, no capability lookup machinery -- just a direct register-to-register transfer and thread switch.
+
+If any check fails, the fastpath returns `slowpath()`, and the assembly stub falls through to the full `syscall_handle_rust()`.
+
+== Step 4: The Server Processes the Request
+
+The VFS server was blocked in `ReplyRecv`.
+The kernel switches to the server thread, which resumes with:
+
+[source,rust]
+----
+// VFS server loop
+let (badge, msg) = ReplyRecv(my_endpoint, previous_reply);
+// badge = client's badge (identifies who called)
+// msg.label = VFS_READ
+// msg.regs[0] = fd
+// msg.regs[1] = size
+let response = handle_read(badge, msg);
+----
+
+The server reads the file, prepares a response, and calls `ReplyRecv` again.
+
+== Step 5: Reply
+
+When the VFS server calls `ReplyRecv(endpoint, response)`:
+
+. The kernel uses the saved `reply_tcb` to find the original client.
+. The response message is copied from the server's registers to the client's registers.
+. The client is unblocked (moved to Ready, then scheduled).
+. The server enters `RecvBlocked` on its endpoint, waiting for the next client.
+
+== Step 6: Return to User Space
+
+The client thread is now ready.
+When the scheduler picks it, the kernel:
+
+. Restores the client's saved registers (including the response in the return registers).
+. Executes `sysretq`, which:
+.. Restores `RIP` from `RCX` (the return address saved in step 1).
+.. Restores flags from `R11`.
+.. Switches back to ring 3 (user mode).
+.. Re-enables interrupts.
+
+The client's `syscall()` call returns with the response.
+
+== The Full Journey
+
+----
+User program
+  │
+  │ syscall instruction
+  ▼
+Assembly entry (syscall.S)
+  │
+  │ check: syscall number == 2?
+  ▼
+Fastpath (fastpath_call_rust)
+  │
+  │ copy registers, switch thread
+  ▼
+VFS server resumes
+  │
+  │ process request, call ReplyRecv
+  ▼
+Kernel: reply to client, server waits
+  │
+  │ client scheduled, registers restored
+  ▼
+Assembly exit (sysretq)
+  │
+  ▼
+User program continues with result
+----
+
+Total kernel involvement: two thread switches and two register copies.
+On the fastpath, this takes single-digit microseconds.
+
+== What About the Slowpath?
+
+The slowpath handles everything the fastpath cannot:
+
+* Messages longer than 4 registers (overflow to IPC buffer).
+* Capability transfer (requires CAP_LOCK, CSpace lookups, slot allocation).
+* No receiver waiting (sender must block in the endpoint queue).
+* Timed operations (sender goes in both endpoint queue and sleep queue).
+* Multi-endpoint receive (thread registered on multiple endpoints).
+
+The slowpath uses the full `syscall_handle_rust()` dispatcher, which is a large match statement over all 28 syscall numbers.
+
+== aarch64 Differences
+
+On aarch64, the mechanism is similar but the instructions differ:
+
+* `svc #0` instead of `syscall`.
+* Exception vector table (VBAR_EL1) instead of MSR-based entry point.
+* Registers: `x8` = syscall number, `x0`-`x5` = arguments.
+* Return: `eret` instead of `sysretq`.
+
+The Rust code is identical -- only the assembly entry/exit differs.
+
+== What to Read Next
+
+* xref:saltyos::guides/building-and-running.adoc[Building and Running] -- see syscalls in action.
+* xref:guides/first-contribution.adoc[First Contribution] -- add something to the kernel yourself.
+* For the full technical reference: xref:../syscalls/syscall-reference.adoc[Syscall ABI], xref:../ipc/fastpath.adoc[IPC Fastpath].

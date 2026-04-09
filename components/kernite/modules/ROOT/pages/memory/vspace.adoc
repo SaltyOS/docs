@@ -1,0 +1,248 @@
+= Virtual Address Spaces
+:description: VSpace — page tables, VSpaceTracking, VmArea, Maple tree, mapping/unmapping, TLB shootdown protocol, deferred free with quiescent generation tracking, and ASID management
+
+A _VSpace_ represents a virtual address space.
+It wraps a hardware page table root (PML4 on x86_64, TTBR0 on aarch64) and a Maple tree that tracks which virtual address regions are mapped.
+VSpaces are observers: they borrow page views from xref:memory/memory-objects.adoc[MemoryObjects] and own no physical frames themselves.
+
+== VSpace Object Layout
+
+A VSpace is allocated from untyped memory as a single contiguous block:
+
+----
+[0 .. 4096)                          — PML4 / TTBR0 page table root (one page)
+[4096 .. 4096 + TRACKING_SIZE)       — VSpaceTracking (embedded metadata)
+----
+
+Total allocation: `VSPACE_OBJECT_SIZE = PAGE_SIZE + VSPACE_TRACKING_SIZE`.
+
+On x86_64, the kernel copies PML4 entries 256-511 (upper half) from the kernel's page table root into the new VSpace, so the kernel remains mapped in every address space.
+
+== VSpaceTracking
+
+`VSpaceTracking` is embedded in the VSpace untyped allocation (seL4 pattern: all kernel object metadata lives in untyped memory).
+The kernel VSpace uses static storage instead.
+
+[source,rust]
+----
+pub struct VSpaceTracking {
+    root: PhysAddr,                                    // page table root address
+    state: AtomicU8,                                   // Active | Dying | Dead
+    active_count: AtomicU32,                           // CPUs with this VSpace loaded
+    active_mask: [AtomicU32; (MAX_CPUS+31)/32],       // bitmap of active CPUs
+    ipi_sent: AtomicU8,                                // prevent duplicate IPIs
+    retire_gen: AtomicU64,                             // generation when retired
+    retire_snapshot: [AtomicU64; MAX_CPUS],            // per-CPU gen snapshot at retire
+    retire_online_cpus: AtomicU32,                     // online CPUs at retire time
+    waiter_head: UnsafeCell<*mut Tcb>,                 // VSpaceWait queue (sched lock only)
+    asid: AtomicU16,                                   // ASID (aarch64), 0 = not allocated
+    asid_generation: AtomicU64,                        // detect stale ASIDs
+    mappings: MapleTree<VmArea>,                       // VA range → MO region
+}
+----
+
+The `waiter_head` field is accessed only from the scheduler module under the scheduler lock with IRQs disabled.
+
+== VmArea
+
+Each mapped region in a VSpace is described by a `VmArea`:
+
+[source,rust]
+----
+#[repr(C)]
+pub struct VmArea {         // 24 bytes
+    pub mo: *mut MemoryObject,  // backing MO
+    pub mo_offset: u32,         // page offset within MO
+    pub page_count: u32,        // pages in this region
+    pub perms: u8,              // RWX packed
+    pub _pad: [u8; 7],
+}
+----
+
+VmAreas are stored in a Maple tree keyed by virtual address range.
+The Maple tree nodes are allocated from the PMM with `FrameOwner::KernelPrivate { MapleNode }`.
+
+VmAreas are purely descriptive -- they do not own frames.
+They record which MO pages are visible at which virtual addresses with which permissions.
+
+== Page Tables
+
+=== x86_64
+
+4-level page tables: PML4 -> PDPT -> PD -> PT.
+512 entries per level (9 bits each), covering 48-bit virtual addresses.
+
+* PML4 entries 0-255: user pages.
+* PML4 entries 256-511: kernel pages (shared from the kernel VSpace).
+
+=== aarch64
+
+4-level page tables under TTBR0 (user) and TTBR1 (kernel).
+Separate translation registers eliminate the need for PML4-level sharing.
+ASID (Address Space Identifier) in TTBR0 bits 63:48 avoids full TLB flushes on switch.
+
+=== Page Table Entry Flags
+
+[cols="1,1,3"]
+|===
+| Flag | Bit | Meaning
+
+| `PRESENT` | 0 | Entry is valid and backed by a physical frame.
+| `WRITABLE` | 1 | Page is writable.
+| `USER` | 2 | Accessible from user mode (EL0).
+| `WRITE_THROUGH` | 3 | Write-through caching policy.
+| `CACHE_DISABLE` | 4 | Caching disabled (used for device MMIO).
+| `COW` | 9 | Copy-on-write marker.  OS-available bit, used by the COW fast-path.
+| `DEMAND` | 10 | Demand page marker.  OS-available when `PRESENT=0`.  Triggers kernel fast-path commit.
+| `NO_EXECUTE` | 63 | Execute disable (NX on x86_64, UXN/PXN on aarch64).
+|===
+
+Physical address bits: `[47:12]` masked by `ENTRY_ADDR_MASK = 0x000F_FFFF_FFFF_F000`.
+
+== Mapping and Unmapping
+
+=== VSPACE_MAP_MO (invoke label 0x97)
+
+Map a range of MO pages into the VSpace at a specified virtual address:
+
+. Validate alignment, address range, and permissions.
+. Insert a `VmArea` into the Maple tree.
+. Add a `ReverseMapEntry` on the backing MO.
+. For each page in the range:
+.. If the page is committed in the MO's radix tree: install a PTE with the physical address and permissions.
+.. If uncommitted: install a PTE with `PRESENT=0`, `DEMAND=1` (demand marker for lazy commit on first access).
+. If the range is ≥ `RANGE_TLB_GLOBAL_THRESHOLD` (8 pages), use a full TLB flush instead of per-page invalidation.
+
+=== VSPACE_UNMAP_MO (invoke label 0x98)
+
+. Look up the VmArea in the Maple tree by virtual address.
+. Clear the corresponding PTEs.
+. Remove the `ReverseMapEntry` from the MO.
+. Remove the VmArea from the Maple tree.
+. Issue TLB invalidation (per-page or full flush based on page count).
+
+=== VSPACE_SHARE_RO_PAGE (invoke label 0x99)
+
+Share a single read-only page from one MO into another VSpace.
+Used for shared library text pages.
+
+=== VSPACE_FORK_RANGE (invoke label 0x9A)
+
+Bulk COW fork for the process manager's fork path:
+
+. For each mapped VmArea in the source VSpace:
+.. Clone the backing MO (`MO_CLONE`, creating a `CowChild`).
+.. Map the cloned MO into the child VSpace at the same virtual address.
+.. Mark both source and child PTEs as read-only with `COW` bit set.
+
+This is a single invoke that replaces many individual `MO_CLONE` + `MAP_MO` operations.
+
+== TLB Shootdown Protocol
+
+When a PTE is modified on an SMP system, other CPUs may have stale cached translations.
+
+=== Single-Page Invalidation
+
+. The modifying CPU writes the target virtual address via `set_tlb_shootdown_addr(va)`.
+. Send `IpiKind::TlbShootdown` to all CPUs that have this VSpace active (checked via `active_mask`).
+. Each receiving CPU:
+.. Reads the shootdown address.
+.. Executes `invlpg` (x86_64) or `TLBI VAE1IS` (aarch64) for that address.
+.. Increments its quiescent generation counter.
+
+=== Range Invalidation
+
+For operations touching ≥ 8 pages, the kernel uses a full TLB flush:
+* x86_64: reload CR3 (flushes all non-global TLB entries).
+* aarch64: `TLBI VMALLE1IS` (flush all EL1 entries) + `DSB ISH` + `ISB`.
+
+=== Cross-CPU Synchronization
+
+The `active_count` and `active_mask` on `VSpaceTracking` track which CPUs have this VSpace loaded.
+On context switch:
+
+* The outgoing VSpace's `active_count` is decremented and its bit in `active_mask` is cleared.
+* The incoming VSpace's `active_count` is incremented and its bit is set.
+
+TLB shootdown IPIs are only sent to CPUs in the `active_mask`, avoiding unnecessary interrupts to CPUs running other address spaces.
+
+== Deferred Free and Quiescent Generation
+
+Page table intermediate pages cannot be freed immediately when a VSpace is destroyed, because another CPU might be mid-walk through that page table.
+
+=== Mechanism
+
+. When a VSpace is destroyed, its `VSpaceTracking` is moved to the global `DEFERRED_FREE_LIST` (protected by `DEFERRED_FREE_LOCK`).
+. A `retire_gen` is assigned from `GLOBAL_RETIRE_GEN` (monotonically increasing).
+. A snapshot of each CPU's `PENDING_GENERATION` is saved in `retire_snapshot[cpu]`.
+
+=== Quiescent Condition
+
+A retired VSpaceTracking can be freed when:
+
+----
+for all cpu in 0..retire_online_cpus:
+    PENDING_GENERATION[cpu] > retire_snapshot[cpu]
+----
+
+This means every CPU has processed at least one scheduler tick (which calls `advance_quiescent_gen()`) since the VSpace was retired.
+
+=== Processing
+
+`process_deferred_free()` runs from the idle thread on each CPU:
+
+. Acquire `DEFERRED_FREE_LOCK`.
+. For each entry in `DEFERRED_FREE_LIST`:
+.. Check the quiescent condition.
+.. If met: free the VSpaceTracking's page table pages to PMM, remove from list.
+.. If not met: leave in list for the next check.
+. Release `DEFERRED_FREE_LOCK`.
+
+The idle thread _must_ periodically re-enter this processing.
+Without it, VSpace teardown paths that wait for cross-CPU quiescence hang indefinitely.
+
+== VSpace Lifecycle
+
+[plantuml]
+....
+@startuml
+skinparam defaultFontSize 11
+skinparam stateBackgroundColor #f5f5f5
+
+state "Active" as A : Normal operation.\nMappings allowed.\nMay be loaded on CPUs.
+state "Dying" as D : Destruction initiated.\nNo new mappings.\nPage table cleanup\nin progress.
+state "Dead" as DEAD : All resources released.\nDeferred free entries\nmay still be pending.
+
+[*] --> A : Untyped::retype\n(VSpace)
+A --> D : Last capability\ndeleted
+D --> DEAD : All CPUs\nhave flushed\npage tables
+DEAD --> [*] : Quiescent\ncondition met,\ntracking freed
+@enduml
+....
+
+When a VSpace transitions to `Dying`:
+
+. No new mappings are accepted.
+. An IPI is sent to all CPUs with this VSpace active, requesting them to switch away.
+. Threads blocked on `VSpaceWait` are woken when the last CPU deactivates.
+. Page table pages are added to the deferred free list.
+
+== ASID Management (aarch64)
+
+Each VSpace is assigned an Address Space Identifier (ASID) to avoid full TLB flushes on context switch.
+
+* ASID pool: protected by `ASID_LOCK` (tier 6 in the lock hierarchy).
+* ASID width: 16 bits (65,536 ASIDs).
+* ASID is stored in TTBR0_EL1 bits 63:48.
+* Generation tracking: if the global ASID generation has advanced past the VSpace's `asid_generation`, the ASID is stale and must be re-allocated.
+
+On x86_64, ASID is not used — CR3 writes implicitly flush the TLB (PCID support is not yet implemented).
+
+== Related Pages
+
+* xref:memory/pmm.adoc[Physical Memory] -- frame allocation for page table pages
+* xref:memory/memory-objects.adoc[Memory Objects] -- MO pages mapped by VSpace
+* xref:memory/page-faults.adoc[Page Fault Handling] -- COW, demand, and slow-path fault resolution
+* xref:../concepts/untyped.adoc[Untyped Memory] -- VSpace retype from untyped
+* xref:../scheduling/threads.adoc[Threads] -- VSpace associated with each TCB
+* xref:../architecture.adoc[Architecture] -- x86_64/aarch64 paging differences

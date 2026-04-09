@@ -1,1 +1,8 @@
-* xref:index.adoc[Overview]
+* xref:index.adoc[SaltyOS]
+* Learning Guides
+** xref:guides/what-is-microkernel.adoc[What Is a Microkernel?]
+** xref:guides/capabilities-101.adoc[Capabilities 101]
+** xref:guides/ipc-explained.adoc[IPC Explained]
+** xref:guides/memory-explained.adoc[Memory Explained]
+** xref:guides/threads-and-scheduling.adoc[Threads and Scheduling]
+** xref:guides/building-and-running.adoc[Building and Running]

@@ -1,0 +1,244 @@
+= Lock Ordering
+:description: Global lock hierarchy, per-object locks, nesting patterns, IRQ save/restore protocol, and worked examples
+
+Kernite enforces a strict lock acquisition order to prevent deadlocks on SMP systems.
+Locks must always be acquired outermost-first.
+Violating the order causes deadlock: CPU A holds lock X and waits for lock Y, while CPU B holds lock Y and waits for lock X.
+
+== Global Lock Hierarchy
+
+From outermost (acquired first) to innermost (acquired last):
+
+----
+CAP_LOCK
+  → endpoint.lock / ntfn.lock / tcb.lock / sc.lock
+    → SLEEP_LOCK / FUTEX_LOCK / IRQ_LOCK
+      → sched.lock_cpu
+        → VSpace.lock
+          → ASID_LOCK
+            → FRAME_LOCK
+              → SERIAL_LOCK
+----
+
+Every lock in the kernel falls into one of these tiers.
+A thread holding a lock at tier N may only acquire locks at tier N+1 or deeper.
+It must never acquire a lock at a higher (outer) tier.
+
+== Lock Descriptions
+
+[cols="1,1,3"]
+|===
+| Lock | Tier | Protects
+
+| `CAP_LOCK`
+| 1 (outermost)
+| Global capability slot array, CDT operations, CNode operations, untyped child tracking, capability lookup.
+
+| `endpoint.lock`
+| 2
+| Per-endpoint state: send/recv queues, NBSend ring buffer, endpoint state.  One lock per endpoint object.
+
+| `ntfn.lock`
+| 2
+| Per-notification state: pending bits, waiting thread, bound_tcb.  One lock per notification object.
+
+| `tcb.lock`
+| 2
+| Per-TCB state for concurrent access patterns.
+
+| `sc.lock`
+| 2
+| Per-SchedContext state.
+
+| `SLEEP_LOCK`
+| 3
+| Global sleep queue (sorted linked list of threads with timed operations).
+
+| `FUTEX_LOCK`
+| 3
+| Global futex hash table.
+
+| `IRQ_LOCK`
+| 3
+| Global IRQ handler table (handler chain per IRQ number).
+
+| `sched.lock_cpu`
+| 4
+| Per-CPU scheduler state: ready queue, current thread, idle thread, pending_enqueue slot.
+
+| `VSpace.lock`
+| 5
+| Per-VSpace page table mutations, maple tree modifications, deferred free list.
+
+| `ASID_LOCK`
+| 6
+| ASID allocation pool (aarch64).
+
+| `FRAME_LOCK`
+| 7
+| PMM bitmap allocator, per-frame metadata array.
+
+| `SERIAL_LOCK`
+| 8 (innermost)
+| COM1 / PL011 serial output and framebuffer console flush.
+|===
+
+Tier-2 locks are per-object.
+Multiple tier-2 locks can be held simultaneously _if_ they are acquired in a consistent order (typically by address to prevent deadlock).
+Tier-3 locks (SLEEP_LOCK, FUTEX_LOCK, IRQ_LOCK) are independent of each other.
+
+== IRQ Save/Restore Protocol
+
+All spinlock acquisitions disable interrupts first.
+This prevents deadlock between interrupt handlers (which may acquire locks) and the interrupted code path (which may already hold locks).
+
+[source,rust]
+----
+let irq = save_irq_disable();   // disable IRQs, save previous state
+LOCK.lock();
+// critical section
+LOCK.unlock();
+restore_irq(irq);               // restore previous IRQ state
+----
+
+Per-endpoint and per-notification locks use a per-CPU IRQ flag save slot:
+
+[source,rust]
+----
+// endpoint.ep_lock():
+let irq = save_irq_disable();
+EP_IRQ_FLAGS[cpu] = irq;        // save for this CPU
+EP_LOCK_DEPTH[cpu] += 1;        // track nesting depth
+self.lock.acquire();
+
+// endpoint.ep_unlock():
+self.lock.release();
+EP_LOCK_DEPTH[cpu] -= 1;
+if EP_LOCK_DEPTH[cpu] == 0 {
+    restore_irq(EP_IRQ_FLAGS[cpu]);
+}
+----
+
+The depth counter allows nested endpoint lock acquisitions (e.g., during multi-endpoint receive where multiple endpoint locks are held simultaneously).
+
+== Nesting Patterns
+
+=== Slowpath Syscall (capability lookup + IPC)
+
+----
+CAP_LOCK → (lookup capability, copy to local) → release CAP_LOCK
+  → endpoint.lock → (queue manipulation) → release endpoint.lock
+    → sched.lock_cpu → (enqueue/dequeue) → release sched.lock_cpu
+----
+
+`CAP_LOCK` is released before acquiring `endpoint.lock`.
+The capability is copied to a stack-local variable under `CAP_LOCK` to prevent torn reads.
+
+=== IPC Capability Transfer
+
+----
+endpoint.lock → release endpoint.lock
+  → CAP_LOCK → (copy_ipc_caps_locked: slot lookup, copy, CDT insert) → release CAP_LOCK
+    → endpoint.lock → (resume)
+----
+
+Cap transfer requires `CAP_LOCK` (tier 1) while `endpoint.lock` (tier 2) was already held.
+To avoid the ordering violation, the endpoint lock is _released_ before acquiring `CAP_LOCK`.
+After cap transfer completes, the endpoint lock is reacquired.
+
+=== IPC Fastpath
+
+----
+CAP_LOCK → (copy endpoint cap to stack) → release CAP_LOCK
+  → endpoint.lock → (check receiver, transfer registers) → release endpoint.lock
+    → sched.lock_cpu → (context switch) → release sched.lock_cpu
+----
+
+The fastpath never holds `CAP_LOCK` and `endpoint.lock` simultaneously.
+
+=== Timer Tick / IPI Handler
+
+----
+sched.lock_cpu → (timer_tick: budget decrement, sleep queue check)
+  → SLEEP_LOCK → (check_wakeups) → release SLEEP_LOCK
+----
+
+Timer handlers enter at tier 4 (`sched.lock_cpu`), not at tier 1.
+This is safe because interrupt handlers never perform capability operations.
+
+=== Bound Notification Signal
+
+----
+ntfn.lock → (check bound_tcb, determine wake action) → release ntfn.lock
+  → endpoint.lock → (remove from recv queue) → release endpoint.lock
+    → sched.lock_cpu → (enqueue woken thread)
+----
+
+`ntfn.lock` is released before acquiring `endpoint.lock` to maintain tier order.
+The bound_tcb state is re-validated after reacquiring `endpoint.lock` (TOCTOU window).
+
+=== MemoryObject Destruction
+
+----
+(CAP_LOCK already released by release_object caller)
+  → VSpace.lock → (unmap reverse-mapped pages) → release VSpace.lock
+    → FRAME_LOCK → (free pages to PMM) → release FRAME_LOCK
+----
+
+`destroy()` runs after the refcount reaches zero, so no concurrent accessors exist.
+`CAP_LOCK` was released before `release_object()`, so acquiring `VSpace.lock` (tier 5) is safe.
+
+=== Context Switch
+
+----
+sched.lock_cpu → (select next thread) → release sched.lock_cpu
+  → arch::context_switch(old, new)
+  → sched.lock_cpu → (process pending_enqueue) → release sched.lock_cpu
+----
+
+The scheduler lock is released _before_ the architectural context switch and reacquired _after_ resume.
+This ensures the lock is not held across the switch, where the old thread's CPU could change.
+
+== Multi-Endpoint Lock Acquisition
+
+When `RecvAny` needs to lock multiple endpoints simultaneously, locks are acquired in _address order_ (lowest memory address first):
+
+[source,rust]
+----
+fn build_locked_endpoint_order(endpoints: &[*mut Endpoint], order: &mut [usize]) {
+    // Sort indices by endpoint address
+    // Acquire locks in sorted order
+    for idx in order { endpoints[*idx].ep_lock(); }
+}
+// Release in reverse order
+fn unlock_endpoint_order(endpoints, order, count) {
+    for idx in order.rev() { endpoints[*idx].ep_unlock(); }
+}
+----
+
+This prevents deadlock when two threads attempt `RecvAny` on overlapping endpoint sets.
+
+== Per-CPU Scheduler Lock Ordering
+
+When enqueuing a thread on a remote CPU:
+
+* If `target_cpu > local_cpu`: hold local lock, acquire target lock (ascending order).
+* If `target_cpu < local_cpu`: release local lock first, acquire target lock, insert, release target lock, reacquire local lock (prevents deadlock by never holding lower-ID lock while requesting higher-ID lock in the wrong order).
+
+== Panic Path
+
+The panic handler intentionally avoids the normal lock path.
+It writes through raw serial helpers (`serial_puts_raw`) because another CPU may hold `SERIAL_LOCK`.
+The panic path:
+
+. Disables IRQ delivery.
+. Writes directly to hardware (COM1 / PL011).
+. Does not acquire any kernel lock.
+
+This ensures panic output is never blocked by a deadlocked lock.
+
+== Related Pages
+
+* xref:../architecture.adoc[Architecture] -- module map and lock hierarchy overview
+* xref:../scheduling/scheduler.adoc[Scheduler] -- per-CPU lock protocol and context switch
+* xref:../ipc/endpoints.adoc[Endpoints] -- endpoint lock and cap transfer lock dance

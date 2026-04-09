@@ -1,0 +1,129 @@
+= What Is a Microkernel?
+:description: An introduction to microkernel architecture for programmers new to OS development — monolithic vs micro, trust boundaries, and where SaltyOS fits
+
+If you have written user-space programs but never looked inside an OS kernel, this page is your starting point.
+
+== The Kernel's Job
+
+Every program you run -- a web browser, a compiler, a game -- needs access to hardware: the CPU, RAM, disk, network.
+Programs cannot talk to hardware directly because that would let any buggy or malicious program crash the entire machine.
+
+The _kernel_ is the one program that runs in privileged mode (ring 0 on x86, EL1 on ARM).
+It mediates all access to hardware and enforces isolation between programs.
+
+== Two Approaches
+
+=== Monolithic Kernel (Linux, Windows NT core)
+
+Everything runs inside the kernel: device drivers, filesystems, networking, process management.
+
+----
+┌──────────────────────────────────────────┐
+│            User Programs                  │
+├──────────────────────────────────────────┤
+│                                          │
+│   Drivers  Filesystems  Networking       │
+│   Scheduler  Memory Manager  IPC         │
+│                                          │
+│            ALL IN KERNEL                 │
+└──────────────────────────────────────────┘
+              Hardware
+----
+
+Pros: fast (no context switches between components), mature, huge driver ecosystem.
+
+Cons: a bug in _any_ driver can crash the whole system.
+A vulnerability in the networking stack gives an attacker full kernel access.
+The trusted computing base (TCB) is enormous -- Linux has 30+ million lines of code in the kernel.
+
+=== Microkernel (seL4, SaltyOS, QNX, MINIX 3)
+
+Only the absolute minimum runs in the kernel: scheduling, IPC, memory management, and access control.
+Everything else -- drivers, filesystems, networking -- runs as regular user-space programs.
+
+----
+┌──────────────────────────────────────────┐
+│  Drivers  Filesystems  Networking  Apps  │
+│         ALL IN USER SPACE                │
+├──────────────────────────────────────────┤
+│                                          │
+│   Scheduler  IPC  Memory  Capabilities   │
+│                                          │
+│          TINY KERNEL (~27K LOC)          │
+└──────────────────────────────────────────┘
+              Hardware
+----
+
+Pros: if a driver crashes, only that driver dies -- the rest of the system keeps running.
+The kernel is small enough to audit (or even formally verify, as seL4 has done).
+Attack surface is minimal.
+
+Cons: every operation that would be a function call in a monolithic kernel becomes an IPC message.
+This adds latency.
+The kernel must be very efficient at IPC.
+
+== Where SaltyOS Fits
+
+SaltyOS uses the microkernel approach.
+The kernel (`kernite`) is about 27,000 lines of Rust.
+It provides exactly four services:
+
+. *Scheduling* -- deciding which thread runs on which CPU, and for how long.
+. *IPC* -- letting programs send messages to each other.
+. *Memory management* -- controlling which programs can access which physical memory.
+. *Capabilities* -- the access control system that governs who can do what.
+
+Everything else is a user-space server:
+
+[cols="1,3"]
+|===
+| Server | What it does
+
+| `init` | Starts all other servers in the right order.
+| `procmgr` | Creates and manages processes (like `fork` and `exec`).
+| `vfs` | Virtual filesystem (like Linux's VFS layer, but in user space).
+| `mmsrv` | Memory manager (decides which pages go where).
+| `console` | Serial console I/O.
+| `netsrv` | TCP/UDP/ICMP networking.
+| `pcidrv` | PCI device enumeration.
+| `blkdrv` | Block device driver (disk I/O).
+| `netdrv` | Network device driver.
+|===
+
+When your program calls `read(fd, buf, size)`, the call goes:
+
+----
+your program
+  → libc (basalt)
+    → IPC to vfs server
+      → IPC to blkdrv server
+        → hardware access
+      ← reply
+    ← reply
+  ← return
+----
+
+Every arrow is an IPC message through the kernel.
+This is why microkernel IPC performance matters so much -- and why kernite has an assembly-optimized xref:kernite::ipc/fastpath.adoc[IPC fastpath].
+
+== Why Rust?
+
+Most kernels are written in C (Linux, seL4) or C++ (Zircon, Windows).
+SaltyOS uses Rust because:
+
+* *Memory safety*: Rust's ownership system prevents use-after-free, buffer overflows, and data races at compile time.  These bugs are the #1 source of kernel vulnerabilities in C kernels.
+* *No runtime*: Rust supports `#![no_std]` freestanding mode with no runtime, heap, or standard library -- exactly what a kernel needs.
+* *Zero-cost abstractions*: Traits, generics, and iterators compile down to the same machine code as hand-written C.
+
+The trade-off: `unsafe` blocks are still necessary for hardware access, raw pointer manipulation, and inline assembly.
+Kernite marks every `unsafe` block with a `// SAFETY:` comment explaining why it is correct.
+
+== What to Read Next
+
+Now that you understand the big picture:
+
+* xref:guides/capabilities-101.adoc[Capabilities 101] -- how SaltyOS controls access to resources (this is the most unfamiliar concept if you come from Linux/Windows).
+* xref:guides/ipc-explained.adoc[IPC Explained] -- how programs talk to each other through the kernel.
+* xref:guides/building-and-running.adoc[Building and Running] -- if you want to see it in action first.
+
+For the full technical reference, start with xref:kernite::architecture.adoc[Architecture].

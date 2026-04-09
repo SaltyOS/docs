@@ -20,5 +20,6 @@ The current scaffold keeps all Antora components in this repository so the site 
 * `components/saltyos/`
 * `components/trona/`
 * `components/basalt/`
+* `components/kernite/`
 
 This is a bootstrap layout for the documentation portal. Content can later move into code-owning repositories after the structure and navigation stabilize.

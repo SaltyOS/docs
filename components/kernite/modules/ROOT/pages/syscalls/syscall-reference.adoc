@@ -1,0 +1,168 @@
+= Syscall ABI
+:description: Syscall calling convention, dispatch flow, complete syscall table, message info encoding, and error codes
+
+This page documents the system call interface between userspace and the kernel.
+
+== Calling Convention
+
+=== x86_64
+
+Syscall instruction: `syscall`.
+
+[cols="1,1,3"]
+|===
+| Register | Direction | Content
+
+| `rax` | in | Syscall number (0-27).
+| `rdi` | in | Argument 1 (capability address or operand).
+| `rsi` | in | Argument 2 (message info or operand).
+| `rdx` | in/out | Argument 3 / return value 2.
+| `r10` | in | Argument 4 (replaces `rcx`, which is clobbered by `syscall`).
+| `r8` | in | Argument 5.
+| `r9` | in | Argument 6.
+| `rax` | out | Error code (0 = success).
+| `rdx` | out | Return value (badge, bits, result).
+|===
+
+Entry point: `syscall.S` saves user RSP on the per-thread kernel stack (not per-CPU `%gs:16`) to prevent corruption during context switches.
+The assembly stub checks the syscall number and dispatches Call (2) and ReplyRecv (3) to the xref:../ipc/fastpath.adoc[IPC fastpath] before falling through to `syscall_handle_rust()`.
+
+=== aarch64
+
+Syscall instruction: `svc #0`.
+
+[cols="1,1,3"]
+|===
+| Register | Direction | Content
+
+| `x8` | in | Syscall number.
+| `x0`-`x5` | in | Arguments 1-6.
+| `x0` | out | Error code.
+| `x1` | out | Return value.
+|===
+
+== Syscall Table
+
+[cols="1,2,4"]
+|===
+| # | Name | Description
+
+| 0 | `Send` | Blocking send to endpoint.
+| 1 | `Recv` | Blocking receive from endpoint.
+| 2 | `Call` | Send + receive (client RPC).  Has fastpath.
+| 3 | `ReplyRecv` | Reply to caller + wait for next.  Has fastpath.
+| 4 | `NBSend` | Non-blocking send (drops if no receiver and queue full).
+| 5 | `Signal` | Signal notification (atomic OR).
+| 6 | `Wait` | Wait on notification (blocks if no bits pending).
+| 7 | `Poll` | Non-blocking poll notification.
+| 8 | `Yield` | Yield CPU to next ready thread.
+| 9 | `Invoke` | Capability invocation (CNode/Untyped/TCB/VSpace/IRQ/IoPort/MO operations).
+| 10 | `DebugPutChar` | Write character to serial.
+| 11 | `DebugDumpState` | Dump CPU/scheduler state to serial.
+| 12 | `ClockGetTime` | Read monotonic clock (nanoseconds).
+| 13 | `NanoSleep` | Sleep for duration (nanoseconds).
+| 14 | `DebugPutStr` | Write string to serial.
+| 15 | `DebugPutBuf` | Write buffer to serial.
+| 16 | `DebugConsoleControl` | Enable/disable kernel console.
+| 17 | `SetInvokeDepths` | Set CNode resolution depths for invoke.
+| 18 | `Futex` | Userspace futex (wait/wake/requeue).
+| 19 | `GetRandom` | Get random bytes (RDRAND on x86_64).
+| 20 | `Shutdown` | ACPI system shutdown.
+| 21 | `SendTimed` | Blocking send with timeout.
+| 22 | `RecvTimed` | Blocking receive with timeout.
+| 23 | `RecvAny` | Receive from any registered endpoint.
+| 24 | `ReplyRecvAny` | Reply + receive from any endpoint.
+| 25 | `RecvAnyTimed` | RecvAny with timeout.
+| 26 | `ReplyRecvAnyTimed` | ReplyRecvAny with timeout.
+| 27 | `NotifReturn` | Return from notification dispatcher.
+|===
+
+== Message Info Encoding
+
+The `msg_info` word (passed in `rsi` on x86_64, `x1` on aarch64) packs three fields:
+
+----
+Bits  6:0  — length     (0-127 message registers)
+Bits 11:7  — extra_caps (0-4 capabilities to transfer)
+Bits 51:12 — label      (40-bit operation identifier)
+----
+
+MR0-MR3 are passed in registers.  MR4-MR19 overflow into the IPC buffer.
+
+== Dispatch Flow
+
+[plantuml]
+....
+@startuml
+skinparam defaultFontSize 10
+
+start
+:Assembly entry\n(save user regs);
+if (syscall == 2 (Call)\nor syscall == 3 (ReplyRecv)?) then (yes)
+  :Fastpath attempt;
+  if (fastpath\neligible?) then (yes)
+    :Register-only\nmessage transfer;
+    :Direct thread switch;
+    stop
+  else (no)
+    :Fall through;
+  endif
+endif
+:syscall_handle_rust();
+switch (syscall number)
+case (0-4)
+  :IPC operations\n(Send/Recv/Call/\nReplyRecv/NBSend);
+case (5-7)
+  :Notification ops\n(Signal/Wait/Poll);
+case (9)
+  :Capability invocation\n(dispatch by label);
+case (8,10-27)
+  :Utility syscalls\n(Yield, Debug, Clock,\nSleep, Futex, etc.);
+endswitch
+:Write result to\nuser registers;
+:Return to userspace;
+stop
+@enduml
+....
+
+== Error Codes
+
+`SyscallError` variants returned in `rax` (x86_64) or `x0` (aarch64):
+
+[cols="1,1,3"]
+|===
+| Value | Name | Meaning
+
+| 0 | `Ok` | Success.
+| 1 | `InvalidCapability` | Capability address does not resolve to a valid capability.
+| 2 | `InvalidArgument` | Argument value out of range or semantically invalid.
+| 3 | `InsufficientRights` | Capability lacks the required right for the operation.
+| 4 | `NotEnoughMemory` | Untyped memory exhausted or no free frames.
+| 5 | `InvalidOperation` | Operation not supported for this object type.
+| 6 | `SlotOccupied` | Destination CNode slot is not empty.
+| 7 | `RangeError` | Retype count exceeds available untyped space or CNode range.
+| 8 | `CapNotFound` | Capability slot is empty.
+| 9 | `HasChildren` | Cannot delete: capability has CDT children (use revoke).
+| 10 | `Timeout` | Timed IPC operation expired.
+| 11 | `Interrupted` | Operation interrupted by a signal/notification.
+| 12 | `NotSupported` | Feature not supported on this architecture.
+|===
+
+== Invoke Dispatch
+
+Syscall 9 (`Invoke`) resolves a capability and dispatches based on the message label.
+See xref:syscalls/invoke-reference.adoc[Capability Invocations] for the complete label table.
+
+The invoke path:
+
+. Resolve the capability address through the caller's CSpace.
+. Check that the capability has the required rights for the operation.
+. Dispatch to the object-type-specific handler based on `msg_info.label`.
+. Return the result to userspace.
+
+== Related Pages
+
+* xref:syscalls/invoke-reference.adoc[Capability Invocations] -- invoke labels by object type
+* xref:../ipc/fastpath.adoc[IPC Fastpath] -- assembly fastpath for Call and ReplyRecv
+* xref:../ipc/endpoints.adoc[Endpoints] -- IPC operation semantics
+* xref:../concepts/capabilities.adoc[Capabilities] -- rights and address resolution

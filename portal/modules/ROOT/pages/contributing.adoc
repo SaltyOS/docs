@@ -3,6 +3,7 @@
 Documentation changes should follow code ownership:
 
 * `saltyos` for system-wide and integration documentation
+* `kernite` for microkernel internals and kernel-facing contracts
 * `trona` for UAPI, ABI, loader, and runtime contracts
 * `basalt` for libc, CRT, headers, and porting documentation
 

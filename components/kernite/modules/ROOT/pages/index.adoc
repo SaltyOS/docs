@@ -1,0 +1,57 @@
+= Kernite
+:description: SaltyOS microkernel — capability-based, EDF-scheduled, dual-architecture
+
+Kernite is the SaltyOS microkernel.
+It provides xref:concepts/capabilities.adoc[capability]-mediated resource access, synchronous and asynchronous xref:ipc/endpoints.adoc[IPC], xref:scheduling/scheduler.adoc[earliest-deadline-first scheduling] with budget enforcement, and xref:memory/vspace.adoc[virtual memory management].
+All other operating system services -- filesystems, drivers, process management, networking -- run in userspace.
+
+Kernite is written in Rust (`#![no_std]`, no `alloc` crate) and runs on xref:arch/x86_64.adoc[x86_64] and xref:arch/aarch64.adoc[aarch64].
+
+== At a Glance
+
+[cols="1h,3"]
+|===
+| Object types | 12 (Untyped, Endpoint, Notification, Tcb, CNode, VSpace, Frame, IrqHandler, IoPort, SchedContext, MemoryObject, Null)
+| System calls | 28
+| Architectures | x86_64 (BIOS + UEFI), aarch64 (UEFI)
+| Scheduler | Earliest Deadline First with budget enforcement
+| IPC | Synchronous endpoints + asynchronous notifications
+| Memory model | Four-tier: xref:memory/pmm.adoc[PMM] / xref:concepts/untyped.adoc[Untyped] / xref:memory/memory-objects.adoc[MemoryObject] / xref:memory/vspace.adoc[VSpace]
+| Capabilities | xref:concepts/capabilities.adoc[Fat capabilities] (32 bytes) with seL4-style xref:concepts/capabilities.adoc#derivation[derivation tree]
+|===
+
+== New to OS Development?
+
+Start with the xref:saltyos::index.adoc#_new_to_os_development[SaltyOS Learning Guides] -- they explain OS concepts from scratch using SaltyOS as a concrete example.
+Then come back here for the kernel-specific guides:
+
+* xref:guides/syscall-walkthrough.adoc[Syscall Walkthrough] -- follow a syscall through the kernel step by step.
+* xref:guides/first-contribution.adoc[First Contribution] -- make your first kernel change.
+
+== Technical Reference
+
+* To understand the kernel's structure and subsystem boundaries, read xref:architecture.adoc[Architecture].
+* To understand the central abstraction that governs all resource access, read xref:concepts/objects.adoc[Object Model] and xref:concepts/capabilities.adoc[Capabilities].
+* To understand how processes communicate, read xref:ipc/endpoints.adoc[Endpoints] and xref:ipc/notifications.adoc[Notifications].
+* To understand physical and virtual memory management, read xref:memory/pmm.adoc[Physical Memory] and xref:memory/vspace.adoc[Virtual Address Spaces].
+* For common usage patterns, read xref:concepts/patterns.adoc[Design Patterns].
+* For the syscall calling convention and complete syscall table, see xref:syscalls/syscall-reference.adoc[Syscall ABI].
+* To extend the kernel, see the xref:internals/developer-guide.adoc[Developer Guide].
+
+== Design Philosophy
+
+Kernite follows three principles:
+
+Minimal trusted computing base::
+The kernel is the only code that runs in privileged mode.
+Drivers, filesystems, and servers execute as unprivileged processes.
+The kernel provides mechanisms (scheduling, IPC, memory mapping, capability transfer); userspace defines policy.
+
+Capability-mediated access::
+No ambient authority exists.
+Every resource -- memory, endpoints, threads, I/O ports -- is accessed through an unforgeable capability token that carries explicit rights.
+Capabilities can be delegated, attenuated, and revoked.
+
+Correctness over performance::
+The codebase favors simplicity and auditability.
+The xref:ipc/fastpath.adoc[IPC fastpath] is the one exception: it receives assembly-level optimization because IPC latency is on every critical path.

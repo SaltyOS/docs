@@ -1,0 +1,173 @@
+= x86_64
+:description: x86_64 architecture backend — GDT, IDT, APIC, paging, SMP trampoline, FPU, CPUID, SMAP/SMEP, and syscall entry
+
+This page documents the x86_64 architecture backend in `kernite/src/arch/x86_64/`.
+
+== Module Structure
+
+[cols="1,3"]
+|===
+| File | Responsibility
+
+| `mod.rs` | Backend entry point, `init()` sequence, timer abstraction, I/O port wrappers.
+| `boot.rs` | BSP bootstrap: GDT, IDT, APIC, ACPI, paging, CPUID initialization in order.
+| `gdt.rs` | Global Descriptor Table with Task State Segment (TSS).  Ring 0/3 code and data segments.
+| `idt.rs` | Interrupt Descriptor Table — 256 entries covering exceptions (0-31), IRQs (32+), and syscall.
+| `apic.rs` | Local APIC (timer, IPI, EOI) + I/O APIC (IRQ routing, level/edge trigger, masking).
+| `acpi.rs` | ACPI MADT (CPU enumeration), MCFG (PCIe ECAM base), HPET detection.
+| `paging.rs` | 4-level page tables (PML4 → PDPT → PD → PT), direct physical map setup, identity map management.
+| `ap_boot.rs` | Application processor trampoline: real mode → protected mode → long mode.  Uses ACPI MADT to find APs.
+| `context.rs` | Context switch: save/restore of `rsp`, `rbx`, `rbp`, `r12`-`r15`, `rflags`, page table switch.
+| `cpu.rs` | Per-CPU data via `%gs` segment, CPU ID, kernel stack management, invoke sequence numbers.
+| `cpuid.rs` | CPUID feature detection: SSE, AVX, XSAVE, SMAP, SMEP, 1G pages, FSGSBASE.
+| `fpu.rs` | FPU/SSE/AVX lazy context switch via `#NM` trap, XSAVE/XRSTOR.
+| `pit.rs` | Programmable Interval Timer — used for APIC timer calibration, fallback timer.
+| `uaccess.rs` | SMAP/SMEP control: `stac`/`clac` for user memory access windows.
+|===
+
+== Initialization Order
+
+`init()` follows a strict dependency-driven sequence:
+
+. `gdt::init()` — GDT must exist before IDT can reference code segments.
+. `cpu::init_bsp()` — per-CPU data (`%gs` base) must be set after GDT reload (which clobbers GS).
+. `idt::init()` — must be ready before any interrupts fire.
+. `mm::init()` — frame allocator needs boot info memory map.
+. `acpi::init()` — parse MADT for CPU topology, MCFG for PCIe.
+. `apic::init()` — configure Local APIC and I/O APIC.  Timer stays masked.
+. `pit::init()` — calibrate APIC timer frequency against PIT.
+. `paging::init()` — build kernel page tables, establish direct physical map.
+. `cpuid::detect()` — detect optional features (SMAP, SMEP, XSAVE).
+
+Timer interrupts start later via `start_timer()` after the scheduler is ready.
+
+== GDT and TSS
+
+The GDT contains 5 segments:
+
+[cols="1,1,3"]
+|===
+| Index | Selector | Purpose
+
+| 0 | `0x00` | Null descriptor.
+| 1 | `0x08` | Kernel code (64-bit, DPL 0).
+| 2 | `0x10` | Kernel data (DPL 0).
+| 3 | `0x18` | User code (64-bit, DPL 3).
+| 4 | `0x20` | User data (DPL 3).
+| 5-6 | `0x28` | TSS descriptor (16 bytes, points to per-CPU TSS).
+|===
+
+The TSS provides:
+
+* `RSP0` — kernel stack pointer loaded on ring 3 → ring 0 transition.  Updated on every context switch to point to the current thread's kernel stack.
+* `IST` entries — interrupt stack table for double fault and NMI handlers.
+
+== IDT
+
+256 entries:
+
+* Entries 0-31: CPU exceptions (divide error, debug, NMI, breakpoint, overflow, ..., page fault, ..., SIMD floating point).
+* Entry 14 (page fault): dispatches to the generic VSpace fault handler after constructing `PageFaultInfo` from CR2 and the error code.
+* Entries 32+: Hardware IRQs routed through I/O APIC.
+* No dedicated syscall vector — syscalls use the `syscall` instruction (MSR-based, not IDT).
+
+== APIC
+
+=== Local APIC
+
+* Memory-mapped at the standard `0xFEE0_0000` physical address (remapped through direct map).
+* Timer: one-shot or periodic mode, calibrated against the PIT during boot.
+* EOI: written to the EOI register after every interrupt handler completes.
+* IPI: sends inter-processor interrupts for reschedule, TLB shootdown, and shutdown.
+
+IMPORTANT: `eoi()` must be sent before any code that might trigger a context switch.
+A delayed EOI blocks further timer interrupts on the local APIC.
+
+=== I/O APIC
+
+* Routes external hardware IRQs (keyboard, COM1, PCI devices) to Local APIC interrupt vectors.
+* Supports level-triggered (PCI) and edge-triggered (ISA) delivery modes.
+* `ioapic_unmask(irq)` / `ioapic_mask(irq)` control per-IRQ delivery.
+* Shared IRQ support: multiple `IrqHandler` objects can register for the same IRQ line.
+
+== Paging
+
+4-level page tables: PML4 → PDPT → PD → PT.
+
+* User pages: PML4 entries 0-255 (lower canonical half).
+* Kernel pages: PML4 entries 256-511 (upper canonical half, shared across all VSpaces).
+* Direct physical map: starts at `PHYS_MAP_OFFSET` (`0xFFFF_8000_0000_0000`), uses 2 MB large pages where possible.
+* Identity map: temporary 1:1 mapping used during boot for AP trampoline code.  Removed by `clear_boot_identity_map()` after all APs boot.
+
+Page table flags: see xref:../memory/vspace.adoc[VSpace] for the complete PTE flag definitions.
+
+== SMP
+
+=== AP Trampoline
+
+Application processors start in real mode.
+The trampoline code (`ap_tramp.S`) performs:
+
+. Real mode → protected mode (set PE in CR0, load GDT).
+. Protected mode → long mode (set PAE, PGE in CR4; set LME in EFER; set PG in CR0).
+. Jump to 64-bit kernel code using the BSP's page tables.
+. Initialize per-CPU data (`%gs` segment, TSS, Local APIC).
+. Enter the idle loop.
+
+CPU topology is discovered via the ACPI MADT (Multiple APIC Description Table).
+Each AP is started with a SIPI (Startup IPI) directed to the trampoline's physical address.
+
+=== IPI Types
+
+[cols="1,3"]
+|===
+| Kind | Purpose
+
+| `Reschedule` | Wake a remote CPU to run `reschedule()` (thread enqueued on its ready queue).
+| `TlbShootdown` | Invalidate a TLB entry on a remote CPU after page table modification.
+| `Shutdown` | Request orderly CPU halt during system shutdown.
+|===
+
+== Syscall Entry
+
+The `syscall` instruction is configured via MSRs:
+
+* `STAR` — segment selectors for kernel/user mode.
+* `LSTAR` — kernel entry point address (`syscall_entry` in `syscall.S`).
+* `SFMASK` — flags cleared on entry (interrupts disabled).
+
+Entry sequence in `syscall.S`:
+
+. Save user `RCX` (return RIP) and `R11` (return RFLAGS) — done by hardware.
+. Swap to the per-thread kernel stack (load from TCB, NOT from per-CPU `%gs:16`).
+. Save user RSP on the kernel stack.
+. Check syscall number: if 2 (Call) or 3 (ReplyRecv), jump to fastpath.
+. Otherwise, save all user registers and call `syscall_handle_rust()`.
+
+== FPU / SSE / AVX
+
+Lazy context switching:
+
+. On context switch, set `CR0.TS` (or manipulate `CR0.EM`).
+. First FPU/SSE/AVX instruction triggers `#NM` (Device Not Available, exception 7).
+. Handler saves the previous thread's state via `XSAVE` (or `FXSAVE` if XSAVE unavailable).
+. Handler restores the current thread's state via `XRSTOR`.
+. Handler clears `CR0.TS` to allow subsequent FPU instructions without trapping.
+
+Save area: `XSaveArea` — 832 bytes, 64-byte aligned (x87: 512 + XSAVE header: 64 + AVX: 256).
+
+== SMAP / SMEP
+
+If CPUID indicates support:
+
+* **SMEP** (Supervisor Mode Execution Prevention): prevents kernel from executing user pages.  Enabled via `CR4.SMEP`.
+* **SMAP** (Supervisor Mode Access Prevention): prevents kernel from reading/writing user pages unless explicitly allowed.  Enabled via `CR4.SMAP`.  The `stac` instruction temporarily opens user access; `clac` closes it.
+
+The `uaccess` module provides controlled user memory access windows.
+
+== Related Pages
+
+* xref:arch/aarch64.adoc[aarch64] -- the other supported architecture
+* xref:../architecture.adoc[Architecture] -- architecture abstraction layer
+* xref:../internals/memory-layout.adoc[Memory Layout] -- address space split and direct physical map
+* xref:../boot.adoc[Boot Sequence] -- initialization order

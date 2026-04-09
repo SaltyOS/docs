@@ -1,5 +1,5 @@
 name: saltyos
 title: SaltyOS
-version: main
+version: vNext
 nav:
   - modules/ROOT/nav.adoc

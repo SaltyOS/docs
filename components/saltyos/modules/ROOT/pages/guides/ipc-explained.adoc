@@ -1,0 +1,192 @@
+= IPC Explained
+:description: Inter-process communication for beginners — why microkernels need IPC, how endpoints work, the Call/ReplyRecv pattern, and notifications
+
+In a monolithic kernel, the filesystem code calls the disk driver directly -- they are in the same address space.
+In a microkernel, the filesystem and disk driver are separate programs.
+They need a way to talk to each other.
+That mechanism is _IPC_ (Inter-Process Communication).
+
+== Why IPC Matters
+
+In SaltyOS, _every_ operation that crosses a server boundary is an IPC message:
+
+* Reading a file: your program -> VFS server -> block driver -> hardware.
+* Creating a process: your program -> process manager.
+* Allocating memory: your program -> memory manager.
+
+IPC is on the critical path of everything.
+A slow IPC mechanism makes the entire OS slow.
+This is why kernite has an assembly-optimized xref:kernite::ipc/fastpath.adoc[fastpath] for the most common IPC patterns.
+
+== Two IPC Primitives
+
+SaltyOS has two communication primitives, each designed for a specific pattern:
+
+=== Endpoints (Synchronous)
+
+An _endpoint_ is like a phone call.
+Both parties must be present: the caller waits for the receiver to pick up, and the receiver waits for someone to call.
+
+----
+Client                 Endpoint                 Server
+  |                      |                        |
+  |--- Send(msg) ------->|                        |
+  |    (client blocks)   |                        |
+  |                      |<--- Recv() ------------|
+  |                      |     (server was waiting)|
+  |                      |--- deliver msg -------->|
+  |                      |                        |
+  |                      |<--- Reply(response) ---|
+  |<-- response ---------|                        |
+  |    (client unblocks) |                        |
+----
+
+Key properties:
+
+* *Synchronous*: the sender blocks until the receiver is ready (and vice versa).
+* *Rendezvous*: no buffering.  Messages are transferred directly from sender to receiver.
+* *Typed*: messages carry a label (what operation), message registers (data), and optionally capabilities.
+
+=== Notifications (Asynchronous)
+
+A _notification_ is like a flag or doorbell.
+You can ring it without waiting, and the listener checks it when ready.
+
+----
+Driver                 Notification              Server
+  |                      |                        |
+  |--- Signal(bits) ---->|                        |
+  |    (never blocks)    | [bits stored]          |
+  |                      |                        |
+  |                      |<--- Wait() ------------|
+  |                      |--- deliver bits ------->|
+  |                      |                        |
+----
+
+Key properties:
+
+* *Asynchronous*: signaling never blocks.  Bits accumulate via bitwise OR.
+* *Lightweight*: just a 64-bit word, no message body.
+* *Used for interrupts*: hardware IRQs are delivered as notification signals.
+
+== The Call/ReplyRecv Pattern
+
+The most common IPC pattern is client-server RPC.  SaltyOS optimizes it with two specialized syscalls:
+
+=== Client Side: `Call`
+
+`Call` = send a request + wait for the reply, in one syscall.
+
+[source]
+----
+// Client: "read 4096 bytes from file"
+msg.label = VFS_READ;
+msg.regs[0] = fd;
+msg.regs[1] = 4096;
+result = Call(vfs_endpoint, msg);
+// blocks until server replies
+// result.regs[0..] contains the response
+----
+
+=== Server Side: `ReplyRecv`
+
+`ReplyRecv` = reply to the previous client + wait for the next request, in one syscall.
+
+[source]
+----
+// Server loop
+loop {
+    (badge, request) = ReplyRecv(my_endpoint, response);
+    // badge identifies which client sent this request
+    response = handle(badge, request);
+}
+----
+
+This is efficient because the reply and the next receive happen atomically -- no window where the server is idle.
+
+=== What Happens Inside the Kernel
+
+When a client calls `Call` and a server calls `ReplyRecv`:
+
+. The client's message is copied directly into the server's registers (no intermediate buffer).
+. The kernel switches from the client thread to the server thread.
+. The server processes the request and calls `ReplyRecv`.
+. The reply is copied back to the client's registers.
+. The kernel switches back to the client thread.
+
+In the best case (short message, no capability transfer), this is handled by the xref:kernite::ipc/fastpath.adoc[IPC fastpath] -- an assembly-optimized path that skips most of the kernel's generic dispatch logic.
+
+== Messages
+
+An IPC message contains:
+
+[cols="1,3"]
+|===
+| Field | Description
+
+| *Label* | A 40-bit operation code.  The server uses this to decide what to do (like a function name).
+| *Length* | How many message registers are used (0-127).
+| *Message registers* | Up to 127 64-bit values.  MR0-MR3 are passed in CPU registers (fast).  MR4+ overflow into the IPC buffer (a shared memory page).
+| *Extra caps* | Up to 4 capabilities can be transferred alongside the message.
+| *Badge* | A 64-bit value set by `mint` that identifies the sender to the receiver.
+|===
+
+== Notifications in Detail
+
+Notifications are simpler than endpoints but serve a different purpose.
+
+=== Signaling
+
+`Signal(notification, bits)` performs an atomic OR on the notification's 64-bit word:
+
+[source]
+----
+notification.bits |= signal_bits;
+----
+
+This never blocks.  Multiple signals accumulate.
+
+=== Waiting
+
+`Wait(notification)` atomically reads and clears the bits:
+
+[source]
+----
+if notification.bits != 0 {
+    result = notification.bits;
+    notification.bits = 0;
+    return result;
+} else {
+    block until someone signals;
+}
+----
+
+=== IRQ Delivery
+
+Hardware interrupts are delivered through notifications:
+
+. A device raises an interrupt.
+. The kernel's interrupt handler signals the device driver's notification.
+. The driver, blocked in `Wait`, is woken.
+. The driver handles the interrupt and acknowledges it.
+
+This means device drivers in SaltyOS are normal programs.  They just happen to wait on a notification that the kernel signals when hardware interrupts fire.
+
+== Bound Notifications
+
+A server often needs to handle both client requests (via endpoint) and async events (via notification) in the same loop.
+SaltyOS supports this with _bound notifications_:
+
+. Bind a notification to your TCB: `TCB_BIND_NOTIFICATION(my_tcb, notification)`.
+. When you call `Recv` on an endpoint, the kernel first checks your bound notification.
+. If the notification has pending bits, they are returned immediately -- you never enter the endpoint queue.
+. If the notification is empty, you block on the endpoint as usual.
+. If someone signals your notification while you are blocked on the endpoint, you are woken immediately.
+
+This lets a single server loop handle both clients and IRQs without polling.
+
+== What to Read Next
+
+* xref:guides/memory-explained.adoc[Memory Explained] -- how programs get memory in a microkernel.
+* xref:kernite::guides/syscall-walkthrough.adoc[Syscall Walkthrough] -- follow a syscall from user space to kernel and back.
+* For the full technical reference: xref:kernite::ipc/endpoints.adoc[Endpoints], xref:kernite::ipc/notifications.adoc[Notifications].

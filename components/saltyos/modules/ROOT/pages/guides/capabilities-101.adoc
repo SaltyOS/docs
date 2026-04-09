@@ -1,0 +1,196 @@
+= Capabilities 101
+:description: Capability-based access control explained for beginners — from file descriptors to unforgeable tokens, with concrete SaltyOS examples
+
+This is the concept that will feel most unfamiliar if you come from Linux or Windows.
+It is also the most important idea in SaltyOS.
+
+== The Problem With Traditional Access Control
+
+On Linux, when you call `open("/etc/passwd", O_RDONLY)`, the kernel checks:
+
+. Does this user have read permission on `/etc/passwd`?
+. Yes -> return file descriptor 3.
+
+The permission check uses the _caller's identity_ (UID/GID).
+The resource is named by a _global path_ (`/etc/passwd`).
+
+This means:
+
+* Any process running as root can access anything.  There is no way to give a program "only access to this one file".
+* Names are global -- if you know the path, you can try to open it.  The only barrier is permission bits.
+* A compromised program inherits all the authority of the user who ran it.
+
+== The Capability Idea
+
+A _capability_ is like a key, not a name tag.
+
+Imagine a building where every door has a lock.
+In the Linux model, you show your employee badge (identity) and a guard checks a list (permission table) at every door.
+In the capability model, you carry keys.
+If you have the key, you can open the door.
+No guard, no list, no badge -- just the key.
+
+Properties of a key:
+
+* *Unforgeable*: you cannot manufacture a key.  Only someone who already has one can give you a copy.
+* *Specific*: a key opens one door, not all doors.
+* *Transferable*: you can hand your key to someone else.
+* *Copyable with restrictions*: you can make a copy that opens the door but cannot be further copied (no `GRANT` right).
+* *Revocable*: the locksmith (kernel) can invalidate all copies of a key.
+
+== How SaltyOS Does It
+
+In SaltyOS, every resource is a _kernel object_: an endpoint (IPC channel), a thread, an address space, a block of memory.
+You access a kernel object by presenting a capability.
+
+A capability is a 32-byte token stored inside the kernel.
+User programs never see the raw bytes -- they refer to capabilities by slot number (like a file descriptor number in Linux).
+
+[source]
+----
+// Linux: global name + identity check
+int fd = open("/dev/sda", O_RDWR);
+
+// SaltyOS: capability slot number (you either have it or you don't)
+trona_call(CAP_BLKDRV_EP, &request);
+----
+
+=== What is in a Capability?
+
+Each capability contains:
+
+[cols="1,3"]
+|===
+| Field | Meaning
+
+| Object pointer | Which kernel object this capability refers to (like which door the key opens).
+| Rights | What you can do: read, write, send, receive, grant, revoke, etc.
+| Badge | An ID tag that identifies you to the receiver (set during `mint`).
+| Depth | How many times this capability has been copied (bounded to prevent infinite chains).
+|===
+
+=== Rights
+
+Rights control what operations are allowed:
+
+* `SEND` -- you can send messages to this endpoint.
+* `RECV` -- you can receive messages from this endpoint.
+* `GRANT` -- you can give a copy of this capability to someone else.  _Without this right, you cannot delegate._
+* `READ` / `WRITE` -- you can map memory with these permissions.
+* `RETYPE` -- you can create new objects from this untyped memory.
+
+The crucial rule: *rights can only be reduced, never increased.*
+If you receive a capability with `SEND` only, you can never add `RECV` to it.
+
+== A Concrete Example
+
+You write a web server that needs to:
+
+. Listen on a network socket (talk to `netsrv`).
+. Read files (talk to `vfs`).
+. Log to console (talk to `console`).
+
+In Linux, your process runs as a user and can access _everything_ that user can access -- every file, every network interface, every device.
+
+In SaltyOS, your process starts with exactly these capabilities:
+
+----
+Slot 3: endpoint to procmgr   (SEND | RECV)
+Slot 4: endpoint to vfs        (SEND | RECV)
+Slot 5: endpoint to namesrv    (SEND | RECV)
+Slot 7: endpoint to mmsrv      (SEND | RECV)
+Slot 11: endpoint to console   (SEND)
+----
+
+Your process _cannot_ talk to `blkdrv` or `pcidrv` because it has no capability for them.
+It cannot forge one.
+It cannot guess a slot number and get lucky -- empty slots return an error.
+
+If you want to talk to `netsrv`, you ask `namesrv` (the name service) using your slot 5 capability.
+`namesrv` gives you a new capability for `netsrv` -- but only if the system policy allows it.
+
+== Operations on Capabilities
+
+=== Copy (Delegation)
+
+You can give someone a copy of your capability:
+
+----
+CNODE_COPY(my_cnode, dest_slot, my_cnode, source_slot, SEND)
+----
+
+This creates a new capability with only `SEND` right.
+The recipient can send messages but cannot copy the capability further (no `GRANT`).
+
+=== Mint (Badging)
+
+You can create a _badged_ copy:
+
+----
+CNODE_MINT(my_cnode, dest_slot, my_cnode, ep_slot, badge=42, SEND)
+----
+
+When the holder of this minted capability sends a message, the receiver sees `badge = 42`.
+This lets a server identify which client is talking to it -- without trusting the client to self-identify.
+
+=== Revoke
+
+You can destroy all capabilities derived from yours:
+
+----
+CNODE_REVOKE(my_cnode, ep_slot)
+----
+
+Every copy and every mint derived from this slot is deleted.
+Threads blocked on those capabilities are woken with an error.
+Authority is immediately and completely removed.
+
+== How Is This Different From File Descriptors?
+
+Linux file descriptors are superficially similar -- they are opaque integers that name a resource.  But:
+
+[cols="1,1,1"]
+|===
+| Property | File descriptor | Capability
+
+| Forgeable? | No (kernel-managed) | No (kernel-managed)
+| Global naming? | Yes (`open()` uses paths) | No (must receive via IPC or inheritance)
+| Revocable subtree? | No | Yes (`revoke` destroys all derived copies)
+| Fine-grained rights? | Limited (`O_RDONLY`, etc.) | 15 distinct rights bits
+| Transfer control? | Limited (`SCM_RIGHTS`) | `GRANT` right gates all further delegation
+| Ambient authority? | Yes (UID/GID grants broad access) | None (only explicit capabilities)
+|===
+
+The biggest difference: in Linux, `root` can access anything.
+In SaltyOS, there is no `root`.
+Authority exists only in capability slots.
+If you do not have the capability, you cannot access the resource, period.
+
+== The CSpace
+
+Each thread has a _CSpace_ (capability space) -- a tree of CNodes (capability storage arrays).
+Think of it as your keyring.
+When you make a system call, you say "use the capability in slot N", and the kernel looks up slot N in your CSpace.
+
+----
+Your CSpace (CNode, 4096 slots):
+  Slot 0: your own TCB
+  Slot 1: your VSpace (address space)
+  Slot 2: your CSpace (this CNode itself)
+  Slot 3: procmgr endpoint
+  Slot 4: vfs endpoint
+  Slot 5: namesrv endpoint
+  ...
+  Slot 4095: (empty)
+----
+
+Slots 0-2 are always present (self-referential capabilities).
+The rest are populated by the process manager when your process is created.
+
+For more detail, see the full reference: xref:kernite::concepts/capabilities.adoc[Capabilities] and xref:kernite::concepts/cspace.adoc[CSpace].
+
+== What to Read Next
+
+* xref:guides/ipc-explained.adoc[IPC Explained] -- how capabilities are used to send messages between programs.
+* xref:guides/memory-explained.adoc[Memory Explained] -- how capabilities control access to physical memory.
+* xref:kernite::concepts/patterns.adoc[Design Patterns] -- real-world patterns for using capabilities in servers.

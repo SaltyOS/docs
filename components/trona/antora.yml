@@ -1,5 +1,5 @@
 name: trona
 title: trona
-version: main
+version: vNext
 nav:
   - modules/ROOT/nav.adoc

@@ -1,0 +1,36 @@
+* xref:index.adoc[Kernite]
+* Kernel Guides
+** xref:guides/syscall-walkthrough.adoc[Syscall Walkthrough]
+** xref:guides/first-contribution.adoc[First Contribution]
+* xref:architecture.adoc[Architecture]
+* xref:boot.adoc[Boot Sequence]
+* Kernel Objects
+** xref:concepts/objects.adoc[Object Model]
+** xref:concepts/capabilities.adoc[Capabilities]
+** xref:concepts/cspace.adoc[CSpace]
+** xref:concepts/untyped.adoc[Untyped Memory]
+** xref:concepts/patterns.adoc[Design Patterns]
+* Inter-Process Communication
+** xref:ipc/endpoints.adoc[Endpoints]
+** xref:ipc/notifications.adoc[Notifications]
+** xref:ipc/fastpath.adoc[IPC Fastpath]
+* Memory Management
+** xref:memory/pmm.adoc[Physical Memory]
+** xref:memory/memory-objects.adoc[Memory Objects]
+** xref:memory/vspace.adoc[Virtual Address Spaces]
+** xref:memory/page-faults.adoc[Page Fault Handling]
+* Scheduling
+** xref:scheduling/scheduler.adoc[Scheduler]
+** xref:scheduling/threads.adoc[Threads]
+* System Call Reference
+** xref:syscalls/syscall-reference.adoc[Syscall ABI]
+** xref:syscalls/invoke-reference.adoc[Capability Invocations]
+* Architecture
+** xref:arch/x86_64.adoc[x86_64]
+** xref:arch/aarch64.adoc[aarch64]
+* Kernel Internals
+** xref:internals/lock-ordering.adoc[Lock Ordering]
+** xref:internals/unsafe-conventions.adoc[Unsafe Code Conventions]
+** xref:internals/memory-layout.adoc[Memory Layout]
+** xref:internals/developer-guide.adoc[Developer Guide]
+* xref:glossary.adoc[Glossary]

@@ -1,0 +1,204 @@
+= Page Fault Handling
+:description: Page fault dispatch — architecture-neutral fault descriptor, kernel fast-path (COW, demand, stack growth), slow-path IPC to mmsrv, and fault message protocol
+
+When a thread accesses a virtual address that the hardware cannot translate, a page fault occurs.
+The kernel classifies the fault and resolves it through one of two paths: a kernel fast-path that requires no IPC, or a slow-path that delegates to the userspace memory manager server (mmsrv).
+
+== Fault Dispatch Overview
+
+[plantuml]
+....
+@startuml
+skinparam defaultFontSize 10
+skinparam activityBackgroundColor #f5f5f5
+
+start
+:Hardware page fault\n(x86_64: #PF, aarch64: data/instruction abort);
+:Construct PageFaultInfo\n{present, write, user};
+:Look up VmArea\nin Maple tree;
+if (VmArea found?) then (no)
+  :Slow-path:\nfault IPC to mmsrv;
+  stop
+endif
+if (COW fault?\n(present && write &&\nPTE has COW bit)) then (yes)
+  :Fast-path:\nCOW resolution;
+  stop
+endif
+if (Demand fault?\n(!present &&\nPTE has DEMAND bit)) then (yes)
+  :Fast-path:\ndemand page commit;
+  stop
+endif
+if (Stack growth?\n(fault addr just below\nstack VmArea)) then (yes)
+  :Fast-path:\nstack extension;
+  stop
+endif
+:Slow-path:\nfault IPC to mmsrv;
+stop
+@enduml
+....
+
+== PageFaultInfo
+
+Each architecture constructs a `PageFaultInfo` from its native fault registers, providing a uniform interface to the generic fault handler:
+
+[source,rust]
+----
+pub struct PageFaultInfo {
+    pub present: bool,  // page was present (permission violation, not unmapped)
+    pub write: bool,    // fault caused by a write access
+    pub user: bool,     // fault occurred in user mode
+}
+----
+
+x86_64:: Constructed from the page fault error code pushed by the CPU: bit 0 = present, bit 1 = write, bit 2 = user.  Fault address from `CR2`.
+
+aarch64:: Constructed from `ESR_EL1` (Exception Syndrome Register): EC field identifies data abort vs instruction abort, ISS field provides WnR (write/read) and DFSC (fault status code).  Fault address from `FAR_EL1`.
+
+=== IPC Error Code Encoding
+
+`PageFaultInfo` is encoded into a canonical error code for the VMFault IPC message:
+
+----
+Bit 0 — Present  (1 = permission fault, 0 = translation/not-present)
+Bit 1 — Write    (1 = write access)
+Bit 2 — User     (1 = user mode)
+Bit 4 — I/D      (1 = instruction fetch)
+----
+
+Both architectures produce this same encoding, so mmsrv handles faults uniformly.
+
+== Kernel Fast-Path Faults
+
+Fast-path faults are resolved entirely in the kernel without context switching to mmsrv.
+This is critical for performance — COW faults during fork and demand faults during heap growth are extremely frequent.
+
+=== COW Write Fault
+
+Triggered when a thread writes to a page marked copy-on-write.
+
+Conditions::
+* PTE is present (`ENTRY_PRESENT` set).
+* PTE is not writable (`ENTRY_WRITABLE` clear).
+* PTE has the COW marker (`ENTRY_COW` set, bit 9).
+* The VmArea permits writes.
+
+Resolution::
+. Identify the backing xref:memory/memory-objects.adoc[MemoryObject] from the VmArea.
+. Allocate a new physical frame from the MO's source (untyped primary, PMM fallback).
+. Copy 4,096 bytes from the original page to the new frame.
+. Update the MO's radix tree with the new frame's physical address.
+. Update the faulting PTE: write the new physical address, set `ENTRY_WRITABLE`, clear `ENTRY_COW`.
+. Invalidate the TLB entry for the faulting address.
+. Resume the faulting thread.
+
+No lock contention with mmsrv.  The MO's `commit_lock` protects the radix tree update.
+
+=== Demand Page Fault
+
+Triggered when a thread accesses a page that has been mapped but not yet backed by a physical frame.
+
+Conditions::
+* PTE is not present (`ENTRY_PRESENT` clear).
+* PTE has the demand marker (`ENTRY_DEMAND` set, bit 10).
+
+Resolution::
+. Identify the backing MemoryObject from the VmArea.
+. Commit a page in the MO at the faulted page index (allocate a frame, update radix tree).
+. Install the PTE with the new physical address and appropriate permissions from the VmArea.
+. Resume the faulting thread.
+
+Demand markers are installed by `VSPACE_MAP_MO` for MO pages that are not yet committed at map time.
+
+=== Stack Growth
+
+Triggered when a thread accesses an address just below the current stack region.
+
+Conditions::
+* Fault address is within one page below the bottom of an existing stack VmArea.
+* The VmArea is identified as a stack region.
+
+Resolution::
+. Extend the stack VmArea downward by one page.
+. Commit a frame for the new page.
+. Install the PTE.
+. Resume the faulting thread.
+
+== Slow-Path Faults (mmsrv IPC)
+
+If the fault does not match any fast-path pattern, the kernel sends a VM fault message to the faulting thread's fault endpoint.
+The memory manager server (mmsrv) receives the message, determines the appropriate action (e.g., commit pages, extend mappings, report a segfault), and replies to resume the thread.
+
+=== Fault Message Format
+
+The fault is delivered as a standard IPC message on the thread's fault endpoint:
+
+[cols="1,1,3"]
+|===
+| Field | Value | Content
+
+| `label` | `2` (`FaultType::VMFault`) | Identifies this as a VM fault.
+| `length` | `4` | Four message registers.
+| `regs[0]` | fault address | The virtual address that caused the fault (`CR2` / `FAR_EL1`).
+| `regs[1]` | error code | Encoded `PageFaultInfo` (present, write, user, instruction bits).
+| `regs[2]` | instruction pointer | The faulting instruction address (`RIP` / `ELR_EL1`).
+| `regs[3]` | is_instruction_fault | `1` if the fault was caused by an instruction fetch, `0` otherwise.
+|===
+
+=== Fault Handler Flow
+
+. The faulting thread enters `BlockedReason::FaultBlocked` with the fault message.
+. The kernel sends the message to the fault endpoint.
+. mmsrv (or another fault handler) receives the message via `Recv`.
+. The handler examines the fault address and error code, performs the necessary memory operations (e.g., `MO_COMMIT`, `VSPACE_MAP_MO`).
+. The handler replies to the fault message.
+. The kernel receives the reply and resumes the faulting thread.
+
+=== Reply-to-Resume
+
+Replying to a fault message resumes the faulted thread at the faulting instruction.
+The thread re-executes the instruction that caused the fault.
+If the handler has fixed the fault (committed the page, installed the mapping), the instruction succeeds.
+If the handler has not fixed the fault (e.g., segfault), the handler can kill the thread instead of replying.
+
+== Other Fault Types
+
+=== User Exception (label 4)
+
+Delivered when a thread triggers a CPU exception that is not a page fault (e.g., illegal instruction, alignment fault):
+
+[cols="1,1"]
+|===
+| `regs[0]` | Exception vector number
+| `regs[1]` | Error code
+| `regs[2]` | Faulting instruction pointer
+| `regs[3]` | Faulting stack pointer
+|===
+
+=== Capability Fault (label 1)
+
+Delivered when a thread's capability lookup fails during a syscall (e.g., the thread tries to invoke a null or invalid capability slot).
+This is informational — the fault handler can log it and decide whether to terminate the thread.
+
+== Performance Considerations
+
+The fast-path / slow-path split is critical to microkernel performance:
+
+COW fast-path::
+A fork followed by exec in a typical shell invocation can trigger hundreds of COW faults.
+If each fault required an IPC round-trip to mmsrv (send fault → mmsrv recv → mmsrv commit → mmsrv reply → thread resume), the overhead would dominate fork time.
+The kernel fast-path resolves each fault in a single trap without leaving the kernel.
+
+Demand fast-path::
+Heap growth via `mmap` + first-touch triggers demand faults.
+The kernel fast-path avoids the IPC round-trip for each page.
+
+Slow-path::
+Reserved for cases that require policy decisions: mapping new regions, handling unmapped addresses, extending non-stack regions, and reporting segfaults.
+mmsrv has full context about the process's memory layout and can make informed decisions.
+
+== Related Pages
+
+* xref:memory/vspace.adoc[Virtual Address Spaces] -- PTE flags, VmArea, MAP_MO
+* xref:memory/memory-objects.adoc[Memory Objects] -- COW clone, commit/decommit, radix tree
+* xref:memory/pmm.adoc[Physical Memory] -- frame allocation for fault resolution
+* xref:../ipc/endpoints.adoc[Endpoints] -- fault message delivery via fault endpoint

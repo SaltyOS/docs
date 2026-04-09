@@ -1,0 +1,159 @@
+= Boot Sequence
+:description: Full initialization path from kmain through subsystem bring-up to first userspace entry
+
+This page describes the kernel initialization sequence from the moment the bootloader transfers control to `kmain` through the creation and dispatch of the first user task.
+
+== Entry Point
+
+The bootloader passes a pointer to a TLV-encoded boot info block:
+
+* x86_64: `kmain(boot_info)` is called with the pointer in `RDI`.
+* aarch64: `kmain(boot_info)` is called with the pointer in `x0`.
+
+== Initialization Order
+
+The initialization order is fixed and dependency-driven.
+Each step requires the previous steps to have completed.
+
+[plantuml]
+....
+@startuml
+skinparam defaultFontSize 10
+
+:1. Serial banner (raw);
+:2. Parse TLV boot info;
+:3. arch::init(boot_info);
+note right: paging, exceptions,\nCPU-local state,\nmm::init() called internally
+:4. Framebuffer console init;
+:5. cap::init();
+note right: global slot array +\nmetadata arrays
+:6. ipc::init();
+:7. sched::init();
+note right: bootstrap TCB,\nBSP idle thread,\n1 CPU online
+:8. arch::start_timer();
+:9. arch::init_smp(boot_info);
+note right: AP trampoline (x86_64)\nor PSCI CPU_ON (aarch64)
+:10. arch::clear_boot_identity_map();
+:11. init::bootstrap(boot_info);
+note right: load init from initrd,\nbuild CSpace, create TCB
+:12. scheduler().reschedule();
+note right: dispatch init task →\nfirst usermode entry
+stop
+@enduml
+....
+
+=== Step Details
+
+[cols="1,4"]
+|===
+| Step | Description
+
+| 1. Serial banner
+| Raw serial output before any subsystem is alive.  No locking.
+
+| 2. Boot info parse
+| `bootinfo::parse()` decodes the TLV block.  If parsing fails, the kernel logs a warning and continues with `boot_info = None`, but userspace bootstrap requires valid boot info.
+
+| 3. `arch::init()`
+| Architecture-specific early bring-up.  Establishes the xref:internals/memory-layout.adoc[direct physical map], exception/trap vectors, CPU-local state, and enough paging state for subsequent initialization.  Calls `mm::init()` internally to initialize the xref:memory/pmm.adoc[physical frame allocator].
+
+| 4. Framebuffer console
+| Initializes the framebuffer text console.  Requires paging (step 3) but must complete before SMP startup so APs inherit the higher-half mapping.
+
+| 5. `cap::init()`
+| Sizes and allocates the xref:concepts/cspace.adoc#global-slot-array[global capability slot array] and per-slot metadata based on free frame count: `clamp(free_frames / 4, 768, 131_072)`.
+
+| 6. `ipc::init()`
+| Initializes xref:ipc/endpoints.adoc[IPC] subsystem structures.
+
+| 7. `sched::init()`
+| Creates a synthetic bootstrap xref:scheduling/threads.adoc[TCB] for the thread running `kmain`.  Allocates the BSP idle TCB and idle stack.  Marks one CPU online.
+
+| 8. `arch::start_timer()`
+| Enables timer interrupts.  Separated from `arch::init()` because the timer must not fire until the xref:scheduling/scheduler.adoc[scheduler] is ready.
+
+| 9. `arch::init_smp()`
+| Starts application processors.  x86_64: ACPI MADT + AP trampoline (real → long mode).  aarch64: PSCI `CPU_ON` + mailbox handoff.
+
+| 10. Clear identity map
+| Removes the bootloader's identity mapping now that all APs have booted into the higher-half mapping.
+
+| 11. `init::bootstrap()`
+| Builds the first user task.  See <<init-bootstrap>> below.
+
+| 12. Reschedule
+| Enters the scheduler for the first time.  The init task is dispatched via the architecture-specific usermode trampoline.
+|===
+
+== Boot Contract
+
+For the kernel to reach userspace, the bootloader must provide:
+
+* A valid TLV boot info block (memory map, initrd location, framebuffer info).
+* A non-empty initrd (`initrd_addr` and `initrd_size` both non-zero).
+* The init program must be loadable from the initrd CPIO archive.
+
+If any condition fails, the kernel halts through the `boot_fatal!` path.
+
+== `arch::init()` Responsibilities
+
+After `arch::init()` completes, generic kernel code assumes:
+
+* A direct physical map is available at `PHYS_MAP_OFFSET`.
+* Exception/trap entry is functional.
+* CPU-local kernel execution state is established.
+* The physical frame allocator is initialized.
+
+Architecture-specific hooks called later by generic code:
+
+[cols="1,1,3"]
+|===
+| Hook | Called at | Purpose
+
+| `arch::start_timer()` | Step 8 | Enable timer interrupts.
+| `arch::init_smp()` | Step 9 | Start application processors.
+| `arch::clear_boot_identity_map()` | Step 10 | Remove bootloader identity mapping.
+| `arch::usermode_trampoline()` | Step 12 | Enter user mode for the init task.
+|===
+
+[[init-bootstrap]]
+== Init Task Bootstrap
+
+`init::bootstrap()` creates the first user task:
+
+. Allocate a new page table root (PML4 on x86_64) for the user VSpace.
+. Copy the kernel upper-half page table entries into the new VSpace.
+. Load the init binary from the initrd CPIO archive via the ELF loader.
+. Map the initrd and boot info into the child VSpace.
+. Allocate a dedicated kernel stack for syscall entry.
+. Construct a statically-backed initial CNode with 4,096 slots (`size_bits = 12`).
+. Store the VSpace in static storage (it is never dropped).
+. Populate well-known capability slots (see xref:concepts/cspace.adoc#_initial_cspace[Initial CSpace]).
+. Configure the first TCB with the init binary's entry point and stack pointer.
+. Create a SchedContext with `budget = 10`, `period = 100`, priority `100`, CPU affinity `0`.
+. Enqueue the init task for scheduling.
+
+== Logging and Panic
+
+The kernel has two serial output paths:
+
+Raw serial (no lock)::
+Used in panic, crash, and very-early boot paths.  Writes directly to COM1 (x86_64) or PL011 (aarch64).  Mirrors to the framebuffer console.
+
+Locked serial (`SERIAL_LOCK`)::
+SMP-safe output under the innermost kernel lock.  `SerialGuard` disables IRQs, acquires the lock, and flushes buffered console output on drop.
+
+The panic handler:
+
+. Disables IRQ delivery.
+. Stops the aarch64 timer (if applicable).
+. Re-enables the framebuffer console.
+. Writes through raw serial helpers (another CPU may hold `SERIAL_LOCK`).
+
+IMPORTANT: Panic reporting does not depend on reclaiming any runtime lock.
+
+== Related Pages
+
+* xref:architecture.adoc[Architecture] -- module map and arch abstraction
+* xref:concepts/cspace.adoc[CSpace] -- initial CSpace layout and well-known slots
+* xref:scheduling/scheduler.adoc[Scheduler] -- scheduler initialization and first dispatch
