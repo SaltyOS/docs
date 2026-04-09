@@ -1,0 +1,5 @@
+name: saltyos
+title: SaltyOS
+version: main
+nav:
+  - modules/ROOT/nav.adoc

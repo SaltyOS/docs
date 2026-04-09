@@ -1,0 +1,14 @@
+= SaltyOS Documentation Portal
+
+This repository contains the bootstrap Antora scaffold for SaltyOS documentation.
+
+The current scaffold is intentionally centralized so the portal and component skeletons build from a single repository.
+
+[#components]
+== Components
+
+* xref:saltyos::index.adoc[SaltyOS]
+* xref:trona::index.adoc[trona]
+* xref:basalt::index.adoc[basalt]
+
+Each component currently contains only the minimum pages needed to establish site structure, navigation, and buildability.

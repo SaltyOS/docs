@@ -1,0 +1,10 @@
+= basalt
+
+This component is the placeholder for SaltyOS libc and CRT documentation.
+
+Planned scope:
+
+* libc surface and headers
+* CRT startup and runtime behavior
+* porting guide for C software
+* compatibility notes

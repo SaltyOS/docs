@@ -1,0 +1,10 @@
+= SaltyOS
+
+This component is the placeholder for system-wide SaltyOS documentation.
+
+Planned scope:
+
+* onboarding and build flow
+* boot and runtime flow
+* architecture and design overviews
+* integration notes and runbooks

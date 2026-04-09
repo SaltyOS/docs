@@ -1,0 +1,24 @@
+= SaltyOS Docs
+
+This repository hosts the Antora playbooks and site scaffold for the SaltyOS documentation portal.
+
+== Local Build
+
+[source,bash]
+----
+npm install
+npm run build
+----
+
+The generated site is written to `build/site`.
+
+== Current Scope
+
+The current scaffold keeps all Antora components in this repository so the site can build from a single commit:
+
+* `portal/`
+* `components/saltyos/`
+* `components/trona/`
+* `components/basalt/`
+
+This is a bootstrap layout for the documentation portal. Content can later move into code-owning repositories after the structure and navigation stabilize.

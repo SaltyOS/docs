@@ -1,0 +1,5 @@
+name: portal
+title: SaltyOS Portal
+version: ~
+nav:
+  - modules/ROOT/nav.adoc

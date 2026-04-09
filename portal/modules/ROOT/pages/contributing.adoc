@@ -1,0 +1,9 @@
+= Contributing
+
+Documentation changes should follow code ownership:
+
+* `saltyos` for system-wide and integration documentation
+* `trona` for UAPI, ABI, loader, and runtime contracts
+* `basalt` for libc, CRT, headers, and porting documentation
+
+The current scaffold keeps existing Markdown sources intact while the AsciiDoc migration is phased in later.

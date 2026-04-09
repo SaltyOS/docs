@@ -1,0 +1,42 @@
+site:
+  title: SaltyOS Docs
+  start_page: portal::index.adoc
+
+content:
+  sources:
+    - url: .
+      branches: HEAD
+      start_path: portal
+    - url: .
+      branches: HEAD
+      start_path: components/saltyos
+    - url: .
+      branches: HEAD
+      start_path: components/trona
+    - url: .
+      branches: HEAD
+      start_path: components/basalt
+
+antora:
+  extensions:
+    - require: '@antora/lunr-extension'
+      index_latest_only: true
+
+asciidoc:
+  attributes:
+    kroki-server-url: https://kroki.io
+    page-pagination: ''
+  extensions:
+    - asciidoctor-kroki
+
+ui:
+  bundle:
+    url: https://gitlab.com/antora/antora-ui-default/-/jobs/artifacts/HEAD/raw/build/ui-bundle.zip?job=bundle-stable
+    snapshot: true
+  supplemental_files: ./supplemental-ui
+
+output:
+  dir: ./build/site
+
+runtime:
+  fetch: true

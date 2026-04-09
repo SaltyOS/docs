@@ -1,0 +1,10 @@
+= trona
+
+This component is the placeholder for SaltyOS userspace ABI and runtime documentation.
+
+Planned scope:
+
+* UAPI and ABI reference
+* syscall and invoke contracts
+* loader and runtime design
+* POSIX and compatibility layers

@@ -1,0 +1,5 @@
+name: basalt
+title: basalt
+version: main
+nav:
+  - modules/ROOT/nav.adoc
