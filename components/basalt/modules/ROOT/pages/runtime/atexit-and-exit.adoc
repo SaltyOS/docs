@@ -1,0 +1,211 @@
+= atexit and Process Exit
+:description: C atexit slots, C++ __cxa_atexit slots, fini_array ordering, and the exit teardown sequence
+
+basaltc separates termination into three call sites:
+
+* `exit(status)` — the normal C teardown path: atexit handlers, C++ destructors, fini arrays, stdio flush, then `_exit`.
+* `_exit(status)` and `_Exit(status)` — immediate termination, no cleanup.
+* `__cxa_finalize(dso_handle)` — the C++ destructor entry point, called by `exit` for the main executable and by `dlclose` for individual DSOs.
+
+This page covers the data structures backing the three atexit families (`atexit`, `__cxa_atexit`, `__cxa_thread_atexit`), the locking discipline, the exact ordering of teardown steps, and the rules for what code can run during teardown.
+
+== The Three atexit Families
+
+[cols="1,1,3"]
+|===
+| Function | Slot count | Purpose
+
+| `atexit(func)`
+| 32
+| C99 / POSIX. Registers a void function to call at process exit. Returns 0 on success, -1 if the slot table is full. The standard guarantees at least 32 slots.
+
+| `__cxa_atexit(dtor, arg, dso_handle)`
+| 128
+| Itanium C++ ABI. Used by C++ compilers to register destructors of namespace-scope objects. Each entry stores the destructor function, an opaque argument (typically `this`), and a `dso_handle` identifying the DSO that owns the destructor.
+
+| `__cxa_thread_atexit(dtor, obj, dso_handle)`
+| (delegates to `__cxa_atexit`)
+| Per-thread destructor for `thread_local` objects. basaltc currently delegates to `__cxa_atexit` because full per-thread cleanup requires TLS destructor infrastructure that the trona substrate does not yet expose. This means thread-local destructors run at process exit time, not at thread exit time — accurate for the main thread, slightly off for spawned threads but never wrong about whether they run.
+|===
+
+`atexit` and `__cxa_atexit` use separate fixed-size arrays.
+The two limits (32 and 128) are independent — registering 32 C handlers does not exhaust the C++ pool, and vice versa.
+
+[source,rust]
+----
+const ATEXIT_MAX: usize = 32;
+const CXA_ATEXIT_MAX: usize = 128;
+
+static mut ATEXIT_FUNCS: [Option<unsafe extern "C" fn()>; ATEXIT_MAX] = [None; ATEXIT_MAX];
+static mut ATEXIT_COUNT: usize = 0;
+
+static mut CXA_ATEXIT_FUNCS: [MaybeUninit<CxaAtexitEntry>; CXA_ATEXIT_MAX] = ...;
+static mut CXA_ATEXIT_COUNT: usize = 0;
+
+static ATEXIT_LOCK: trona::sync::Mutex = trona::sync::Mutex::new();
+----
+
+`ATEXIT_LOCK` protects all four globals — `ATEXIT_FUNCS`, `ATEXIT_COUNT`, `CXA_ATEXIT_FUNCS`, `CXA_ATEXIT_COUNT`.
+A single lock keeps the implementation simple at the cost of some unnecessary serialization between C and C++ atexit registrations, which is fine because both APIs are called rarely (typically only at process startup).
+
+== The CxaAtexitEntry Struct
+
+[source,rust]
+----
+#[repr(C)]
+struct CxaAtexitEntry {
+    destructor: unsafe extern "C" fn(*mut core::ffi::c_void),
+    arg: *mut core::ffi::c_void,
+    dso_handle: *mut core::ffi::c_void,
+}
+----
+
+The destructor takes a single `void*` argument — typically the `this` pointer of the object being destroyed — and returns nothing.
+`dso_handle` identifies which DSO registered the destructor, so that `dlclose(handle)` can call only the destructors belonging to the DSO being unloaded.
+The main executable always uses `dso_handle = NULL`; basaltc compiles `static __dso_handle: SyncPtr = SyncPtr(null())` and exports it via `#[unsafe(no_mangle)]` so the executable's link picks it up.
+
+`MaybeUninit` is used because `CxaAtexitEntry` cannot be safely default-constructed (the `destructor` field is a non-nullable function pointer).
+Each slot is `assume_init_ref`-cast on access — safe because the slot is only read after `CXA_ATEXIT_COUNT` has been incremented past it.
+
+== The exit Sequence
+
+When `main` returns, basaltc enters `exit(status)` and runs the teardown in a fixed order:
+
+[source,rust]
+----
+pub unsafe extern "C" fn exit(status: i32) -> ! {
+    // Step 1: atexit handlers (reverse order, under lock)
+    ATEXIT_LOCK.lock();
+    while ATEXIT_COUNT > 0 {
+        ATEXIT_COUNT -= 1;
+        if let Some(func) = ATEXIT_FUNCS[ATEXIT_COUNT] {
+            ATEXIT_LOCK.unlock();   // released so handler can re-register
+            func();
+            ATEXIT_LOCK.lock();
+        }
+    }
+    ATEXIT_LOCK.unlock();
+
+    // Step 2: C++ destructors via __cxa_atexit
+    __cxa_finalize(core::ptr::null_mut());
+
+    // Step 3: ELF .fini_array (reverse order)
+    let fini_start = core::ptr::addr_of!(SAVED_FINI_ARRAY_START).read();
+    let fini_end = core::ptr::addr_of!(SAVED_FINI_ARRAY_END).read();
+    call_fini_array(fini_start, fini_end);
+
+    // Step 4: flush stdio
+    crate::stdio::fflush_all();
+
+    // Step 5: kernel exit
+    _exit(status);
+}
+----
+
+Five steps in order:
+
+. **`atexit` handlers** registered with C `atexit(3)` run in **last-registered-first** order. The lock is released across each handler call so that a handler is allowed to register more atexit handlers via re-entrant `atexit` calls. When new handlers register during teardown, they will run in the next iteration of the loop (because `ATEXIT_COUNT` is incremented while the lock is held by the registering function).
+. **`__cxa_finalize(NULL)`** runs every C++ destructor previously registered via `__cxa_atexit`, in reverse registration order. The `NULL` `dso_handle` argument means "all DSOs". The same lock-release pattern is used so destructors can register more destructors.
+. **`.fini_array`** runs the executable's destructor function pointers in **reverse** order (note: `.init_array` runs forward, `.fini_array` runs reverse). The bounds were saved at startup by `__libc_start_main` into `SAVED_FINI_ARRAY_START` / `SAVED_FINI_ARRAY_END`.
+. **`stdio::fflush_all`** flushes every open `FILE*` stream so that buffered writes reach the kernel before the process disappears. See xref:../io/stdio.adoc[Buffered I/O].
+. **`_exit(status)`** calls `trona_posix::posix_exit(status)`, which makes the kernel `Send` to procmgr that terminates the process. This call never returns.
+
+The order is fixed and matches glibc / musl / FreeBSD libc.
+A few subtleties:
+
+* `atexit` and `__cxa_atexit` are stored in **separate** arrays with separate counters, but exit walks them sequentially: first all `atexit`, then all `__cxa_atexit`. This means a C `atexit` handler registered after a C++ destructor will still run **before** the destructor at exit time. This is the inverse of registration order across the two pools, but it matches the glibc convention (C handlers always wrap around C++ destructors).
+* Stdio flush happens after destructors. A C++ destructor that writes to `std::cout` or `printf` will see its output flushed correctly because the underlying `FILE*` is still alive at flush time.
+* `.eh_frame*` is discarded by the basaltc linker script, so destructors must not throw exceptions out of basaltc-linked code. Throwing from a `__cxa_atexit` destructor that is destroying a basaltc-internal object would call `terminate`. (The `LIBCXXABI_SILENT_TERMINATE` flag in libcxxabi makes this an immediate `_exit` instead of an unwind attempt.)
+
+== call_fini_array
+
+[source,rust]
+----
+unsafe fn call_fini_array(
+    start: *const unsafe extern "C" fn(),
+    mut p: *const unsafe extern "C" fn(),
+) {
+    while p > start {
+        p = p.sub(1);
+        let func = core::ptr::read(p);
+        func();
+    }
+}
+----
+
+Reverse iteration is the entire content of the function.
+There is no priority sorting at this stage because the executable's linker script has already sorted by `SORT_BY_INIT_PRIORITY` when emitting `.fini_array`.
+
+== __cxa_finalize from dlclose
+
+[source,rust]
+----
+pub unsafe extern "C" fn __cxa_finalize(dso_handle: *mut core::ffi::c_void) {
+    ATEXIT_LOCK.lock();
+    let mut i = CXA_ATEXIT_COUNT;
+    while i > 0 {
+        i -= 1;
+        let entry = CXA_ATEXIT_FUNCS[i].assume_init_ref();
+        if dso_handle.is_null() || entry.dso_handle == dso_handle {
+            ATEXIT_LOCK.unlock();
+            (entry.destructor)(entry.arg);
+            ATEXIT_LOCK.lock();
+        }
+    }
+    if dso_handle.is_null() {
+        CXA_ATEXIT_COUNT = 0;
+    }
+    ATEXIT_LOCK.unlock();
+}
+----
+
+`__cxa_finalize(NULL)` is called from `exit`.
+`__cxa_finalize(dso_handle)` is called from `dlclose` to clean up only the destructors that belong to the DSO being unloaded.
+Both paths use the same loop body and the same lock-release-around-call pattern.
+
+After `__cxa_finalize(NULL)` completes, `CXA_ATEXIT_COUNT` is reset to 0 to prevent the same destructors from running twice (on a hypothetical second `exit` call from a destructor).
+For `__cxa_finalize(dso_handle)` with a non-null handle, the count is **not** reset — the matched destructors stay in the array because basaltc does not implement compaction. The next `__cxa_finalize` call will skip over them because the entry's `destructor` field still points at unloaded code, but the `dso_handle` no longer matches anything.
+
+This is technically a small leak (the slots stay occupied) but is acceptable in practice because the slot count is small (128) and dlclose-with-finalize is rare.
+
+== exit vs _exit vs _Exit
+
+[cols="1,3"]
+|===
+| Function | Behavior
+
+| `exit(status)`
+| Full teardown: atexit, `__cxa_finalize`, `.fini_array`, stdio flush, `_exit`.
+
+| `_exit(status)`
+| Skips all C/C++ teardown. Calls `trona_posix::posix_exit(status)` directly. Useful in fork-then-exec children that should not run the parent's destructors.
+
+| `_Exit(status)`
+| C99 spelling of `_exit`. Implemented as a one-line wrapper that calls `_exit`.
+|===
+
+`_exit` is also the function that `exit` ultimately tail-calls — it is the only path to actually leave the process.
+The kernel side terminates the process, releases its address space, and notifies any waiting parent via the procmgr `waitpid` mechanism.
+
+The same `posix_exit` IPC also serves abnormal termination paths (uncaught signal handlers, `abort`, panic from a Rust `main`).
+Those paths bypass the C teardown entirely — `abort()` calls `_Exit(SIGABRT + 128)` after attempting a stack trace.
+
+== Constraints on Teardown Code
+
+* atexit and destructors run with all stdio FILE objects still alive — `printf` / `fprintf(stderr, ...)` work.
+* They run with all heap memory still mapped — `malloc` / `free` work.
+* They run with `libtrona.so` and `libc.so` still loaded — every `trona_posix::*` call still works.
+* They do **not** run after the kernel `posix_exit` syscall — once that returns control flow leaves user space.
+* They are not interruptible by signals (signals are masked between teardown steps because basaltc holds `ATEXIT_LOCK` across most of them).
+* They cannot rely on `errno` from a previous call — destructors should set `errno` themselves before calling functions that might clear it.
+
+`atexit` handlers do not receive arguments.
+`__cxa_atexit` destructors receive the `arg` they were registered with — this is how a destructor knows which object to destroy.
+A `static int x = init_x();` declaration in a C++ namespace generates an `__cxa_atexit(destroy_x, &x, __dso_handle)` registration during the executable's `.init_array`.
+
+== Related Pages
+
+* xref:runtime/crt-startup.adoc[CRT Startup] — where atexit handlers are registered (during `.init_array`)
+* xref:runtime/dynamic-linking.adoc[Dynamic Linking] — `dlclose` calls `__cxa_finalize(handle)` for the unloaded DSO
+* xref:../io/stdio.adoc[Buffered I/O] — what `fflush_all` actually does at exit time
+* xref:../cxx/cxxabi-and-unwind.adoc[libcxxabi and libunwind] — the C++ side that calls `__cxa_atexit`

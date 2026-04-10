@@ -1,0 +1,319 @@
+= Files and Directories
+:description: unistd, dirent, fcntl, stat, fts, glob — the file and directory API surface and how it routes through trona_posix
+
+This page covers the basaltc modules that operate on file descriptors and directory entries: `unistd.rs`, `dirent.rs`, `fts.rs`, `glob.rs`, `select.rs`, `ioctl.rs`, plus the `fcntl`/`stat` related entries from `unistd.rs`.
+Every function listed is a `#[unsafe(no_mangle)] pub extern "C" fn` thin wrapper around a `trona_posix::*` system call; the wrappers translate C ABI conventions (errno set, return -1 on failure) to the trona convention (negative result is the negated errno) and back.
+
+== Module Overview
+
+[cols="1,3"]
+|===
+| Module | Functions
+
+| `unistd.rs`
+| `open`, `close`, `read`, `write`, `pread`, `pwrite`, `lseek`, `dup`, `dup2`, `dup3`, `fcntl`, `pipe`, `pipe2`, `access`, `unlink`, `rmdir`, `mkdir`, `chdir`, `fchdir`, `getcwd`, `link`, `symlink`, `readlink`, `truncate`, `ftruncate`, `stat`, `lstat`, `fstat`, `chmod`, `fchmod`, `chown`, `fchown`, `lchown`, `umask`, `sync`, `fsync`, `fdatasync`, `readv`, `writev`, `isatty`, `ttyname`, `ttyname_r`, `getpid`, `getppid`, `getuid`, `getgid`, `geteuid`, `getegid`, `setuid`, `setgid`, `getgroups`, `setgroups`, `getlogin`, `gethostname`, `sethostname`
+
+| `dirent.rs`
+| `opendir`, `fdopendir`, `readdir`, `readdir_r`, `closedir`, `rewinddir`, `seekdir`, `telldir`, `dirfd`, `scandir`, `alphasort`, `versionsort`
+
+| `fts.rs`
+| `fts_open`, `fts_read`, `fts_children`, `fts_set`, `fts_close` — BSD file tree streams
+
+| `glob.rs`
+| `glob`, `globfree` — POSIX shell-style pattern expansion
+
+| `select.rs`
+| `select`, `pselect` — fd_set multiplexing
+
+| `ioctl.rs`
+| `ioctl` — generic device-control entry point
+|===
+
+The functional split is purely by API surface; underlying every call is the same VFS server reachable through `trona_posix::posix_*`.
+
+== File Descriptor Operations (unistd.rs)
+
+The unistd surface is the most heavily used part of basaltc.
+Every wrapper has the same shape: convert C arguments to Rust types, call `trona_posix::posix_*`, translate the result.
+
+[source,rust]
+----
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn open(path: *const u8, flags: i32, mode: u32) -> i32 {
+    let result = unsafe { trona_posix::posix_open(path, flags as u32, mode) };
+    if result < 0 {
+        errno::set_errno(-result as i32);
+        return -1;
+    }
+    result as i32
+}
+----
+
+The wrapper does five things:
+
+. Pass through the C string pointer untranslated (`trona_posix::posix_open` accepts `*const u8`).
+. Cast `flags` to the wider unsigned type that `trona_posix` expects.
+. Forward `mode` (the create mode for `O_CREAT`).
+. Convert a negative `trona_posix` result to the C convention: store `-result` in `errno`, return `-1`.
+. Pass a non-negative result through unchanged.
+
+This pattern repeats across all unistd functions.
+There are no clever optimizations or aggressive caching — every call is one IPC round-trip.
+
+== File Descriptor Routing in trona_posix
+
+`trona_posix::posix_*` does **not** dispatch on a per-server basis based on fd type.
+Instead, every fd in a SaltyOS process maps to a capability stored in a per-process fd table maintained by `trona_posix`.
+The capability points at one of several userland servers:
+
+[cols="1,3"]
+|===
+| fd backend | Server reached
+
+| Regular file
+| The vfsserver (which in turn talks to a filesystem server like saltyfs).
+
+| Pipe
+| The vfsserver pipe channel.
+
+| Socket
+| netsrv (TCP/UDP/ICMP) or the AF_UNIX server.
+
+| TTY / pty
+| posix_ttysrv.
+
+| Shared memory (`shm_open`)
+| The vfsserver's shm region.
+
+| Special device (`/dev/console`, `/dev/random`, ...)
+| The console server / `getrandom` etc.
+|===
+
+`trona_posix` knows which capability backs each fd, so calling `posix_read(fd, ...)` always reaches the right server without basaltc having to dispatch.
+This means basaltc's `unistd.rs` is uniformly thin — there is no special case for "read from a socket" versus "read from a regular file".
+
+== Path Translation
+
+basaltc passes paths through verbatim.
+There is no path canonicalization, no symlink resolution, no working-directory expansion in basaltc itself; the VFS server does all of that.
+Calling `open("../foo/bar", O_RDWR, 0)` sends the literal `"../foo/bar"` string to vfsserver, which resolves it relative to the calling process's current working directory (also tracked server-side).
+
+The one exception is `getcwd(buf, size)`:
+
+[source,rust]
+----
+pub unsafe extern "C" fn getcwd(buf: *mut u8, size: usize) -> *mut u8 {
+    let len = unsafe { trona_posix::posix_getcwd(buf, size) };
+    if len < 0 {
+        errno::set_errno(-len as i32);
+        return core::ptr::null_mut();
+    }
+    buf
+}
+----
+
+`getcwd` returns the buffer pointer on success, NULL on failure — the C convention. No string copy in basaltc; trona_posix writes directly into the user buffer.
+
+`realpath` (in `stdlib.rs` rather than `unistd.rs`) is the one path-resolution function that runs partly in basaltc.
+It calls `posix_stat` repeatedly while walking the path components, allocating a result buffer with `malloc`.
+
+== Stat Family
+
+`stat`, `lstat`, `fstat` populate a `struct stat`:
+
+[source,rust]
+----
+pub unsafe extern "C" fn stat(path: *const u8, buf: *mut Stat) -> i32 {
+    let result = unsafe { trona_posix::posix_stat(path, buf) };
+    if result < 0 {
+        errno::set_errno(-result as i32);
+        return -1;
+    }
+    0
+}
+----
+
+The `Stat` type is `#[repr(C)]` and matches the layout declared in `lib/basalt/c/include/sys/stat.h`.
+basaltc and `trona_posix` share the type from `trona::types` so there is no field-by-field copy.
+
+`fstatat` is implemented (Linux extension widely used by ports) and routes through `posix_fstatat`.
+
+== Directories (dirent.rs)
+
+[source,rust]
+----
+#[repr(C)]
+pub struct DIR {
+    fd: i32,
+    // ... cookie state for trona_posix
+}
+
+pub unsafe extern "C" fn opendir(path: *const u8) -> *mut DIR {
+    let dir = trona_posix::dirent::posix_opendir(path);
+    // ... allocate DIR struct, store the cookie ...
+}
+
+pub unsafe extern "C" fn readdir(dir: *mut DIR) -> *mut Dirent {
+    let entry_ptr = trona_posix::dirent::posix_readdir(...);
+    // ... return pointer to next entry ...
+}
+----
+
+The `DIR` struct is opaque to user code (declared in `<dirent.h>` as a forward declaration).
+Inside basaltc it carries the underlying fd and the trona_posix cookie used to position within the directory stream.
+
+`scandir(path, namelist, filter, compar)` allocates an array of `dirent*` pointers via `malloc`, walks the directory with `readdir`, applies the filter callback, and sorts with `qsort` using the user-supplied comparator.
+`alphasort` and `versionsort` are stock comparators provided as helpers.
+
+`readdir_r` (the reentrant variant) is implemented but is deprecated in glibc. It still works on basaltc; ports that use it do not need to switch.
+
+== fcntl
+
+`fcntl(fd, cmd, ...)` is the swiss-army-knife operation: duplicate fd, set/clear flags, set file lock, query owner.
+basaltc supports the common subset:
+
+[cols="1,3"]
+|===
+| Command | Action
+
+| `F_DUPFD`, `F_DUPFD_CLOEXEC`
+| Duplicate fd, optionally with `O_CLOEXEC`
+
+| `F_GETFD`, `F_SETFD`
+| Get/set close-on-exec flag
+
+| `F_GETFL`, `F_SETFL`
+| Get/set file status flags (`O_NONBLOCK`, `O_APPEND`, etc.)
+
+| `F_GETOWN`, `F_SETOWN`
+| Get/set fd owner for `SIGIO` delivery
+
+| `F_GETLK`, `F_SETLK`, `F_SETLKW`
+| Advisory file locking
+
+| `F_GETPIPE_SZ`, `F_SETPIPE_SZ`
+| Pipe buffer size (Linux extension widely used)
+|===
+
+Each command routes through `trona_posix::posix_fcntl`, which forwards the request to the appropriate server.
+File locking is handled by vfsserver; advisory locks are per-process and do not cross fork boundaries.
+
+== readv / writev
+
+Vectored I/O is supported for fds that the underlying server supports it on:
+
+[source,rust]
+----
+pub unsafe extern "C" fn readv(fd: i32, iov: *const Iovec, iovcnt: i32) -> isize {
+    let result = unsafe { trona_posix::posix_readv(fd, iov, iovcnt) };
+    if result < 0 {
+        errno::set_errno(-result as i32);
+        return -1;
+    }
+    result as isize
+}
+----
+
+`Iovec` is `#[repr(C)]` and matches the standard struct.
+basaltc passes the iov array through to trona_posix, which constructs the appropriate IPC payload.
+
+== select / pselect
+
+`select.rs` reduces `select()` to `poll()`:
+
+[source,rust]
+----
+pub unsafe extern "C" fn select(
+    nfds: i32, readfds: *mut FdSet, writefds: *mut FdSet,
+    exceptfds: *mut FdSet, timeout: *mut Timeval,
+) -> i32 {
+    // 1. Convert (readfds, writefds, exceptfds) to a pollfd[] up to nfds.
+    // 2. Convert timeout from struct timeval to milliseconds.
+    // 3. Call trona_posix::poll::posix_poll(pollfds, count, ms).
+    // 4. Convert the pollfd events back to the three fd_sets.
+    // 5. Return the count of fds with any event.
+}
+----
+
+The reduction is straightforward because basaltc has no select-specific kernel support — every fd is pollable, and the pollable bitmap on each fd carries the read/write/error events that select wants.
+
+`pselect` adds an atomic signal mask switch around the wait, which trona_posix supports natively via a separate `posix_ppoll` entry point.
+
+== fts and glob
+
+`fts_open(paths, options, compar)` returns an `FTS*` cursor:
+
+[source,rust]
+----
+pub struct FTS {
+    // root paths array
+    // current state
+    // options (FTS_PHYSICAL | FTS_LOGICAL | FTS_NOCHDIR | FTS_COMFOLLOW | ...)
+    // compar callback
+}
+----
+
+Each call to `fts_read(fts)` returns the next `FTSENT` (a struct with the path, depth, file type, stat result, and flags).
+fts handles directory entry sorting (via the user comparator), depth tracking, post-order vs pre-order traversal, and physical vs logical (symlink-following) walks.
+
+The implementation is a faithful port of the FreeBSD `fts(3)` interface and uses `posix_opendir`/`posix_readdir`/`posix_stat` underneath.
+About 900 lines of basaltc code; one of the largest single modules outside of `stdio` and `wchar`.
+
+`glob(pattern, flags, errfunc, pglob)` performs shell-style pattern expansion (`*`, `?`, `[...]`, `{...}`):
+
+[source,rust]
+----
+pub unsafe extern "C" fn glob(
+    pattern: *const u8, flags: i32,
+    errfunc: Option<unsafe extern "C" fn(*const u8, i32) -> i32>,
+    pglob: *mut Glob,
+) -> i32 {
+    // 1. Parse the pattern into segments.
+    // 2. For each directory level, opendir + readdir, match each entry against the segment.
+    // 3. Recurse for the next segment.
+    // 4. Sort the result (unless GLOB_NOSORT).
+    // 5. Allocate the result array via malloc and store in pglob.
+}
+----
+
+`globfree(pglob)` frees the result array.
+
+`fnmatch(pattern, string, flags)` lives in `glob.rs` as well, since it shares the pattern matcher.
+
+== ioctl
+
+`ioctl.rs` is one function:
+
+[source,rust]
+----
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ioctl(fd: i32, request: u64, arg: *mut u8) -> i32 {
+    let result = unsafe { trona_posix::ioctl::posix_ioctl(fd, request, arg) };
+    if result < 0 {
+        errno::set_errno(-result as i32);
+        return -1;
+    }
+    result
+}
+----
+
+The `request` is a 32-bit ioctl number with embedded direction, type, and command bits.
+trona_posix decodes it and routes to the right server (terminal control to posix_ttysrv, socket control to netsrv, etc.).
+
+basaltc does not interpret the request — it is just a tunnel.
+Higher-level wrappers like `tcgetattr` (in `termios.rs`) build the appropriate `TCGETS` request and call this function.
+
+== Common Pitfalls
+
+* **No buffering** — `read()` and `write()` are direct, unlike `fread()` / `fwrite()`. A `read(fd, buf, 1)` issues one IPC call.
+* **`O_DIRECTORY`** is honored — `open()`-ing a path that is not a directory with `O_DIRECTORY` returns `ENOTDIR`.
+* **`O_CLOEXEC`** must be passed at open time. There is no `fcntl(F_SETFD, FD_CLOEXEC)` shortcut — well, the shortcut works, but a fork between `open` and `fcntl` would inherit the fd unflagged.
+* **`getcwd(NULL, 0)`** is the GNU extension that returns a `malloc`'d buffer. basaltc supports it.
+* **`ttyname(fd)`** allocates from a per-thread TLS buffer — see xref:../internals/trona-boundary.adoc[trona Boundary]. The pointer becomes invalid on the next call from the same thread.
+
+== Related Pages
+
+* xref:io/stdio.adoc[Buffered I/O (stdio)] — `FILE*` layer built on top of these functions
+* xref:../process/processes-and-signals.adoc[Processes and Signals] — `fork`, `exec`, `wait` are also in `process.rs`
+* xref:../internals/trona-boundary.adoc[trona Boundary] — `trona_posix` mapping for every function above
+* xref:../net/sockets.adoc[Sockets] — `socket()` returns an fd usable with `read`/`write`

@@ -1,0 +1,256 @@
+= libc++ Configuration
+:description: __config_site flags that pin SaltyOS-specific libc++ behavior — locale, threading, hardening, random source
+
+`lib/basalt/cpp/__config_site` is a 71-line C header that pins libc++'s compile-time configuration for SaltyOS.
+It is included via `-include __config_site` in every libcxx and libcxxabi compilation, before any standard libcxx header processes its own configuration logic.
+The file replaces the upstream `libcxx/include/__config_site.in` template that LLVM's CMake build would normally generate.
+This page walks through every macro, explains the SaltyOS choice, and lists the user-visible consequences.
+
+== File Structure
+
+[source,cpp]
+----
+// __config_site — SaltyOS libc++ compile-time configuration
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+#ifndef _LIBCPP___CONFIG_SITE
+#define _LIBCPP___CONFIG_SITE
+
+// ABI versioning
+#define _LIBCPP_ABI_VERSION 1
+#define _LIBCPP_ABI_NAMESPACE __1
+#define _LIBCPP_ABI_FORCE_ITANIUM 1
+#define _LIBCPP_ABI_FORCE_MICROSOFT 0
+
+// Threading
+#define _LIBCPP_HAS_THREADS 1
+#define _LIBCPP_HAS_MONOTONIC_CLOCK 1
+#define _LIBCPP_HAS_TERMINAL 0
+#define _LIBCPP_HAS_MUSL_LIBC 0
+#define _LIBCPP_HAS_THREAD_API_PTHREAD 1
+#define _LIBCPP_HAS_THREAD_API_EXTERNAL 0
+#define _LIBCPP_HAS_THREAD_API_WIN32 0
+#define _LIBCPP_HAS_THREAD_API_C11 0
+
+// Filesystem and random
+#define _LIBCPP_HAS_FILESYSTEM 1
+#define _LIBCPP_HAS_RANDOM_DEVICE 1
+#define _LIBCPP_USING_GETENTROPY
+
+// Locale (C-locale only via SaltyOS backend)
+#define _LIBCPP_LOCALE_BACKEND_SALTYOS
+#define _LIBCPP_HAS_LOCALIZATION 1
+#define _LIBCPP_PROVIDES_DEFAULT_RUNE_TABLE
+#define _LIBCPP_HAS_UNICODE 0
+#define _LIBCPP_HAS_WIDE_CHARACTERS 1
+#define _LIBCPP_HAS_TIME_ZONE_DATABASE 0
+
+// Hardening (off — baremetal)
+#define _LIBCPP_HARDENING_MODE_DEFAULT _LIBCPP_HARDENING_MODE_NONE
+#define _LIBCPP_ASSERTION_SEMANTIC_DEFAULT _LIBCPP_ASSERTION_SEMANTIC_IGNORE
+
+// Misc
+#define _LIBCPP_INSTRUMENTED_WITH_ASAN 0
+#define _LIBCPP_HAS_VENDOR_AVAILABILITY_ANNOTATIONS 0
+#define _LIBCPP_LIBC_PICOLIBC 0
+#define _LIBCPP_LIBC_NEWLIB 0
+#define _LIBCPP_LIBC_LLVM_LIBC 0
+#define _LIBCPP_PSTL_BACKEND_SERIAL 1
+
+#endif
+----
+
+== ABI Versioning
+
+[cols="1,1,3"]
+|===
+| Macro | Value | Effect
+
+| `_LIBCPP_ABI_VERSION`
+| 1
+| Standard libc++ ABI v1. Compatible with mainstream Linux distributions.
+
+| `_LIBCPP_ABI_NAMESPACE`
+| `__1`
+| Inline namespace for ABI v1 symbols. Mangled into every libc++ symbol so that future ABI changes can coexist.
+
+| `_LIBCPP_ABI_FORCE_ITANIUM`
+| 1
+| Force the Itanium C++ ABI even on platforms where another ABI might be the default. Itanium is the standard on x86_64 and aarch64 Linux/BSD, so this is the safe choice.
+
+| `_LIBCPP_ABI_FORCE_MICROSOFT`
+| 0
+| Disabled — basalt does not target the Microsoft Visual C++ ABI even though it has a Win32 subsystem (which uses MSVC ABI through `kernel32.dll` PE shim, separately from libc++).
+|===
+
+== Threading
+
+[cols="1,3"]
+|===
+| Macro | Effect
+
+| `_LIBCPP_HAS_THREADS = 1`
+| Enable `<thread>`, `<mutex>`, `<condition_variable>`, `<atomic>` (with hardware atomics), `<future>`, `<barrier>`, `<latch>`, `<shared_mutex>`. The whole concurrency surface.
+
+| `_LIBCPP_HAS_MONOTONIC_CLOCK = 1`
+| Enable `std::chrono::steady_clock`. Without this, only `system_clock` is available.
+
+| `_LIBCPP_HAS_THREAD_API_PTHREAD = 1`
+| Use the POSIX pthread API as the threading backend. The other three (EXTERNAL, WIN32, C11) are 0.
+|===
+
+The pthread backend means libc++'s thread/mutex/condvar are thin wrappers around basaltc's `pthread.rs`, which is itself a thin wrapper around `trona_posix::pthread::*`.
+See xref:../process/threads-and-sync.adoc[Threads and Synchronization].
+
+`_LIBCPP_HAS_TERMINAL = 0` disables libc++'s terminal-color output (for assertion messages); SaltyOS does not have a `<termios>`-aware libc++ output path.
+
+`_LIBCPP_HAS_MUSL_LIBC = 0` is correct because SaltyOS uses basaltc, not musl. libc++ has a few musl-specific workarounds (mostly around `wchar_t` and locale) that this disables.
+
+== Filesystem
+
+`_LIBCPP_HAS_FILESYSTEM = 1` enables `<filesystem>` headers, but the runtime support is partial:
+
+* `std::filesystem::path` — fully working (pure path string manipulation, no I/O).
+* `std::filesystem::filesystem_clock` — working.
+* `std::filesystem::filesystem_error` — working.
+* `std::filesystem::directory_entry`, `directory_iterator`, `recursive_directory_iterator` — **not built** (the libcxx sources `directory_entry.cpp`, `directory_iterator.cpp`, `operations.cpp` are deliberately excluded from `_cxx_srcs` in `lib/basalt/cpp/meson.build`).
+* `std::filesystem::create_directory`, `remove`, `rename`, etc. — **not built** for the same reason.
+
+Programs that include `<filesystem>` to manipulate path strings (parse, join, normalize) work fine.
+Programs that walk a directory tree with `directory_iterator` will fail at link time with unresolved symbols.
+
+This is a known partial conformance.
+The directory walk operations could be enabled by adding the libcxx sources to the build and providing the underlying `posix_opendir` / `posix_readdir` calls (which basaltc already exposes), but that work has not been done.
+
+== Random Device
+
+`_LIBCPP_HAS_RANDOM_DEVICE = 1` enables `std::random_device`.
+`_LIBCPP_USING_GETENTROPY` selects the `getentropy(2)` backend rather than reading from `/dev/random` or `/dev/urandom`.
+
+The reason: SaltyOS provides `getentropy` directly through `trona_posix::getrandom` (which talks to the kernel's RDRAND/randr source), but does not yet have a `/dev/random` device file.
+Pre-defining `_LIBCPP_USING_GETENTROPY` ensures libc++'s random_device implementation picks the right backend on the first try.
+Without this, libc++'s `__config` chain falls through to "unknown target" and selects `/dev/random`, which would fail at runtime.
+
+== Locale Backend
+
+[cols="1,3"]
+|===
+| Macro | Effect
+
+| `_LIBCPP_LOCALE_BACKEND_SALTYOS`
+| Custom backend defined under `__locale_dir/support/saltyos.h`. Implements `locale_t` as a no-op sentinel and routes character classification through the basaltc rune table.
+
+| `_LIBCPP_HAS_LOCALIZATION = 1`
+| Enable the `<locale>` header. Without this, the entire localization layer is disabled and several stream operations fail to compile.
+
+| `_LIBCPP_PROVIDES_DEFAULT_RUNE_TABLE`
+| Tells libc++ to use its built-in power-of-two rune table for `ctype_base::mask` instead of expecting a host libc to provide `_CTYPE_*` macros. Same approach as Fuchsia, Bionic, WASI.
+
+| `_LIBCPP_HAS_UNICODE = 0`
+| Disable the Unicode-aware `std::format` numeric formatters and the Unicode width tables. Numeric formatting still works for the basic cases.
+
+| `_LIBCPP_HAS_WIDE_CHARACTERS = 1`
+| Enable `wchar_t` overloads in the standard library: `wstring`, `wcin`/`wcout`, `wregex`, etc.
+
+| `_LIBCPP_HAS_TIME_ZONE_DATABASE = 0`
+| Disable `std::chrono::time_zone` and `std::chrono::zoned_time`. The IANA timezone database is not bundled. Programs using `<chrono>` for clocks and durations work; programs using `<chrono>` for civil-time conversion in named time zones do not.
+|===
+
+The C-locale-only choice is consistent across basaltc and libc++.
+See xref:../text/locale-and-ctype.adoc[Locale, ctype and wchar] for the basaltc side.
+
+== Hardening
+
+[cols="1,3"]
+|===
+| Macro | Effect
+
+| `_LIBCPP_HARDENING_MODE_DEFAULT = _LIBCPP_HARDENING_MODE_NONE`
+| Disable all bounds-checking, debug assertions, and runtime invariant checks in libc++. Programs that index out of bounds in `std::vector` get undefined behavior, not a runtime trap.
+
+| `_LIBCPP_ASSERTION_SEMANTIC_DEFAULT = _LIBCPP_ASSERTION_SEMANTIC_IGNORE`
+| Make `_LIBCPP_ASSERT` a no-op when triggered. Combined with the hardening mode above, this removes all libc++-internal sanity checks.
+|===
+
+The choice prioritizes runtime overhead over safety.
+basalt is a "baremetal-style" libc++: small, fast, and trusts the caller.
+A future build flag could expose `_LIBCPP_HARDENING_MODE_FAST` (the upstream default) for debug builds without changing this file — that would require the `__assertion_handler` to actually do something useful.
+
+== Miscellaneous
+
+[cols="1,3"]
+|===
+| Macro | Effect
+
+| `_LIBCPP_INSTRUMENTED_WITH_ASAN = 0`
+| Not built with AddressSanitizer. SaltyOS does not have ASan support.
+
+| `_LIBCPP_HAS_VENDOR_AVAILABILITY_ANNOTATIONS = 0`
+| Apple-specific availability annotations disabled.
+
+| `_LIBCPP_LIBC_PICOLIBC = 0`
+| Not using picolibc.
+
+| `_LIBCPP_LIBC_NEWLIB = 0`
+| Not using newlib.
+
+| `_LIBCPP_LIBC_LLVM_LIBC = 0`
+| Not using LLVM libc. (basaltc is implicitly the C library.)
+
+| `_LIBCPP_PSTL_BACKEND_SERIAL = 1`
+| Parallel STL uses the serial backend — `std::execution::par` and `std::execution::par_unseq` run sequentially. The threading-aware backends require an additional dependency that basalt does not have.
+|===
+
+== User-Visible Consequences
+
+What works:
+
+* All container types: `vector`, `string`, `map`, `unordered_map`, `set`, `unordered_set`, `deque`, `list`, `array`, `forward_list`, `tuple`, `optional`, `variant`, `expected`, `span`, `string_view`.
+* Algorithms: `<algorithm>`, `<numeric>`, `<ranges>` (C++20).
+* Threading: `thread`, `mutex`, `condition_variable`, `shared_mutex`, `barrier`, `latch`, `atomic`, `future`.
+* Iostreams: `cin`, `cout`, `cerr`, `ifstream`, `ofstream`, `stringstream`. (Note: stream `<<` formatting is locale-bound but uses the C locale, which is fine for English text and numbers.)
+* `<chrono>` for clocks and durations.
+* `<charconv>` for `to_chars` / `from_chars` numeric conversion (uses Ryu).
+* `<format>` C++20/23 format strings (basic forms).
+* `<random>` random number generators (random_device backed by getentropy).
+* `<regex>` (libc++'s own regex, distinct from the C `regex.h` in basaltc).
+* RTTI (`typeid`, `dynamic_cast`).
+* C++ exceptions (with libunwind).
+
+What does not work:
+
+* `std::filesystem::directory_iterator` and the directory traversal API.
+* `std::chrono::time_zone`, `zoned_time`, and the IANA tzdb.
+* `std::execution::par` parallel STL.
+* Locale-aware sorting (`std::collate` returns C-locale results).
+* Locale switching (`std::locale("ja_JP.UTF-8")` returns the C locale).
+* Unicode-aware width and case in `<format>`.
+* Hardening assertions on container access.
+
+== Modifying the Configuration
+
+To change a setting, edit `lib/basalt/cpp/__config_site` and rebuild.
+The file is included via `-include` in every libcxx compilation, so a change triggers a full rebuild of `libc++.so`.
+
+To enable libc++ assertions for debugging:
+
+[source,cpp]
+----
+#define _LIBCPP_HARDENING_MODE_DEFAULT _LIBCPP_HARDENING_MODE_FAST
+#define _LIBCPP_ASSERTION_SEMANTIC_DEFAULT _LIBCPP_ASSERTION_SEMANTIC_TRAP
+----
+
+This catches out-of-bounds accesses with a hard trap. Useful when debugging a port crash. Production builds should leave the hardening off because it adds bounds-check instructions to every container access.
+
+To enable filesystem directory traversal:
+
+. Add the missing libcxx sources to `_cxx_srcs` in `lib/basalt/cpp/meson.build`: `filesystem/directory_entry.cpp`, `filesystem/directory_iterator.cpp`, `filesystem/operations.cpp`.
+. Verify that the basaltc `posix_opendir` / `posix_readdir` paths are reachable from libcxx (they should be, via the C library).
+. Test against a port that uses `directory_iterator`.
+
+== Related Pages
+
+* xref:cxx/cxx-runtime.adoc[libc++ Runtime] — overall composition
+* xref:cxx/cxxabi-and-unwind.adoc[libcxxabi and libunwind] — exception runtime detail
+* xref:../text/locale-and-ctype.adoc[Locale, ctype and wchar] — the C-locale policy on the basaltc side
+* xref:../runtime/heap-and-malloc.adoc[Heap and malloc] — `operator new` calls into basaltc's malloc

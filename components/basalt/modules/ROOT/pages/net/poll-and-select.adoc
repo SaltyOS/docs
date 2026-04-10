@@ -1,0 +1,227 @@
+= Poll and Select
+:description: select reduces to posix_poll, fd_set encoding, timeout conversion, and the pselect signal mask handshake
+
+basaltc supports both `poll` and `select` for fd multiplexing.
+`poll` is the native form: `select.rs` reduces `select` to a `pollfd[]` array and forwards to `trona_posix::poll::posix_poll`.
+This page covers the reduction, the `fd_set` encoding, the timeout conversion, the `pselect`/`ppoll` signal mask handshake, and the relationship with epoll.
+
+== Why Two APIs?
+
+`select` is older (POSIX 1990) and has a fixed-size bitmap representation that does not scale beyond `FD_SETSIZE` (typically 1024 on Linux, 1024 on basaltc as well).
+`poll` (POSIX 1990 too, but more widely deployed later) uses a variable-length array of `struct pollfd` entries and has no fd-number cap.
+
+basaltc supports both because ports use both, but underneath, only `poll` is real — `select` reduces to `poll` at the basaltc level before any IPC happens.
+
+== fd_set Layout
+
+`fd_set` is a bitmap with one bit per fd:
+
+[source,c]
+----
+#define FD_SETSIZE 1024
+typedef struct {
+    unsigned long fds_bits[FD_SETSIZE / (8 * sizeof(unsigned long))];
+} fd_set;
+----
+
+basaltc declares the same layout in `<sys/select.h>`.
+The standard macros operate on the bitmap:
+
+* `FD_ZERO(set)` — clear all bits
+* `FD_SET(fd, set)` — set bit `fd`
+* `FD_CLR(fd, set)` — clear bit `fd`
+* `FD_ISSET(fd, set)` — test bit `fd`
+
+These are typically inline functions or macros in `<sys/select.h>`; basaltc provides them as both inline and out-of-line so any caller convention works.
+
+`FD_SETSIZE` is 1024 on basaltc.
+This means `select` cannot multiplex on fds with values >= 1024.
+A program that hits this limit needs to use `poll` or `epoll` instead.
+
+== select Reduction
+
+[source,rust]
+----
+pub unsafe extern "C" fn select(
+    nfds: i32,
+    readfds: *mut FdSet, writefds: *mut FdSet, exceptfds: *mut FdSet,
+    timeout: *mut Timeval,
+) -> i32 {
+    // 1. Walk the three fd_sets up to nfds.
+    //    For each fd whose bit is set in any of the three sets,
+    //    add a pollfd entry with the appropriate events mask.
+    let mut polls: [PollFd; FD_SETSIZE] = [PollFd::default(); FD_SETSIZE];
+    let mut npolls = 0usize;
+    for fd in 0..nfds {
+        let mut events = 0i16;
+        if readfds  is set on fd { events |= POLLIN; }
+        if writefds is set on fd { events |= POLLOUT; }
+        if exceptfds is set on fd { events |= POLLPRI; }
+        if events != 0 {
+            polls[npolls] = PollFd { fd, events, revents: 0 };
+            npolls += 1;
+        }
+    }
+
+    // 2. Convert struct timeval to milliseconds.
+    let timeout_ms = if timeout.is_null() {
+        -1  // wait forever
+    } else {
+        let tv = *timeout;
+        (tv.tv_sec * 1000 + tv.tv_usec / 1000) as i32
+    };
+
+    // 3. Call the underlying poll.
+    let n = trona_posix::poll::posix_poll(polls.as_mut_ptr(), npolls, timeout_ms);
+
+    // 4. Convert pollfd revents back into the three fd_sets.
+    if !readfds.is_null()  { (*readfds).clear();  }
+    if !writefds.is_null() { (*writefds).clear(); }
+    if !exceptfds.is_null(){ (*exceptfds).clear();}
+    for i in 0..npolls {
+        let p = &polls[i];
+        if p.revents & POLLIN  != 0 { set bit p.fd in readfds  }
+        if p.revents & POLLOUT != 0 { set bit p.fd in writefds }
+        if p.revents & POLLPRI != 0 { set bit p.fd in exceptfds}
+    }
+
+    // 5. Return the count of fds with any event.
+    n
+}
+----
+
+The reduction is straightforward: each set bit in any of the three input sets becomes a `pollfd` entry with `POLLIN` / `POLLOUT` / `POLLPRI` as appropriate.
+After `poll` returns, the three output sets are cleared and rebuilt from the `revents` fields.
+
+The pollfd buffer is stack-allocated (1024 entries × 8 bytes = 8 KB) so `select` does not allocate.
+
+== Timeout Conversion
+
+`select` takes a `struct timeval` (seconds + microseconds), `poll` takes milliseconds:
+
+[source,c]
+----
+struct timeval { time_t tv_sec; suseconds_t tv_usec; };
+----
+
+The conversion is `tv_sec * 1000 + tv_usec / 1000`, which loses sub-millisecond precision.
+This is acceptable because `poll`/`epoll` use millisecond precision throughout SaltyOS, and a microsecond-precision wait would require a different syscall altogether.
+
+`NULL` timeout means "wait forever" (-1 in milliseconds).
+Zero timeout (`tv_sec = 0`, `tv_usec = 0`) means "poll, do not block" — `posix_poll` with timeout 0 is the equivalent.
+
+`select` does not modify `*timeout` on return (basaltc follows the BSD convention).
+The Linux convention of decrementing `*timeout` to reflect the time remaining is not implemented; ports that depend on it must save and restore the value themselves.
+
+== pselect — Atomic Mask + Wait
+
+`pselect` is `select` with two additional behaviors:
+
+. The timeout is `struct timespec` (nanosecond precision input) instead of `struct timeval`.
+. An optional signal mask is atomically applied for the duration of the wait.
+
+[source,rust]
+----
+pub unsafe extern "C" fn pselect(
+    nfds: i32,
+    readfds: *mut FdSet, writefds: *mut FdSet, exceptfds: *mut FdSet,
+    timeout: *const Timespec, sigmask: *const Sigset,
+) -> i32 {
+    // Save current signal mask
+    let saved_mask = if !sigmask.is_null() {
+        let mut old: Sigset = ...;
+        sigprocmask(SIG_SETMASK, sigmask, &mut old);
+        Some(old)
+    } else { None };
+
+    // Convert timespec to ms (with rounding)
+    let timeout_ms = ...;
+
+    // Reduce to poll as before
+    let n = posix_poll(...);
+
+    // Restore signal mask
+    if let Some(old) = saved_mask {
+        sigprocmask(SIG_SETMASK, &old, core::ptr::null_mut());
+    }
+
+    n
+}
+----
+
+The atomicity in glibc's pselect is provided by a kernel ppoll syscall that takes the mask as an argument.
+basaltc's pselect uses `sigprocmask` before and after, which leaves a tiny window where the original mask is restored *after* the wait completes — meaning a signal that arrives between the wait and the mask restore can still be observed by the user code.
+This is safe but slightly different from the Linux atomic semantics.
+
+For ports that need strict atomicity (typically: a SIGINT-aware loop using pselect to avoid the lost-signal race), the right pattern is to set up a signal handler that writes to a pipe and read from that pipe in the pselect — the self-pipe trick — which works correctly under both atomic and non-atomic implementations.
+
+`ppoll(fds, nfds, timeout, sigmask)` is the same atomic-mask pattern applied to native `poll`.
+
+== POLL* Constants
+
+[cols="1,3"]
+|===
+| Flag | Meaning
+
+| `POLLIN`
+| Data available to read.
+
+| `POLLOUT`
+| Space available to write.
+
+| `POLLPRI`
+| Out-of-band data (rare; mostly TCP urgent).
+
+| `POLLERR`
+| Error condition (output only, set by poll regardless of input mask).
+
+| `POLLHUP`
+| Hangup (peer closed).
+
+| `POLLNVAL`
+| Invalid fd (output only).
+
+| `POLLRDHUP`
+| Linux extension: shutdown of the read half of a stream socket.
+|===
+
+The mapping from select to poll uses `POLLIN`/`POLLOUT`/`POLLPRI`.
+`POLLERR`, `POLLHUP`, `POLLNVAL` are reported back via `revents` regardless of the input mask, and the select reduction maps them to the read set (POSIX's "exception" semantics for select are weak; the read fd_set is the closest match).
+
+== epoll vs poll vs select
+
+basaltc supports all three because the SaltyOS port set includes software written against each:
+
+[cols="1,1,3"]
+|===
+| API | When to use | Notes
+
+| `select`
+| Legacy code, simple cases with few fds
+| O(nfds) at every call. Fixed FD_SETSIZE limit.
+
+| `poll`
+| Most ports, moderate fd counts
+| O(N) where N is the number of pollfds. No FD_SETSIZE limit. The native form on basaltc — everything else reduces to it.
+
+| `epoll`
+| High-fd-count event loops, libevent backends
+| O(1) at wait time after O(log N) registration. Edge-triggered or level-triggered. Linux extension; supported on basaltc for compatibility.
+|===
+
+Internally, all three reach the same vfs/netsrv readiness mechanism.
+The difference is the user-facing API and the per-call cost.
+
+== Constraints
+
+* `select` is capped at `FD_SETSIZE = 1024`. Higher fd values silently fall outside the bitmap and are not polled.
+* `poll` is unbounded but the basaltc reduction in `select` uses a 1024-entry stack array, so `select` cannot call `poll` with more than 1024 entries even if all bits in the input set are below 1024.
+* Sub-millisecond timeouts in `select` and `pselect` are rounded down to 0 (poll-once). Sub-millisecond waits are not possible without a different API.
+* `pselect` is not strictly atomic with respect to signal mask (see "pselect" above).
+
+== Related Pages
+
+* xref:net/sockets.adoc[Sockets] — every socket fd is pollable
+* xref:../process/processes-and-signals.adoc[Processes and Signals] — `pselect` and the cooperative signal model
+* xref:../io/files-and-directories.adoc[Files and Directories] — every file fd is also pollable (ready when readable/writable)
+* xref:../internals/trona-boundary.adoc[trona Boundary] — `trona_posix::poll::posix_poll`

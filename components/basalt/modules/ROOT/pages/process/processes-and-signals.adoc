@@ -1,0 +1,308 @@
+= Processes and Signals
+:description: fork, exec, wait, signal handling — and the cooperative signal delivery model that makes SA_RESTART unnecessary
+
+basaltc's process control surface lives in `process.rs` (fork, exec, waitpid, kill, system, popen) and `signal.rs` (signal, sigaction, sigprocmask, raise).
+The signal model is unusual compared to glibc and FreeBSD: SaltyOS delivers signals **cooperatively** through trona notification objects rather than interrupting system calls.
+This page explains the process control wrappers, the cooperative signal model, why `SA_RESTART` has no effect, and the consequences for ports that depend on traditional signal semantics.
+
+== Process Control (process.rs)
+
+The process module wraps the fork/exec/wait family.
+Each function is the usual thin shim:
+
+[source,rust]
+----
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fork() -> i32 {
+    let result = unsafe { trona_posix::posix_fork() };
+    if result < 0 {
+        errno::set_errno(-result as i32);
+        return -1;
+    }
+    result as i32
+}
+----
+
+The full surface:
+
+[cols="1,3"]
+|===
+| Function | trona_posix call | Notes
+
+| `fork()`
+| `posix_fork`
+| Returns child PID to parent, 0 to child, -1 on failure. Underlying procmgr clones the address space (COW), CSpace, and fd table.
+
+| `vfork()`
+| `posix_fork`
+| Identical to `fork` on SaltyOS — there is no separate vfork path because COW already avoids the duplication cost vfork was designed to skip.
+
+| `execve(path, argv, envp)`
+| `posix_execve`
+| Replaces the current process image. On success does not return; on failure sets `errno` and returns -1.
+
+| `execv`, `execvp`, `execl`, `execlp`, `execle`, `execvpe`
+| `posix_execve` after argv/envp construction
+| Convenience wrappers. `execvp`/`execlp` walk `$PATH`. `execle`/`execvpe` use a custom envp.
+
+| `waitpid(pid, status, options)`
+| `posix_waitpid`
+| Returns the PID of the changed child or 0 (with `WNOHANG`) or -1.
+
+| `wait(status)`
+| `waitpid(-1, status, 0)`
+| One-line wrapper.
+
+| `kill(pid, sig)`
+| `posix_kill`
+| Send a signal to a process or process group. -1 with `errno = EPERM` if the caller lacks permission.
+
+| `raise(sig)`
+| `signals::posix_raise`
+| Send a signal to the current process. Implemented in `signal.rs`.
+
+| `system(cmd)`
+| `fork` + `execve("/bin/sh", "-c", cmd)` + `waitpid`
+| Runs a shell command. Returns the child's exit status.
+
+| `popen(cmd, mode)`, `pclose(fp)`
+| `pipe` + `fork` + `execve("/bin/sh", "-c", cmd)`
+| Opens a `FILE*` connected to a child process's stdin or stdout.
+
+| `getpid`, `getppid`, `getpgrp`, `getpgid`, `setpgid`, `setsid`, `getsid`
+| `posix_*`
+| Process and session identifiers.
+|===
+
+`fork` is the operation with the most kernel interaction.
+The procmgr server clones the parent's address space using COW (copy-on-write at the page table level), duplicates the parent's fd capability slots, and creates a new TCB.
+The child's `posix_fork` returns 0 in the child's address space; the parent's call returns the child's PID.
+
+`execve` discards the current address space, loads the new ELF, and re-runs the dynamic linker.
+The fd table survives if the fd has `FD_CLOEXEC` clear; otherwise it is closed.
+basaltc has no work to do here — every detail lives in procmgr and the loader.
+
+== Cooperative Signal Delivery
+
+The signal model is the most distinctive part of basaltc's process API.
+
+Traditional Unix delivers signals by interrupting whatever the target thread is doing — a system call in progress is stopped (with `EINTR`), the user-mode stack is rewound to a signal trampoline, and the handler runs.
+After the handler returns, the syscall is either restarted (`SA_RESTART`) or returns `EINTR` to the caller.
+
+SaltyOS does not interrupt system calls.
+Instead, signals are stored as pending bits in a per-process trona notification object.
+When the process makes any IPC call (which is what every system call ultimately is), the trona substrate checks the notification before returning to user code, and `posix_sigcheck` runs the handler if a pending bit matches an unblocked signal.
+
+[plantuml]
+....
+@startuml
+skinparam defaultFontSize 11
+
+participant "Sender\n(another process)" as SENDER
+participant "kernite" as KERN
+participant "trona\nnotification" as NTFN
+participant "Receiver\nuser code" as USER
+participant "Receiver\nposix_sigcheck" as CHECK
+
+SENDER -> KERN : posix_kill(pid, SIGINT)
+KERN -> NTFN : Signal(SIGINT bit)
+note right: Asynchronous;\nsender does not wait
+SENDER -[#blue]->o SENDER : returns
+
+USER -> KERN : any syscall (e.g. read)
+KERN --> USER : syscall result
+USER -> CHECK : trona return path\ncalls posix_sigcheck
+CHECK -> NTFN : poll pending bits
+NTFN --> CHECK : SIGINT pending
+CHECK -> CHECK : apply __sig_sa_mask\ncall handler\nrestore mask
+CHECK --> USER : resume
+@enduml
+....
+
+The check happens at every IPC return. If user code is in a tight CPU loop with no syscalls, signals queue up and only fire on the next syscall. This is the same behavior as a Unix process running in a non-interruptible kernel sleep.
+
+== sigaction and __sig_sa_*
+
+`sigaction(sig, act, oact)` stores the handler in basaltc's `HANDLERS[NSIG]` array and the per-signal mask and flags in trona globals:
+
+[source,rust]
+----
+(*(&raw mut trona_posix::__sig_sa_mask))[sig as usize] = (*act).sa_mask.bits;
+(*(&raw mut trona_posix::__sig_sa_flags))[sig as usize] = (*act).sa_flags;
+----
+
+`__sig_sa_mask[sig]` is the set of signals to block while the handler for `sig` is running.
+`posix_sigcheck` reads this when invoking the handler:
+
+. Save the current blocked mask.
+. Apply `__sig_sa_mask[sig]` (OR with the current mask).
+. Call the handler.
+. Restore the saved blocked mask.
+
+This matches the POSIX semantics for `sa_mask`.
+The `__sig_sa_flags[sig]` field stores `SA_NOCLDSTOP`, `SA_NOCLDWAIT`, `SA_SIGINFO`, `SA_RESETHAND`, etc.
+Most are honored. `SA_RESTART` is the exception:
+
+[source,rust]
+----
+// SA_RESTART: In SaltyOS, POSIX signals are delivered cooperatively via
+// notification polling (posix_sigcheck). System calls (IPC to VFS/procmgr)
+// complete atomically from userland's perspective and are never interrupted
+// by signals. Therefore SA_RESTART has no behavioral effect — it is stored
+// in __sig_sa_flags for sigaction() compatibility but intentionally unused.
+pub const SA_RESTART: i32 = 0x10000000;
+----
+
+Code that depends on `SA_RESTART` to restart interrupted system calls is technically broken on SaltyOS because system calls are never interrupted in the first place — but the breakage manifests as "the program works" rather than "the program crashes", because the absence of interruption is strictly safer than the presence of interruption.
+A program that sets `SA_RESTART` and never sees `EINTR` from a syscall just gets the behavior it asked for.
+
+A program that *does not* set `SA_RESTART` and expects `EINTR` from a syscall during a signal will not see `EINTR`.
+This is the harder case: ports that use `select`/`poll` with a manual `sigprocmask` to wake up on a signal need to use `pselect`/`ppoll` instead, where the signal mask is atomically applied for the duration of the wait.
+
+== signal()
+
+The classic `signal(sig, handler)` function is implemented as a thin wrapper around `posix_signal`:
+
+[source,rust]
+----
+pub unsafe extern "C" fn signal(sig: i32, handler: SighandlerT) -> SighandlerT {
+    SIGNAL_LOCK.lock();
+    let old = HANDLERS[sig as usize];
+    HANDLERS[sig as usize] = handler;
+    let reg_result = trona_posix::signals::posix_signal(sig, handler);
+    if reg_result == usize::MAX {
+        HANDLERS[sig as usize] = old;
+        errno::set_errno(errno::EINVAL);
+        SIG_ERR
+    } else {
+        old
+    }
+}
+----
+
+`signal` does not set `sa_mask` or `sa_flags`; the previous values remain in the trona globals.
+For predictable cross-port behavior, prefer `sigaction` over `signal`, which is the same recommendation as on glibc and FreeBSD.
+
+`SIG_DFL` and `SIG_IGN` are forwarded to `posix_signal`, which interprets them as "use the default action" (terminate, ignore, dump core, etc., depending on the signal) and "ignore this signal" respectively.
+
+== sigprocmask and the Blocked Mask
+
+[source,rust]
+----
+pub unsafe extern "C" fn sigprocmask(how: i32, set: *const Sigset, oldset: *mut Sigset) -> i32 {
+    let current = *(&raw const trona_posix::__sig_blocked_mask);
+    if !oldset.is_null() {
+        (*oldset).bits = current;
+    }
+    if !set.is_null() {
+        let updated = match how {
+            SIG_BLOCK   => current | (*set).bits,
+            SIG_UNBLOCK => current & !(*set).bits,
+            SIG_SETMASK => (*set).bits,
+            _ => { errno::set_errno(errno::EINVAL); return -1; }
+        };
+        *(&raw mut trona_posix::__sig_blocked_mask) = updated;
+    }
+    0
+}
+----
+
+`__sig_blocked_mask` is a single global because basaltc's signal implementation is single-threaded.
+`pthread_sigmask` is a one-line forwarder to `sigprocmask` for the same reason — there is no per-thread signal state.
+
+Multi-threaded ports that send per-thread signals will not get the strict glibc-style isolation, but typical use cases (block `SIGCHLD` in a worker thread, deliver to the main thread) work because the next `posix_sigcheck` from the main thread sees the pending bit.
+
+== sigsuspend
+
+`sigsuspend(mask)` is the one place basaltc actually waits for a signal:
+
+[source,rust]
+----
+pub unsafe extern "C" fn sigsuspend(mask: *const Sigset) -> i32 {
+    // Apply temporary mask
+    let saved = *(&raw const trona_posix::__sig_blocked_mask);
+    *(&raw mut trona_posix::__sig_blocked_mask) = (*mask).bits;
+
+    // Block on the signal notification
+    let cap_signal_ntfn: u64 = 6;
+    let pending_bits = trona::trona_wait(cap_signal_ntfn);
+    if pending_bits != 0 {
+        // Re-post for posix_sigcheck to consume
+        trona::trona_signal(cap_signal_ntfn, pending_bits);
+    }
+
+    trona_posix::signals::posix_sigcheck();
+
+    // Restore mask
+    *(&raw mut trona_posix::__sig_blocked_mask) = saved;
+    errno::set_errno(errno::EINTR);
+    -1  // POSIX: always returns -1 with EINTR
+}
+----
+
+`trona_wait` consumes notification bits atomically — if a signal arrives between the temporary mask install and the wait, the wait returns immediately.
+Because consuming the bits would prevent `posix_sigcheck` from seeing them, basaltc re-posts the consumed bits before invoking sigcheck.
+
+`sigsuspend` always returns -1 with `errno = EINTR`, which is the POSIX-mandated behavior.
+
+== sigpending
+
+`sigpending(set)` polls the notification non-destructively to discover which blocked signals are pending:
+
+[source,rust]
+----
+pub unsafe extern "C" fn sigpending(set: *mut Sigset) -> i32 {
+    let cap_signal_ntfn: u64 = 6;
+    let mut bits: u64 = 0;
+    let err = trona::trona_poll(cap_signal_ntfn, &raw mut bits);
+    if err == 0 && bits != 0 {
+        trona::trona_signal(cap_signal_ntfn, bits);  // re-post (poll is destructive)
+        let blocked = *(&raw const trona_posix::__sig_blocked_mask);
+        (*set).bits = (bits as u32) & blocked;
+    } else {
+        (*set).bits = 0;
+    }
+    0
+}
+----
+
+The "poll then re-post" pattern is needed because `trona_poll` consumes the notification bits.
+`sigpending` re-posts whatever it found so that `posix_sigcheck` can still find them on the next IPC return.
+
+== Sigset Helpers
+
+The `sigemptyset`, `sigfillset`, `sigaddset`, `sigdelset`, `sigismember` functions are pure bit-manipulation on the 32-bit `Sigset` (basaltc supports `NSIG = 32` signals).
+None of them touches kernel state.
+
+== sys_signame
+
+basaltc exports `sys_signame[NSIG]`, an array of NUL-terminated signal name strings indexed by signal number:
+
+[source,c]
+----
+extern const char * const sys_signame[NSIG];
+// sys_signame[1] == "HUP"
+// sys_signame[2] == "INT"
+// sys_signame[15] == "TERM"
+----
+
+This is used by `psignal(3)` and by ports that print signal names directly.
+Slots 23-27 and 30-31 are NULL because the corresponding Linux signals (SIGURG, SIGXCPU, SIGXFSZ, SIGVTALRM, SIGPROF, SIGPWR, SIGSYS) are not yet wired into trona.
+Most port-relevant signals (SIGINT, SIGTERM, SIGSEGV, SIGCHLD, SIGPIPE, SIGALRM, SIGUSR1/2) are present.
+
+== Constraints on Signal Handlers
+
+Signal handlers run in the context of whichever thread happens to be executing the next syscall return — usually the main thread.
+This means:
+
+* **Handlers run synchronously with `posix_sigcheck`**, never asynchronously inside a syscall. They cannot interrupt code that is running in user mode without making any IPC calls.
+* **Handlers may call any basaltc function**, because there is no risk of self-deadlock from interrupting a previously held lock — the handler runs at a syscall return point, not in the middle of an arbitrary function.
+* **Handlers should still avoid `printf`** because it acquires `SIGNAL_LOCK` for stdout, which the next handler invocation will also try to take. The non-recursive design of `SIGNAL_LOCK` predates the recursive `TypedMutex` used in stdio.
+* **Handlers cannot pre-empt CPU-bound code**. A program in a tight loop never sees signals until it makes a syscall. This is acceptable for the SaltyOS port set but is a behavioral departure from preemptive Unix that ports authors should know about.
+
+== Related Pages
+
+* xref:process/threads-and-sync.adoc[Threads and Synchronization] — `pthread_kill`, `pthread_sigmask`
+* xref:../runtime/crt-startup.adoc[CRT Startup] — when the signal notification capability is wired in
+* xref:../io/files-and-directories.adoc[Files and Directories] — `pselect`/`ppoll` for atomic mask + wait
+* xref:../internals/trona-boundary.adoc[trona Boundary] — `trona_posix::signals::*` and `__sig_*` globals

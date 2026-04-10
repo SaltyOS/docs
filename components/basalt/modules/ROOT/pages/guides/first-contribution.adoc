@@ -1,0 +1,212 @@
+= First Contribution
+:description: Set up a SaltyOS development environment, build basalt locally, make a small change, and submit it for review
+
+This guide is for contributors who have not modified basalt before.
+It covers the prerequisites, the local build, picking a small first change, the test loop, and the submission process.
+After working through this once you should be comfortable with the iteration cycle for any future basalt change.
+
+== Prerequisites
+
+You need:
+
+[cols="1,3"]
+|===
+| Tool | Why
+
+| Rust nightly with `rust-src`
+| basaltc compiles against `core` from source.
+
+| Clang
+| The build system enforces clang. gcc is rejected.
+
+| Meson >= 1.1
+| Build system entry point.
+
+| Ninja
+| Backend used by Meson.
+
+| QEMU (`qemu-system-x86_64` or `qemu-system-aarch64`)
+| Run the result.
+
+| OVMF or AAVMF
+| UEFI firmware for QEMU. Required for aarch64; optional for x86_64.
+
+| `just`
+| Command runner used by all the SaltyOS workflows.
+
+| About 30 GB of disk space
+| Source, build, and the optional LLVM toolchain submodule.
+|===
+
+The SaltyOS toolchain (custom rustc + clang that know the `*-unknown-saltyos` targets) is bootstrapped via `just tc all` and takes around an hour for the full LLVM + rustc build.
+For a first basalt change you can usually skip this if your distribution has a recent-enough rustc and clang to compile the kernel — but you will need it eventually for any change that touches userland targets.
+
+== First Build
+
+[source,bash]
+----
+git clone https://github.com/SaltyOS/saltyos.git
+cd saltyos
+git submodule update --init --recursive
+just setup
+just build
+----
+
+The first build downloads dependencies, runs Meson, compiles the kernel, builds basaltc and libtrona, links the userland programs, and packs the initrd.
+Expect 5–15 minutes depending on your machine.
+
+If the build fails, the most common causes are:
+
+* `clang` not found — install LLVM/Clang.
+* `nightly` rustc not selected — `rustup default nightly` or set `rust-toolchain.toml`.
+* `rust-src` component missing — `rustup component add rust-src`.
+* LLVM submodule absent — needed only for libc++; pass `-Dbuild_libcxx=false` to skip, or `git submodule update --init toolchain/llvm-project` to fetch.
+
+== First Run
+
+[source,bash]
+----
+just run
+----
+
+QEMU boots SaltyOS in BIOS mode on x86_64.
+You should see the kernel banner, then the userland init starting, then the test_runner output with `PASS`/`FAIL` lines for each test, and finally a shell prompt.
+
+If you see a panic or crash before the shell, do not start changing things — first reproduce on a clean tree to make sure your environment is sane.
+
+== Picking a Small First Change
+
+Good first changes:
+
+. **Add a missing constant** — basaltc's headers are sometimes missing a `#define` for a constant that some port wants. Add the constant to the header and rebuild.
+. **Implement a simple BSD function** — `strnstr`, `strrstr`, or another single-purpose string function from the FreeBSD man pages. Pick one that has zero dependencies, write the implementation in `string.rs`, and declare it in `string.h`.
+. **Improve a doc comment** — pick a Rust file with thin documentation and add explanation of what the functions do. This is a low-risk way to learn the codebase.
+. **Fix a typo** — search `grep -r 'recieve' lib/basalt/` and similar.
+
+Bad first changes:
+
+. Anything that touches the kernel (`kernite/`).
+. Anything that requires a new Meson rule (build system changes are subtle).
+. Anything that touches more than 2-3 files in the first patch.
+. Anything that requires changes to `trona_posix` (you would need to also rebuild trona, and the test cycle is longer).
+
+== The Edit-Build-Run Loop
+
+For a basalt change, the loop is:
+
+[source,bash]
+----
+# Edit lib/basalt/c/src/<module>.rs or lib/basalt/c/include/<header>.h
+
+just build      # rebuild basaltc and re-link userland
+just run        # boot the result and watch test_runner
+----
+
+`just build` reuses the build cache, so subsequent builds after a basaltc edit take 30 seconds or so.
+A header-only change is faster.
+A change that adds a new top-level Rust module needs `just distclean && just setup && just build` because Meson discovery happens at setup time.
+
+To watch a specific test instead of the full test_runner output, look at `userland/tests/test_runner/src/main.rs` and find the test module that matches your area.
+You can usually run a single test by editing the test_runner main to skip the others.
+
+== Tracing a Crash
+
+If your change causes a crash:
+
+. Boot with `just run --debug` to enable QEMU's instruction logging to `qemu.log`.
+. Look at the serial output for a kernel panic message. The kernel prints register state on panic.
+. If the crash is in basaltc itself, the panic message will mention which file and line. Look at that location in `lib/basalt/c/src/`.
+. If the crash is in user code (a port or test), check whether your basaltc change broke an assumption the user code was making.
+
+`just run --gdb` starts QEMU with a GDB server on port 1234 and waits for a connection.
+Attach with `gdb -ex 'target remote :1234' -ex 'symbol-file build-x86_64/userland/tests/test_runner/test_runner'` (or whichever binary you are debugging) to set breakpoints.
+
+== Verifying Before Submission
+
+Before opening a pull request:
+
+[source,bash]
+----
+just fmt-check       # rust formatter check
+just build           # full build, no warnings beyond baseline
+just run --headless  # smoke test without GUI
+----
+
+If `just run` boots cleanly through to the test_runner and prints `PASS` for the relevant tests, you are ready.
+
+For changes that touch SMP-relevant code (locks, atomics, signal handling), also test with multiple CPUs:
+
+[source,bash]
+----
+just run --smp 2
+just run --smp 4
+----
+
+Race conditions often only show up under SMP.
+
+== Commit Message
+
+basalt uses Conventional Commits with the `basaltc` scope:
+
+[source]
+----
+feat(basaltc): add strnstr to string.rs
+
+Implements the FreeBSD strnstr extension for ports that use the
+length-bounded substring search. Pure Rust implementation, no
+trona_posix dependency.
+----
+
+The first line is the type and subject (one sentence, imperative mood).
+Subsequent paragraphs are the body (why, what, any risk notes).
+basalt uses these scopes: `basaltc`, `basaltcpp`, `compat`, `arch`, `build`.
+
+Good types:
+
+* `feat` — new function or feature
+* `fix` — bug fix
+* `refactor` — code restructuring without behavior change
+* `docs` — documentation only
+* `test` — test additions
+* `chore` — build system, tooling
+* `perf` — performance improvement
+
+== Pull Request
+
+[source,bash]
+----
+git checkout -b feat/basaltc-strnstr
+git add lib/basalt/c/src/string.rs lib/basalt/c/include/string.h
+git commit -m "feat(basaltc): add strnstr to string.rs"
+git push origin feat/basaltc-strnstr
+gh pr create --title "feat(basaltc): add strnstr" --body "..."
+----
+
+The PR description should include:
+
+* What the change is.
+* Why the change is needed (which port? which test? which spec section?).
+* What testing you ran (`just build`, `just run`, etc.).
+* Any known limitations or follow-ups.
+
+The reviewers will look at:
+
+* Does the C signature match the upstream specification?
+* Is the Rust implementation correct, including edge cases?
+* Does the function follow the basaltc conventions (errno handling, NULL checks, doc comment, `unsafe` SAFETY notes)?
+* Is the header declaration in the right file with the right guards?
+* Does the build pass cleanly?
+
+== After Merge
+
+Watch the CI on the main branch to make sure your change does not break the larger build.
+If a downstream port now fails because of a behavioral change you introduced (rare but possible), the maintainers may ask for a follow-up fix.
+
+For ongoing contributions, check the `feat/*` branches in the saltyos repo for in-progress work that might need help, and look at the `good first issue` label on GitHub for curated entry points.
+
+== Related Pages
+
+* xref:guides/porting-a-c-program.adoc[Porting a C Program] — typical reason to add a new basaltc function
+* xref:guides/adding-a-libc-function.adoc[Adding a libc Function] — the procedure for the most common change type
+* xref:../architecture.adoc[Architecture] — overall module map
+* xref:../build-system.adoc[Build System] — what `just build` actually runs

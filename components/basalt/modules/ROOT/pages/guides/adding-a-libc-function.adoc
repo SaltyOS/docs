@@ -1,0 +1,216 @@
+= Adding a libc Function
+:description: Step-by-step procedure for adding a new POSIX or BSD function to basaltc — Rust module, header, trona delegation, build
+
+This guide walks through the procedure for adding a new function to basaltc.
+The example uses a hypothetical `getentropy_alt` (a variant of `getentropy`), but the steps apply to any new function regardless of category — POSIX, BSD extension, GNU extension, or SaltyOS-specific.
+
+== Decide Where the Function Lives
+
+basaltc's 44 modules are organized by topic.
+Pick the module that already contains related functions:
+
+[cols="1,3"]
+|===
+| If your function is... | It probably belongs in...
+
+| File or directory operation
+| `unistd.rs` (file ops), `dirent.rs` (directory ops), `fts.rs` (tree walk), `glob.rs` (pattern), `stdio.rs` (FILE-based)
+
+| Process control
+| `process.rs` (fork/exec/wait), `signal.rs` (signals), `pthread.rs` (threads), `pty.rs` (pseudo-tty)
+
+| Memory operation
+| `malloc.rs` (heap), `mem.rs` (low-level), `string.rs` (strings)
+
+| Time
+| `time.rs`
+
+| Math
+| `math.rs` (or `arch/x86_64/math_*.rs` if it needs SIMD)
+
+| Networking
+| `socket.rs`, `netif.rs`, `inet.rs`
+
+| Environment
+| `env.rs` (variables), `getopt.rs` (argv), `sysinfo.rs` (uname), `pwd.rs` (users)
+
+| Locale or text
+| `locale.rs`, `ctype.rs`, `wchar.rs`, `iconv.rs`, `regex.rs`
+
+| Random / crypto
+| `getrandom.rs`, `crypt.rs`, `sha512.rs`
+
+| BSD extension
+| `compat/freebsd/<topic>.rs`
+
+| Truly new category
+| Create a new top-level module (see below)
+|===
+
+If you cannot decide, look at how the upstream documentation classifies the function (`man 3 X`'s SYNOPSIS section names a header) and find the basaltc module that owns that header.
+
+== Decide What the Function Does
+
+Three patterns:
+
+. **Pure Rust** — the function transforms data in process. Examples: `strlen`, `strcmp`, `regex compile`. No `trona_posix` calls.
+. **Delegation** — the function operates on kernel state. Examples: `read`, `open`, `fork`, `socket`. Uses `trona_posix::*`.
+. **Combined** — the function is mostly pure Rust but needs one or two system calls. Examples: `realpath` (path canonicalization with `stat` calls), `mkstemp` (random name generation plus `open`).
+
+Pick the pattern based on what the function does.
+The xref:../internals/trona-boundary.adoc[trona Boundary] page has a complete inventory of which existing functions use which pattern.
+
+== Step 1: Implement in the Module
+
+Open `lib/basalt/c/src/<module>.rs` and add the function.
+The shape is consistent across all of basaltc:
+
+[source,rust]
+----
+/// Brief description of what the function does.
+///
+/// More detail about behavior, error conditions, references to the POSIX
+/// specification or BSD man page if applicable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn my_new_function(
+    arg1: *const u8,
+    arg2: usize,
+) -> i32 {
+    // 1. Validate arguments and convert to Rust types if needed.
+    if arg1.is_null() {
+        crate::errno::set_errno(crate::errno::EINVAL);
+        return -1;
+    }
+
+    // 2. Call into trona_posix or do the pure-Rust work.
+    let result = unsafe { trona_posix::module::posix_my_new_function(arg1, arg2) };
+
+    // 3. Convert the result to C-ABI convention.
+    if result < 0 {
+        crate::errno::set_errno(-result as i32);
+        return -1;
+    }
+    result as i32
+}
+----
+
+Key conventions:
+
+* `#[unsafe(no_mangle)]` and `pub extern "C"` to expose the C ABI symbol with the standard name.
+* `unsafe extern "C"` (not just `extern "C"`) because Rust 2024 requires the function be unsafe if any of its arguments are pointers that the caller must validate.
+* Validate arguments at the top: NULL pointers, range checks, etc. Return `-1` and set `errno` on failure (unless this is a pthread function, which returns the error code directly).
+* Negative `trona_posix` result → set `errno = -result`, return `-1`.
+* Positive `trona_posix` result → return as-is.
+* Doc comment on every public function so future readers can understand intent without reading the C library reference.
+
+If the function is pure Rust, skip the `trona_posix` call and do the work inline.
+
+== Step 2: Declare in the Header
+
+Open the corresponding header in `lib/basalt/c/include/`.
+Add the prototype:
+
+[source,c]
+----
+int my_new_function(const char *arg1, size_t arg2);
+----
+
+Place it next to related functions in the same header.
+For example, a new `unistd` function goes in `unistd.h`; a new `pwd` function goes in `pwd.h`.
+
+If the function needs new types or constants, declare them in the same header.
+basaltc headers are POSIX-style: `#ifdef __cplusplus extern "C" {` ... `}` guards, function-style prototypes, no anonymous structs except where POSIX requires them.
+
+== Step 3: trona Delegation (if needed)
+
+If your function calls `trona_posix::module::posix_my_new_function` and that function does not exist yet, you need to add it to `trona_posix` first.
+This is a separate change in `lib/trona/posix/src/<module>.rs`:
+
+. Add the new `pub fn posix_my_new_function(...)` to the appropriate trona_posix module.
+. Implement it. Usually this means constructing an IPC message and waiting for the reply, or wrapping a `trona::syscall::*` call.
+. The trona side is documented separately; consult the trona contributor guide if needed.
+
+If your function only needs operations that already exist in `trona_posix`, you can skip this step entirely.
+
+== Step 4: Build
+
+[source,bash]
+----
+just build
+----
+
+The first build adds your function and detects compile errors.
+Common errors at this stage:
+
+* **Missing import** — add `use crate::errno;` or `use trona_posix::*;` at the top of the module file.
+* **Wrong signature** — Rust will tell you the type mismatch. Check the signature against the standard.
+* **Used a Rust feature not enabled** — basaltc uses `#![no_std]`; functions like `String::new()` or `Vec::push` are not available. Use raw pointers and manual buffer management.
+* **`extern "C"` mismatch** — the function pointer types in your imports must match the trona_posix declarations exactly.
+
+If you added an entirely new top-level module, you also need to add a `pub mod my_new_module;` line to `lib/basalt/c/src/lib.rs` and run `just distclean && just setup && just build` to re-discover the source file.
+Adding a new function to an existing module does not require distclean.
+
+== Step 5: Test
+
+Write a small C test program that calls the new function:
+
+[source,c]
+----
+#include <stdio.h>
+#include <unistd.h>
+
+int main() {
+    char buf[64];
+    int r = my_new_function(buf, sizeof(buf));
+    printf("my_new_function returned %d, buf = %s\n", r, buf);
+    return 0;
+}
+----
+
+Build the test as a SaltyOS userland program by adding a small Meson rule under `userland/tests/` (or borrow an existing test program's pattern), then `just build && just run` and check the serial output.
+
+The `userland/tests/test_runner` program is the canonical place to add automated test cases that run on every boot.
+
+== Step 6: Document
+
+If the function changes a basaltc API surface, update the relevant doc page in `../saltyos-docs/components/basalt/`:
+
+* New unistd function → add to xref:../io/files-and-directories.adoc[Files and Directories].
+* New pthread function → add to xref:../process/threads-and-sync.adoc[Threads and Synchronization].
+* New library entirely → add a new page or section.
+
+If the function is widely used, also add it to the appropriate header inventory in xref:../architecture.adoc[Architecture].
+
+== Checklist
+
+Before sending the change for review:
+
+. [ ] The new function is in the right module.
+. [ ] The C signature in the header matches the Rust signature in the implementation byte-for-byte.
+. [ ] All pointer arguments are validated (NULL checks, length checks).
+. [ ] The function follows the errno/return convention for its family (basaltc default vs pthread).
+. [ ] A `// SAFETY:` comment explains every `unsafe { ... }` block.
+. [ ] The function has a Rust doc comment describing its behavior.
+. [ ] If the function delegates to trona_posix, the delegation function exists and has a matching signature.
+. [ ] The build passes: `just build`.
+. [ ] A test program exercises the new function and prints expected output.
+. [ ] The basalt documentation is updated if the new function changes the public API surface.
+. [ ] The basaltc README (`lib/basalt/c/README.md`) is updated if you added a new top-level module (the README's module count and module list need to stay in sync).
+
+== Pitfalls
+
+* **Forgetting `#[unsafe(no_mangle)]`** — the symbol gets mangled and the linker cannot find it from C code. The error message is "undefined reference to my_new_function".
+* **Forgetting the `pub extern "C"`** — the function is not exported from the crate. Same linker error.
+* **Setting errno on success** — the C convention says errno is undefined on success and should not be cleared. Only set errno on failure.
+* **Returning the wrong sentinel value** — most basaltc functions return `-1` on failure, but some return `NULL`, `0`, `EOF`, or a special value like `PTHREAD_NULL`. Match the upstream convention.
+* **Not validating pointer arguments** — a NULL pointer dereference inside basaltc crashes the entire process. Always check.
+* **Using `expect`/`unwrap`** — these panic on failure, and panic in basaltc means abort. Use `match` and explicit error handling.
+* **Allocating memory before the heap is up** — the heap is initialized lazily on first malloc, but only after `init_mm_from_auxv` runs. Functions called before that point cannot allocate. See xref:../runtime/crt-startup.adoc[CRT Startup].
+
+== Related Pages
+
+* xref:guides/porting-a-c-program.adoc[Porting a C Program] — when you find a missing function while porting
+* xref:guides/first-contribution.adoc[First Contribution] — broader contribution workflow
+* xref:../internals/trona-boundary.adoc[trona Boundary] — how delegation works
+* xref:../architecture.adoc[Architecture] — module organization
+* xref:../build-system.adoc[Build System] — what `just build` actually runs

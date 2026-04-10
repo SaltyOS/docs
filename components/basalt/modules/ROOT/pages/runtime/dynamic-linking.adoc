@@ -1,0 +1,194 @@
+= Dynamic Linking
+:description: dlopen, dlsym, dlclose, dladdr, dl_iterate_phdr — cooperation with the SaltyOS runtime dynamic linker
+
+basaltc provides the POSIX `dlfcn(3)` family on top of the SaltyOS runtime dynamic linker (`ld-trona.so`), which has already loaded the executable's `DT_NEEDED` libraries by the time `_start` runs.
+The dlfcn implementation lives in `lib/basalt/c/src/dlfcn.rs` and contains a self-contained ELF parser and relocator so that `dlopen` can pull additional `ET_DYN` shared objects into the process at runtime.
+This page covers the link-map model, the load and relocate algorithm, the symbol lookup algorithm, the relocation types supported per architecture, and the limitations of the current implementation.
+
+== Two Sources of Loaded DSOs
+
+When a SaltyOS process starts, two distinct loaders cooperate to populate its address space:
+
+`ld-trona.so`::
+The runtime dynamic linker. Loaded by `init` (or `procmgr` for spawned children) before the executable runs. Walks the `PT_INTERP` chain, loads every `DT_NEEDED` library, performs all initial relocations, and finally jumps to the executable's `_start`. After this point `ld-trona.so` is dormant — but the link-map chain it constructed remains in memory.
+
+`basaltc dlfcn`::
+The runtime extension. When user code calls `dlopen("libfoo.so", RTLD_NOW)`, basaltc takes over: it reads the file from VFS, parses the ELF, allocates anonymous memory for `PT_LOAD` segments, copies the segment data, performs the relocations, and links the new DSO into the same chain `ld-trona.so` populated.
+
+The two loaders share data structures but not code.
+basaltc's `DlHandle` struct mirrors the parts of `ld-trona.so`'s link-map entries that user code can ask about (base address, name, symbol table, dynamic section pointers).
+`dlfcn` reuses the chain head established by `ld-trona.so` so that `dlsym(RTLD_DEFAULT, ...)` searches the libraries the executable was linked against, not just the libraries opened with `dlopen`.
+
+[plantuml]
+....
+@startuml
+skinparam defaultFontSize 11
+
+cloud "Process address space" {
+  rectangle "executable" as EXE
+  rectangle "libc.so" as LIBC
+  rectangle "libtrona.so" as TRONA
+  rectangle "libstdc++ etc.\n(DT_NEEDED chain)" as DEPS
+  rectangle "libplugin.so\n(opened with dlopen)" as PLUGIN
+}
+
+[ld-trona.so] as RTLD
+[dlfcn.rs] as DL
+
+RTLD --> EXE : load + relocate
+RTLD --> LIBC : load + relocate
+RTLD --> TRONA : load + relocate
+RTLD --> DEPS : load + relocate
+DL --> PLUGIN : load + relocate\non dlopen call
+DL --> RTLD : reuses link-map chain
+@enduml
+....
+
+== ELF Format Constants
+
+`dlfcn.rs` carries its own ELF constant definitions rather than depending on the trona ELF loader (`trona_loader::elf`).
+This avoids a circular dependency: `trona_loader` is the loader used by `ld-trona.so` and lives below basaltc in the dependency graph.
+
+The constants cover the ELF64 little-endian subset that SaltyOS uses:
+
+[cols="1,3"]
+|===
+| Group | Constants
+
+| Header
+| `ELFCLASS64=2`, `ELFDATA2LSB=1`, `EV_CURRENT=1`, `ET_DYN=3`
+
+| Program headers
+| `PT_LOAD=1`, `PT_DYNAMIC=2`, `PT_TLS=7`, plus `PF_R`, `PF_W`, `PF_X` flags
+
+| Dynamic tags
+| `DT_NULL`, `DT_NEEDED`, `DT_STRTAB`, `DT_SYMTAB`, `DT_RELA`, `DT_RELASZ`, `DT_STRSZ`, `DT_SYMENT`, `DT_INIT`, `DT_FINI`, `DT_SONAME`, `DT_PLTGOT`, `DT_PLTRELSZ`, `DT_JMPREL`, `DT_INIT_ARRAY`, `DT_FINI_ARRAY`, `DT_INIT_ARRAYSZ`, `DT_FINI_ARRAYSZ`, `DT_GNU_HASH`
+
+| Relocation types (x86_64)
+| `R_NONE=0`, `R_ABS64=1`, `R_GLOB_DAT=6`, `R_JUMP_SLOT=7`, `R_RELATIVE=8`
+
+| Relocation types (aarch64)
+| `R_NONE=0`, `R_ABS64=257`, `R_GLOB_DAT=1025`, `R_JUMP_SLOT=1026`, `R_RELATIVE=1027`
+
+| Symbol bindings
+| `STB_LOCAL=0`, `STB_GLOBAL=1`, `STB_WEAK=2`, plus type tags `STT_SECTION=3`, `STT_FILE=4`
+|===
+
+The `R_*` constants are the only architecture-conditional definitions in the file.
+The relocator handles all four arch-relevant types: `R_ABS64` for absolute symbol addresses, `R_GLOB_DAT` for GOT entries, `R_JUMP_SLOT` for PLT entries, and `R_RELATIVE` for base-relative relocations applied without symbol lookup.
+
+== Handle Layout
+
+[source,rust]
+----
+const DL_HANDLE_MAGIC: u64 = 0x444c_4844_4c4f_4144;
+const RTLD_MAX_OBJECTS: usize = 16;
+
+struct DlHandle {
+    magic: u64,
+    name: [u8; RTLD_MAX_OBJECT_NAME],
+    base: *mut u8,
+    size: usize,
+    phdr: *const Elf64Phdr,
+    phnum: usize,
+    dynamic: *const Elf64Dyn,
+    strtab: *const u8,
+    symtab: *const Elf64Sym,
+    nsyms: usize,
+    next: *mut DlHandle,
+    refcount: u32,
+}
+----
+
+Every `DlHandle` carries a magic number for sanity checking on `dlsym`/`dlclose`, a fixed-size name buffer (96 bytes — enough for the longest port library names without dynamic allocation in the linker code), the load base address, the segment cover size, pointers to the program headers and dynamic section, the cached string and symbol tables, the symbol count, the next handle in the chain, and a reference count.
+
+The handle list is a singly linked list rooted at `DL_HEAD`, protected by `DL_LOCK`.
+A statically allocated bound (`RTLD_MAX_OBJECTS = 16`) caps the total number of dlopen-loaded libraries to keep the locking footprint small; this is enough for the SaltyOS port set, where dlopen usage is limited to a few plugin systems.
+
+The special handle `DL_MAIN_HANDLE = 1 as *mut u8` represents `RTLD_DEFAULT` — a sentinel meaning "search the executable and all `DT_NEEDED` libraries from `ld-trona.so`".
+
+== dlopen
+
+`dlopen("path", flags)` runs through the following sequence:
+
+. **Acquire `DL_LOCK`** so the handle list and per-process state are stable.
+. **Look up the existing handle** by name. If found, increment the reference count and return it. This makes `dlopen` idempotent: opening the same library twice gives the same handle, just with a higher refcount.
+. **Read the file from VFS** via `trona_posix::posix_open` + `posix_read` into a temporary buffer.
+. **Validate the ELF header**: must be ELF64, little-endian, `EV_CURRENT`, `ET_DYN`, and the machine type matching the host architecture.
+. **Allocate VA space** for the segments. dlfcn computes the load span from the lowest `PT_LOAD` `p_vaddr` to the highest `p_vaddr + p_memsz`, rounds to a page, and asks `posix_mm` for an anonymous mapping of that size.
+. **Copy each `PT_LOAD` segment** from the file image to the right offset inside the allocated mapping, then memset the BSS region (the part of `p_memsz` beyond `p_filesz`) to zero. Apply the per-segment protection bits using `posix_mprotect`.
+. **Locate `PT_DYNAMIC`** and walk it to extract `DT_STRTAB`, `DT_SYMTAB`, `DT_RELA`/`DT_JMPREL`, `DT_GNU_HASH`, `DT_INIT`/`DT_FINI`, `DT_INIT_ARRAY`/`DT_FINI_ARRAY`.
+. **Resolve `DT_NEEDED`** references recursively. For each named library, call back into `dlopen` (the lock is reentrant only at the function-level, so dlfcn releases and re-acquires across recursive calls). Missing dependencies fail the entire load and return an error via `dlerror()`.
+. **Apply relocations** for `R_RELATIVE`, `R_ABS64`, `R_GLOB_DAT`, `R_JUMP_SLOT` against the resolved symbol table, walking both `DT_RELA` and `DT_JMPREL`.
+. **Run `DT_INIT`** then `.init_array`. Forward order, identical to the C/POSIX startup sequence.
+. **Insert the new `DlHandle`** at the head of `DL_HEAD` and return it to the caller.
+
+`RTLD_NOW` and `RTLD_LAZY` are both supported in name only — basaltc always performs eager binding because the implementation does not yet have a PLT trampoline that could perform lazy resolution.
+
+== dlsym
+
+`dlsym(handle, name)` looks up a symbol by name:
+
+* If `handle == RTLD_DEFAULT`, walk the entire handle chain (executable + DT_NEEDED + dlopen-loaded) and return the first match.
+* If `handle == RTLD_NEXT`, walk the chain starting after the caller's library. The caller is identified by walking the return address backwards through the link-map.
+* Otherwise, search only the named handle's symbol table.
+
+The lookup is a linear scan over the symbol table.
+There is no `DT_GNU_HASH` chain walk despite the constant being parsed from the dynamic section — the implementation reads `DT_SYMTAB` directly and compares names with `strcmp`.
+This is acceptable for SaltyOS because the typical library has fewer than a thousand exported symbols and `dlsym` is called at most a handful of times per process.
+
+== dlclose
+
+`dlclose(handle)` decrements the reference count.
+When the count reaches zero:
+
+. Run `DT_FINI` and `.fini_array` in reverse order.
+. Unlink the handle from the chain.
+. Call `posix_munmap` on the load region.
+. Zero the handle struct.
+
+The handle struct is freed back to the global allocator pool.
+basaltc does not implement aggressive teardown of types defined inside the unloaded DSO — that is, if a C++ object created from the dlopen-loaded library still has live instances when `dlclose` runs, accessing those instances after the close is undefined behavior, exactly as on glibc.
+
+== dladdr and dl_iterate_phdr
+
+`dladdr(addr, info)` walks the link-map chain looking for the handle whose `[base, base+size)` contains `addr`.
+On a match it fills the `Dl_info` struct with `dli_fname` (the saved name), `dli_fbase` (the base address), and the nearest preceding symbol from the symbol table (`dli_sname`, `dli_saddr`).
+If the address is not in any loaded library, it returns 0 and leaves `info` untouched.
+
+`dl_iterate_phdr(callback, data)` walks the chain in load order and invokes the user callback once per DSO with a `dl_phdr_info` struct (name, base address, program header pointer and count).
+The callback can return a nonzero value to stop iteration early.
+This is the entry point used by stack unwinding (libunwind) and language runtimes (Rust's panic infrastructure) to discover loaded DSOs at runtime.
+
+== TLS Limitation
+
+The runtime dynamic linker supports static TLS established at process startup: every DSO with a `PT_TLS` segment registered before `_start` runs gets a slot in the per-thread TLS block.
+basaltc's `dlopen` does **not** extend this — DSOs loaded with `dlopen` cannot have `PT_TLS` segments.
+Attempting to dlopen a library with TLS results in a load failure with "dynamic TLS not supported" recorded in `dlerror()`.
+
+This is a known limitation.
+Implementing dynamic TLS requires per-thread TLS block reallocation and a TLS descriptor table protocol (`__tls_get_addr`), neither of which the SaltyOS substrate currently provides.
+None of the SaltyOS ports require dynamic TLS today; this limitation has not blocked any practical use case.
+
+== dlerror
+
+`dlerror()` returns the most recent error message as a `*const u8` pointer to a static buffer (`DLERROR_RET`), or `NULL` if no error occurred since the last call.
+basaltc maintains two buffers (`DLERROR_MSG` and `DLERROR_RET`): the first holds the in-progress message during error formatting, the second holds the most recently completed message.
+This double-buffering avoids returning a pointer to a buffer that another thread is currently writing.
+Both buffers are fixed at 128 bytes — long enough for any error message basaltc generates.
+
+`dlerror()` clears the saved message after returning, so a second consecutive call returns `NULL`.
+This matches POSIX semantics.
+
+== Concurrency
+
+`DL_LOCK` (a futex-based mutex) serializes all dlfcn entry points.
+This is heavy-handed but acceptable: dlopen is a slow operation (file I/O + ELF parsing + relocations + IPC), so contention is rare, and the lock guarantees that handle list traversal is consistent with concurrent loads or unloads.
+
+Per-thread `dlerror` state lives in TLS so that two threads cannot read each other's last error.
+
+== Related Pages
+
+* xref:runtime/crt-startup.adoc[CRT Startup] — what `ld-trona.so` does before basaltc dlfcn becomes relevant
+* xref:runtime/atexit-and-exit.adoc[atexit and Process Exit] — `__cxa_atexit` and the DSO unload story
+* xref:../cxx/cxxabi-and-unwind.adoc[libcxxabi and libunwind] — libunwind uses `dl_iterate_phdr` to find DSO program headers for stack unwinding

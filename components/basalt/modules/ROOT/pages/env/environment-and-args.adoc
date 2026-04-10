@@ -1,0 +1,238 @@
+= Environment and Arguments
+:description: getenv, setenv, environ, POSIX getopt, GNU getopt_long, BSD err/warn, sysinfo, __progname
+
+This page covers the modules that handle process-level state and metadata: `env.rs` (environment variables), `getopt.rs` (command-line option parsing), `sysinfo.rs` (uname / sysconf / getpagesize), and the `compat/freebsd/bsd_err.rs` family (`err`, `errx`, `warn`, `warnx`).
+None of these modules require IPC; they manipulate in-process data populated at startup.
+
+== environ and getenv (env.rs)
+
+The `environ` global is a NULL-terminated array of `KEY=VALUE` strings:
+
+[source,rust]
+----
+#[unsafe(no_mangle)]
+pub static mut environ: *mut *const u8 = core::ptr::null_mut();
+----
+
+`__libc_start_main` initializes this pointer in the C/POSIX layer of startup (see xref:../runtime/crt-startup.adoc[CRT Startup]).
+The strings live in the initial stack pages and are valid for the process lifetime — basaltc does not copy them.
+
+[cols="1,3"]
+|===
+| Function | Behavior
+
+| `getenv(name)`
+| Walk `environ`, return a pointer to the value of the first matching entry (the bytes after `=`), or `NULL` if not found.
+
+| `setenv(name, value, overwrite)`
+| If `name` already exists and `overwrite == 0`, return 0 (no change). Otherwise allocate a new `KEY=VALUE` string with `malloc`, replace the entry in `environ` (or append a new entry, allocating a new `environ` array), free the old string.
+
+| `unsetenv(name)`
+| Find the entry, remove it from `environ`, free the string.
+
+| `putenv(string)`
+| Insert the user-supplied `KEY=VALUE` string into `environ` directly. The user's string is **not** copied; the caller must keep it alive. Glibc-style behavior.
+
+| `clearenv()`
+| Set `environ[0] = NULL`. Does not free the strings or the array.
+
+| `secure_getenv(name)`
+| Glibc extension: returns NULL if the program is suid/sgid. basaltc currently treats it as `getenv` because there is no concept of suid in SaltyOS yet.
+|===
+
+`environ` modification through `setenv`/`unsetenv` reallocates the array as it grows.
+The first reallocation transitions from the initial stack-based array to a heap-allocated array; subsequent reallocations grow that.
+This means an early `setenv` triggers the first basaltc heap allocation if it has not happened already.
+
+`environ` is **not protected by a lock**.
+Multi-threaded code that mutates the environment must serialize externally.
+Reading via `getenv` is safe under read-only conditions but races with concurrent `setenv`/`unsetenv`.
+
+== getopt and getopt_long (getopt.rs)
+
+`getopt(argc, argv, optstring)` parses POSIX-style short options:
+
+[source,rust]
+----
+pub static mut optarg: *mut u8 = core::ptr::null_mut();
+pub static mut optind: i32 = 1;
+pub static mut opterr: i32 = 1;
+pub static mut optopt: i32 = 0;
+pub static mut optreset: i32 = 0;
+----
+
+The five public globals match the standard POSIX interface:
+
+* `optarg` — current option's argument (if any)
+* `optind` — index of the next argument to process
+* `opterr` — print error messages (default 1)
+* `optopt` — last option that caused an error
+* `optreset` — BSD extension: set to 1 to restart parsing from `optind = 1`
+
+Parsing recognizes:
+
+* `-x` — option `x`
+* `-x value` — option `x` with separate argument
+* `-xvalue` — option `x` with attached argument
+* `-xyz` — combined options `x`, `y`, `z` (all without arguments)
+* `--` — end of options; remaining arguments are positional
+* Trailing positional arguments
+
+The `optstring` argument is a string like `"abc:de:f"` where each letter is an option name.
+A `:` after a letter means "this option takes an argument".
+A leading `+` makes parsing stop at the first non-option (POSIX strict mode).
+A leading `-` makes non-options return as option `1` with the argument in `optarg` (GNU extension).
+
+`getopt_long(argc, argv, shortopts, longopts, longindex)` extends parsing with `--name` and `--name=value` long options.
+The `longopts` argument is an array of `option` structs:
+
+[source,c]
+----
+struct option {
+    const char *name;       // long option name without --
+    int has_arg;            // no_argument | required_argument | optional_argument
+    int *flag;              // if non-NULL, set to val instead of returning val
+    int val;                // value to return (or store in flag)
+};
+----
+
+The implementation is ~650 lines of pure Rust.
+It handles abbreviated long options (where unique), the `flag` indirection mechanism, and `optional_argument` (where `--name=value` is recognized but `--name value` is not, matching glibc behavior).
+
+`getopt_long_only` is also implemented for ports that prefer the X11 single-dash long-option style.
+
+== uname and sysconf (sysinfo.rs)
+
+`uname(buf)` fills a `struct utsname` with system identification:
+
+[source,c]
+----
+struct utsname {
+    char sysname[65];
+    char nodename[65];
+    char release[65];
+    char version[65];
+    char machine[65];
+};
+----
+
+basaltc returns hardcoded values from `sysinfo.rs`:
+
+* `sysname` — `"SaltyOS"`
+* `nodename` — `"salty"` (a fixed placeholder until a hostname registry exists)
+* `release` — `"0.1.0"`
+* `version` — `"0.1.0"`
+* `machine` — `"x86_64"` (currently hardcoded; aarch64 builds need this changed)
+
+Ports that key off `sysname == "Linux"` will need patches; the SaltyOS port set already carries these for the affected packages.
+
+`sysconf(name)` returns runtime configuration values:
+
+[cols="1,3"]
+|===
+| Name | Returns
+
+| `_SC_PAGESIZE` (also `_SC_PAGE_SIZE`)
+| 4096
+
+| `_SC_CLK_TCK`
+| 100 (centiseconds per tick — POSIX standard)
+
+| `_SC_NPROCESSORS_ONLN`
+| 1 (placeholder; not yet queried from the kernel)
+
+| `_SC_NPROCESSORS_CONF`
+| 1 (same as ONLN on basaltc)
+
+| `_SC_OPEN_MAX`
+| 256 (maximum file descriptors per process)
+
+| `_SC_CHILD_MAX`
+| 64
+
+| `_SC_STREAM_MAX`
+| 16
+
+| `_SC_LINE_MAX`
+| 2048
+
+| `_SC_ARG_MAX`
+| 131072
+
+| `_SC_GETPW_R_SIZE_MAX`, `_SC_GETGR_R_SIZE_MAX`
+| 1024 each
+
+| `_SC_PHYS_PAGES`
+| 65536 (placeholder — 256 MB / 4 KB pages)
+|===
+
+Unsupported names (including `_SC_HOST_NAME_MAX`, `_SC_AVPHYS_PAGES`, `_SC_VERSION`, `_SC_NPROCESSORS_*` semantics that the kernel knows about) return -1 without setting `errno` — the caller can detect support by checking for the -1 return value.
+
+`getdtablesize()` returns 256 directly. `getrlimit` returns `RLIM_INFINITY` for every resource; `setrlimit` accepts every request and discards it. These are stubs intended to satisfy ports that expect the API to exist without depending on real limit enforcement.
+
+== BSD err/warn (compat/freebsd/bsd_err.rs)
+
+`err`, `errx`, `warn`, `warnx`, `verr`, `verrx`, `vwarn`, `vwarnx` are the BSD diagnostic functions:
+
+[source,c]
+----
+err(1, "open %s", filename);
+// prints: progname: open foo.txt: No such file or directory
+// then exits with code 1
+
+errx(1, "internal error: %d", code);
+// prints: progname: internal error: 42
+// then exits with code 1
+
+warn("read failed");
+// prints: progname: read failed: I/O error
+// (continues execution)
+
+warnx("invalid input");
+// prints: progname: invalid input
+// (continues execution)
+----
+
+The functions:
+
+* Read `__progname` (set during `__libc_start_main` via `setprogname`).
+* Format the user message via `vfprintf(stderr, ...)`.
+* For `err`/`warn` (no `x` suffix), append `: <strerror(errno)>`.
+* Append a newline.
+* For `err`/`errx`, call `exit(eval)`.
+
+basaltc implements the entire family in `compat/freebsd/bsd_err.rs` along with `setprogname`, `getprogname`, and the static `__progname` global.
+
+`error_at_line` and `error_print_progname` (the glibc forms) are not implemented; ports that need them should be patched to use `err`/`warn` instead.
+
+== getprogname / setprogname
+
+The program name is stored in a static pointer set by `__libc_start_main`:
+
+[source,rust]
+----
+static mut PROGNAME_PTR: *const u8 = core::ptr::null();
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn setprogname(name: *const u8) {
+    // ... extract basename from path ...
+    PROGNAME_PTR = basename;
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn getprogname() -> *const u8 {
+    PROGNAME_PTR
+}
+----
+
+`setprogname(argv[0])` is called automatically at startup; user code only needs to call it explicitly to override the auto-detected value.
+The implementation strips leading directories so that `setprogname("/usr/bin/foo")` results in `getprogname()` returning `"foo"`.
+
+The pointer is a static, not thread-local, because the program name is process-wide.
+
+== Related Pages
+
+* xref:../runtime/crt-startup.adoc[CRT Startup] — when `environ` and `__progname` are populated
+* xref:env/users-and-groups.adoc[Users and Groups] — `getlogin` and the user database functions
+* xref:../compat/freebsd-compat.adoc[FreeBSD Compatibility] — `err`/`warn` and other BSD modules
+* xref:../internals/trona-boundary.adoc[trona Boundary] — `sysinfo` calls `trona_posix::utsname`; everything else is pure Rust

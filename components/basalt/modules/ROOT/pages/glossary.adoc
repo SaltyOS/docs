@@ -1,0 +1,140 @@
+= Glossary
+:description: Definitions of key terms used throughout the basalt documentation
+
+[[archmath]]ArchMath, ArchMem, ArchString::
+The three Rust traits in `lib/basalt/c/src/arch/mod.rs` that abstract math, memory, and string operations whose implementations differ per CPU architecture.  Each target architecture provides a concrete type implementing the traits, and the type alias `Arch` resolves to the right concrete type at compile time.  See xref:arch/multi-arch-dispatch.adoc[Multi-Architecture Dispatch].
+
+[[arc4random]]arc4random::
+The BSD cryptographically secure pseudo-random number generator.  basaltc implements it on top of `getentropy()` using ChaCha20.  Provided by `compat/freebsd/bsd_misc.rs`.
+
+[[basaltc]]basaltc::
+The Rust C standard library that produces `libc.so`.  44 modules covering POSIX, BSD extensions, and a FreeBSD compatibility layer.  See xref:architecture.adoc[Architecture].
+
+[[blockheader]]BlockHeader::
+The 16-byte header `malloc.rs` places before each allocation in the heap.  Stores the block size and a free-list link pointer.  See xref:runtime/heap-and-malloc.adoc[Heap and malloc].
+
+[[c-locale]]C locale::
+The only locale basaltc supports.  All `setlocale` calls return `"C"` regardless of input.  See xref:text/locale-and-ctype.adoc[Locale, ctype and wchar].
+
+[[capsicum]]Capsicum::
+FreeBSD's capability-based security framework.  basaltc provides stub implementations of the Capsicum API surface so that ports linking against it succeed at link time, but no sandboxing is enforced.  See xref:compat/freebsd-compat.adoc[FreeBSD Compatibility].
+
+[[crt-start]]crt_start.o::
+The static C runtime object containing `_start`, the ELF entry point.  Statically linked into every executable rather than into `libc.so` to avoid an unresolved `main` reference in the shared library.  See xref:runtime/crt-startup.adoc[CRT Startup].
+
+[[cxa-atexit]]__cxa_atexit::
+The Itanium C++ ABI function for registering destructors of namespace-scope objects and `thread_local` objects with non-trivial destructors.  basaltc provides the implementation in `crt.rs`; libcxxabi calls it via DT_NEEDED.  See xref:runtime/atexit-and-exit.adoc[atexit and Process Exit].
+
+[[cxa-finalize]]__cxa_finalize::
+The function that runs registered C++ destructors at exit time (called from `exit`) or at DSO unload time (called from `dlclose`).  Companion to `__cxa_atexit`.
+
+[[cooperative-signals]]Cooperative signal delivery::
+basaltc's signal model: signals are stored as pending bits in a trona notification object and dispatched at the next IPC return via `posix_sigcheck`, instead of preemptively interrupting the user code.  See xref:process/processes-and-signals.adoc[Processes and Signals].
+
+[[dlerror]]dlerror::
+The function that returns the most recent dynamic-linker error message.  basaltc maintains two static buffers (in-progress and most-recent-completed) for thread-safe error reporting.  See xref:runtime/dynamic-linking.adoc[Dynamic Linking].
+
+[[dl-iterate-phdr]]dl_iterate_phdr::
+The function that walks the link-map chain calling a callback for each loaded DSO.  Used by libunwind to find DSO program headers for stack unwinding, by Rust's panic infrastructure, and by debuggers.
+
+[[dl-trona-so]]ld-trona.so::
+The SaltyOS runtime dynamic linker.  Loads the executable's `DT_NEEDED` libraries before `_start` runs, then hands control to the executable.  basaltc's `dlfcn.rs` reuses the link-map chain ld-trona.so populates.
+
+[[fd-table]]fd table::
+The per-process file descriptor table maintained by `trona_posix`.  Maps fd numbers to capability slots that point at userland servers (vfsserver, netsrv, posix_ttysrv, etc.).  basaltc operates on fd numbers; trona_posix dispatches to the right server.  See xref:internals/trona-boundary.adoc[trona Boundary].
+
+[[fini-array]]fini_array::
+The ELF section containing function pointers to run at process exit time.  Populated by C++ destructor and `__attribute__((destructor))` declarations.  Walked in reverse order by `exit` after the C and C++ atexit handlers complete.  See xref:runtime/atexit-and-exit.adoc[atexit and Process Exit].
+
+[[file-struct]]FILE::
+basaltc's buffered I/O stream type.  Wraps a POSIX file descriptor with a 1024-byte buffer and supports `_IOFBF`, `_IOLBF`, `_IONBF` modes.  Defined in `stdio.rs`.  See xref:io/stdio.adoc[Buffered I/O].
+
+[[free-list]]Free list::
+The singly linked list of free blocks maintained by `malloc.rs`.  Sorted by address to enable bidirectional coalescing on free.  See xref:runtime/heap-and-malloc.adoc[Heap and malloc].
+
+[[funopen]]funopen::
+The BSD extension that creates a `FILE*` whose I/O calls are user-supplied callbacks instead of `posix_read`/`posix_write`.  Used by libxo and ports that build in-memory streams.  See xref:io/stdio.adoc[Buffered I/O].
+
+[[futex]]Futex::
+A fast user-space mutex primitive.  The trona substrate provides a `Futex` syscall that basaltc uses to back `pthread_mutex`, `pthread_cond`, the malloc heap lock, the dlfcn lock, and the atexit lock.  Three-phase acquire: CAS → spin → futex_wait.
+
+[[getentropy]]getentropy::
+The BSD CSPRNG seed source.  basaltc implements it on top of `trona_posix::getrandom`, which talks to the kernel's RDRAND or hardware random source.
+
+[[hardening-mode]]Hardening mode::
+libc++'s configurable runtime safety check level.  basalt sets `_LIBCPP_HARDENING_MODE_NONE` to disable all bounds checking and assertion overhead in the standard library.  See xref:cxx/cxx-config-site.adoc[libc++ Configuration].
+
+[[init-array]]init_array::
+The ELF section containing function pointers to run at process startup time, after `__libc_start_main` and before `main`.  Populated by C++ namespace-scope constructors and `__attribute__((constructor))` declarations.  Walked in forward order.
+
+[[itanium-abi]]Itanium C++ ABI::
+The cross-platform standard for C++ runtime representation.  Used on Linux, macOS, FreeBSD, and SaltyOS.  Implemented by libcxxabi.  See xref:cxx/cxxabi-and-unwind.adoc[libcxxabi and libunwind].
+
+[[libcxx]]libcxx::
+The LLVM C++ standard library.  Provides `<vector>`, `<string>`, `<thread>`, etc.  Built from `toolchain/llvm-project/libcxx/src/` and statically linked into `libc++.so`.  See xref:cxx/cxx-runtime.adoc[libc++ Runtime].
+
+[[libcxxabi]]libcxxabi::
+The LLVM Itanium C++ ABI implementation.  Provides RTTI, exception personality, `__cxa_*` functions, typeinfo objects.  Statically linked into `libc++.so`.  See xref:cxx/cxxabi-and-unwind.adoc[libcxxabi and libunwind].
+
+[[libunwind]]libunwind::
+The LLVM stack unwinder.  Reads DWARF Call Frame Information to walk the stack during exception throws and to support `_Unwind_Backtrace`.  Statically linked into `libc++.so`.
+
+[[libxo]]libxo::
+A FreeBSD library for structured output (text, XML, JSON, HTML from one source).  basaltc provides a stub implementation in `compat/freebsd/xo.rs` that emits text only via `printf`, ignoring the structured-output annotations.
+
+[[link-map]]Link map::
+The chain of `DlHandle` structs maintained by basaltc and `ld-trona.so` describing every loaded DSO.  Walked by `dlsym(RTLD_DEFAULT)`, `dl_iterate_phdr`, and `dladdr`.
+
+[[no-std]]no_std::
+The Rust attribute that excludes the `std` library, leaving only `core`.  basaltc is `#![no_std]` because there is no host libc to link against (basaltc *is* the libc).  See xref:architecture.adoc[Architecture].
+
+[[posix-tz]]POSIX TZ::
+The format used by the `TZ` environment variable to describe a time zone.  basaltc parses POSIX TZ strings (e.g., `EST5EDT,M3.2.0,M11.1.0`) for `localtime` / `mktime`.  See xref:time/time-and-tz.adoc[Time and Timezones].
+
+[[posix-sigcheck]]posix_sigcheck::
+The trona function that checks pending signal bits and dispatches the user handler.  Called automatically at every IPC return.  See xref:process/processes-and-signals.adoc[Processes and Signals].
+
+[[progname]]__progname::
+The static pointer holding the program name (basename of `argv[0]`).  Set during `__libc_start_main` via `setprogname`.  Read by BSD `err`/`warn` functions to prefix diagnostic output.
+
+[[rtld]]rtld::
+The runtime dynamic linker (`ld-trona.so`).  Loads `DT_NEEDED` libraries at process startup before `_start` runs.
+
+[[rune-table]]Rune table::
+The 256-entry table that backs the `<ctype.h>` macros.  Each entry holds a category bitmask and the upper / lower case mapping for one byte value.  Ported from FreeBSD's `_RuneLocale` and stored in `compat/freebsd/rune.rs`.
+
+[[sa-restart]]SA_RESTART::
+The POSIX `sigaction` flag requesting that interrupted syscalls restart automatically.  basaltc accepts the flag for compatibility but it has no effect because syscalls are never interrupted.  See xref:process/processes-and-signals.adoc[Processes and Signals].
+
+[[sbrk]]sbrk::
+The classic Unix heap-extension primitive.  basaltc's `malloc` calls `trona_posix::mm::posix_sbrk` to grow the heap when the free list is empty.
+
+[[setjmp-longjmp]]setjmp / longjmp::
+The non-local jump primitives.  basaltc's implementation is in `lib/basalt/c/src/arch/{x86_64,aarch64}/setjmp.S` (callee-saved register save/restore).
+
+[[slot-allocator]]Slot allocator::
+The per-process allocator for CSpace slots, initialized during `init_mm_from_auxv`.  Used to store capabilities returned by trona system calls (file descriptor capabilities, MO capabilities, etc.).
+
+[[stdio-init]]stdio init::
+The `ensure_stdio_init` function that wires up the static `stdin`, `stdout`, `stderr` slots and the FreeBSD `__stdinp`, `__stdoutp`, `__stderrp` aliases.  Called early in `__libc_start_main`.
+
+[[strlcpy]]strlcpy / strlcat::
+BSD-recommended buffer-safe string copy and concatenate.  Differ from glibc's `strncpy`/`strncat` in two ways: the size argument is the buffer size (not the maximum copy length), and the result is always NUL-terminated.  See xref:text/strings-and-memory.adoc[Strings and Memory].
+
+[[tls]]TLS (Thread-Local Storage)::
+Per-thread state.  basaltc relies on `trona_posix::tls::Tls`, a struct with fields for `errno`, the `gmtime`/`localtime` reentrancy buffer, the `asctime` and `ctime` buffers, the `dlerror` message, etc.  Accessed through the architecture thread pointer (`%fs` on x86_64, `TPIDR_EL0` on aarch64).  See xref:internals/trona-boundary.adoc[trona Boundary].
+
+[[trona-boundary]]trona boundary::
+The line between basaltc (which translates C ABI to Rust calls) and `trona_posix` (which makes the actual IPC calls to userland servers).  Some basaltc modules cross the boundary heavily (`unistd`, `stdio`); others stay entirely above it (`regex`, `iconv`, `string`).  See xref:internals/trona-boundary.adoc[trona Boundary].
+
+[[trona-posix]]trona_posix::
+The Rust crate one layer below basaltc that exposes POSIX-shaped functions backed by trona IPC calls to userland servers.  Almost every basaltc system-touching function is a thin wrapper around a `trona_posix::*` call.
+
+[[utsname]]utsname::
+The struct returned by `uname()`.  Carries `sysname` (`"SaltyOS"`), `nodename` (current hostname), `release`, `version`, and `machine` (`"x86_64"` or `"aarch64"`).
+
+[[vfsserver]]vfsserver::
+The userland Virtual File System server that backs every file fd.  basaltc reaches it via `trona_posix::posix_*` calls.
+
+[[wcs]]wcwidth::
+The function that returns the display column width of a wide character.  Returns 1 for normal characters, 0 for combining characters, 2 for some CJK ranges.  basaltc uses the FreeBSD compact wcwidth table.

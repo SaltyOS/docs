@@ -1,0 +1,339 @@
+= CRT Startup
+:description: From _start in crt_start.S to main, including auxv parsing, IPC handshake, TLS init, and ELF init arrays
+
+This page traces what happens between the moment the runtime dynamic linker hands control to a SaltyOS process and the moment that process's `main` function returns.
+The path runs through `crt_start.S` (architecture-specific assembly), `__libc_start_main` in `lib/basalt/c/src/crt.rs`, the trona substrate IPC and slot allocator setup, and finally the ELF `.preinit_array` / `.init_array` constructors.
+This is the single most distinctive piece of basaltc — every detail matters because the order of operations dictates which APIs are usable when.
+
+== The Two-Layer Split
+
+basaltc divides startup into a **common runtime init** that every dynamically linked SaltyOS process needs (whether the program is C, Rust, or anything else loaded by `ld-trona.so`), and a **C/POSIX layer** that only matters to programs built against the C ABI.
+
+Common runtime init::
+. Map and initialize the IPC buffer at a fixed virtual address.
+. Initialize the per-process slot allocator from the startup CSpace layout.
+. Initialize `posix_mm` against the mmsrv endpoint discovered via auxv.
+. Initialize the main thread's TLS slot.
+
+C/POSIX layer::
+[start=5]
+. Parse `argc`, `argv`, `envp` and call `env::init_environ`.
+. Set the program name (`__progname`) from `argv[0]`.
+. Probe stdio file descriptors; open `/dev/console` if absent.
+. Initialize the FreeBSD rune locale tables.
+. Save `.fini_array` bounds for `exit` to call later.
+. Run `.preinit_array` then `.init_array` constructors.
+. Call `main(argc, argv, envp)`.
+. On return, call `exit(status)`.
+
+The split exists because `common_init` is shared between basaltc and direct trona userland programs.
+A pure-Rust SaltyOS server that does not link `libc.so` still needs the IPC buffer, slot allocator, and TLS — but it does not need `environ` parsing, stdio fds, or rune tables.
+Both layers live in `crt.rs`, but only the common layer is reused by other startup paths.
+
+== _start: The ELF Entry Point
+
+`crt_start.S` (per-architecture, in `lib/basalt/c/src/arch/{x86_64,aarch64}/crt_start.S`) defines `_start`.
+`_start` is the symbol named in the ELF header `e_entry` of every basaltc-linked binary.
+The runtime dynamic linker `ld-trona.so` jumps here after relocating the executable and its DT_NEEDED libraries.
+
+`_start` does only a few things:
+
+. Save the initial stack pointer (which points at `argc`, followed by `argv`, `envp`, and `auxv`).
+. Load the addresses of the `.preinit_array`, `.init_array`, and `.fini_array` section bounds (from symbols emitted by the linker script).
+. Pass everything to `__libc_start_main` as call arguments, with the stack pointer in the first or second argument register depending on architecture.
+. Tail-call into `__libc_start_main` (it never returns).
+
+The assembly is short because `crt_start.S` is statically linked into every executable.
+Anything more complicated would inflate every binary on the system.
+All real work happens in `__libc_start_main`, which is in `libc.so` and shared.
+
+== __libc_start_main Signature
+
+[source,rust]
+----
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __libc_start_main(
+    main_fn: unsafe extern "C" fn(i32, *const *const u8, *const *const u8) -> i32,
+    stack_ptr: *const u64,
+    preinit_array_start: *const unsafe extern "C" fn(),
+    preinit_array_end: *const unsafe extern "C" fn(),
+    init_array_start: *const unsafe extern "C" fn(),
+    init_array_end: *const unsafe extern "C" fn(),
+    fini_array_start: *const unsafe extern "C" fn(),
+    fini_array_end: *const unsafe extern "C" fn(),
+) -> !
+----
+
+`main_fn` is the user's `main` symbol.
+`stack_ptr` points at the initial stack frame containing argc/argv/envp/auxv.
+The four `_start`/`_end` pairs bound the executable's preinit, init, and fini arrays — passed in by `_start` because they are emitted by the executable's linker script, not basaltc's.
+
+== The Initial Stack Frame
+
+ELF SystemV ABI defines the layout below `stack_ptr` on entry:
+
+[source]
+----
+[ argc                       ]   <- stack_ptr
+[ argv[0]                    ]
+[ argv[1]                    ]
+[ ...                        ]
+[ NULL terminator            ]
+[ envp[0]                    ]
+[ envp[1]                    ]
+[ ...                        ]
+[ NULL terminator            ]
+[ auxv[0].tag, auxv[0].val   ]
+[ auxv[1].tag, auxv[1].val   ]
+[ ...                        ]
+[ AT_NULL terminator         ]
+[ argv strings               ]
+[ envp strings               ]
+----
+
+`__libc_start_main` walks this layout in three passes:
+
+. Read `argc` directly from `*stack_ptr`.
+. Compute `argv = stack_ptr + 1`. Compute `envp = argv + argc + 1` (skipping past argv and its NULL).
+. Walk `envp` until the NULL, then `auxv = envp + 1`. Save `auxv` to a global (`SAVED_AUXV`) so `getauxval(3)` and `elf_aux_info(3)` can read it later, and call `trona::runtime_set_auxv(auxv)` so the trona substrate also has it.
+
+== SaltyOS auxv Tags
+
+The standard ELF auxiliary vector carries information like the page size (`AT_PAGESZ`), the entry point (`AT_ENTRY`), and the random bytes for stack canaries (`AT_RANDOM`).
+SaltyOS adds three custom tags in the `0x1000–0x100F` range, all consumed during startup:
+
+[cols="1,2,4"]
+|===
+| Tag | Symbol | Purpose
+
+| `0x1005`
+| `AT_TRONA_CSPACE_LAYOUT`
+| Pointer to a `CspaceLayout` struct describing the startup CSpace's allocation range. The runtime dynamic linker writes this in place after consuming its own startup frame slots, so the basaltc slot allocator sees the post-RTLD layout directly.
+
+| `0x1009`
+| `AT_TRONA_EXPAND_EP`
+| Capability slot index for the procmgr endpoint used to expand the CSpace when the per-process slot allocator runs out.
+
+| `0x100B`
+| `AT_TRONA_MM_EP`
+| Capability slot index for the mmsrv endpoint. `posix_mm_init()` uses this to register the process with the page fault handler. If absent (set to 0), the process has no demand-paging support.
+|===
+
+A fourth tag `0x100E` (`sc_cap`) is also read but is normally overridden by `trona::__trona_sc_cap` set by the runtime dynamic linker.
+
+== Common Runtime Init
+
+[source,rust]
+----
+unsafe fn common_init(stack_ptr: *const u64) {
+    init_ipc_from_auxv(stack_ptr);
+    init_mm_from_auxv(stack_ptr);
+    trona_posix::tls::init_main_thread_tls();
+}
+----
+
+=== IPC Buffer
+
+`init_ipc_from_auxv` invokes the kernel through `trona::invoke::tcb_set_ipc_buffer(CAP_SELF_TCB, ipc_buf_vaddr)` to map the per-thread IPC buffer at the fixed virtual address `0x0000_0000_0020_0000`.
+After the syscall returns, basaltc calls `trona::ipc::ipc_context_init` to initialize the substrate's IPC context with the same address.
+From this point on every IPC syscall (`Send`, `Recv`, `Call`) reads and writes the message registers through this buffer.
+
+Until this step completes, **no IPC is possible**.
+Code executed earlier in `_start` and `crt_start.S` cannot make any system call that requires message passing.
+
+=== Slot Allocator
+
+`init_mm_from_auxv` reads `AT_TRONA_CSPACE_LAYOUT` to discover the per-process slot allocator range (`alloc_base`, `alloc_count`).
+It calls `trona::slot_alloc::slot_alloc_init(alloc_base, alloc_count, cspace_ntfn)`.
+The slot allocator manages the process's CNode slots — every capability the process receives (file descriptors as VFS endpoints, shared memory regions as MO caps, etc.) gets stored in a slot pulled from this pool.
+
+The runtime dynamic linker has already consumed a few slots for its own DSO loads, and it writes the post-RTLD `alloc_base` back into the layout descriptor before jumping to `_start`, so basaltc inherits the correct starting point without having to re-scan the CSpace.
+
+=== posix_mm
+
+`trona_posix::mm::posix_mm_init(mm_ep)` registers the process with mmsrv (the userland memory manager) using the capability from `AT_TRONA_MM_EP`.
+After this call, demand-paging is live: page faults from the application code raise an IPC into mmsrv, which maps frames on demand.
+If `mm_ep` is 0 (no pager), `posix_mm_init` records that fact and `mmap`/`mprotect` calls fail with `ENOMEM` later.
+
+=== Main Thread TLS
+
+`trona_posix::tls::init_main_thread_tls()` allocates the main thread's TLS slot and installs the architecture-specific thread pointer.
+On x86_64 the thread pointer is `%fs`; on aarch64 it is `TPIDR_EL0`.
+The TLS slot includes `errno`, `libc_tm_buf`, `libc_asctime_buf`, `libc_ctime_buf`, and other reentrancy buffers used by basaltc.
+
+After this step, `__errno_location()` returns a real per-thread pointer instead of the pre-TLS fallback global.
+See xref:../internals/trona-boundary.adoc[trona Boundary] for the TLS layout details.
+
+== The C/POSIX Layer
+
+With common init done, `__libc_start_main` continues with the C-specific setup:
+
+=== argv, envp, environ
+
+[source,rust]
+----
+let argc = *stack_ptr as i32;
+let argv = stack_ptr.add(1) as *const *const u8;
+let envp = argv.add(argc as usize + 1) as *const *const u8;
+env::init_environ(envp);
+----
+
+`env::init_environ` walks `envp` and stores the pointer in the global `environ` variable that `getenv`, `setenv`, `unsetenv` use.
+It does not copy the strings — they remain in the initial stack pages, valid for the process lifetime.
+
+=== Program Name
+
+[source,rust]
+----
+if argc > 0 && !(*argv).is_null() {
+    crate::compat::freebsd::bsd_misc::setprogname(*argv);
+}
+----
+
+`setprogname` stores `argv[0]` in a global pointer used by the BSD `err(3)` family (`err`, `errx`, `warn`, `warnx`).
+These functions print `<program>: <message>` formatted output and need a name even before any user code runs.
+
+=== stdio File Descriptors
+
+[source,rust]
+----
+let probe = trona_posix::posix_dup(0);
+if probe >= 0 {
+    trona_posix::posix_close(probe);
+} else {
+    let fd0 = trona_posix::posix_open(b"/dev/console\0".as_ptr(), 2, 0);
+    if fd0 >= 0 {
+        trona_posix::posix_dup(fd0);
+        trona_posix::posix_dup(fd0);
+    }
+}
+----
+
+If the parent process passed file descriptors through `exec` (typical: getty → bash → child program), `dup(0)` succeeds and basaltc leaves fds 0/1/2 alone.
+If the process was spawned fresh (init → daemon), `dup(0)` fails because the descriptor is empty, so basaltc opens `/dev/console` for read/write and dups it twice to make stdin, stdout, and stderr.
+Either way, after this block fds 0, 1, and 2 are guaranteed to be open and pointing somewhere usable.
+
+`crate::stdio::ensure_stdio_init()` then constructs the `__stdoutp`, `__stdinp`, `__stderrp` `FILE*` objects so that `printf(3)` and `fprintf(stderr, ...)` see live `FILE` structures.
+See xref:../io/stdio.adoc[Buffered I/O].
+
+=== Locale
+
+`crate::compat::freebsd::rune::init_rune_locale()` populates the FreeBSD `_RuneLocale` tables that `ctype.h` macros (`isalpha`, `isdigit`, `toupper`, `tolower`, etc.) read.
+basaltc uses C locale only — see xref:../text/locale-and-ctype.adoc[Locale, ctype and wchar] — so this is a one-shot initialization with no per-locale state to track.
+
+=== Saving fini_array
+
+[source,rust]
+----
+core::ptr::addr_of_mut!(SAVED_FINI_ARRAY_START).write(fini_array_start);
+core::ptr::addr_of_mut!(SAVED_FINI_ARRAY_END).write(fini_array_end);
+----
+
+The fini array bounds passed in by `_start` are saved to globals.
+`exit` reads them later when calling destructors in reverse order.
+This indirection exists because `exit` can be called from any place in the program (including from within an atexit handler), and at that point the original `_start` arguments are no longer accessible.
+
+=== Init Arrays
+
+[source,rust]
+----
+call_preinit_array(preinit_array_start, preinit_array_end);
+call_init_array(init_array_start, init_array_end);
+----
+
+`.preinit_array` runs first (forward order), then `.init_array`.
+Both are arrays of function pointers emitted by the linker for any C/C++ object marked with `__attribute__((constructor))` or any C++ namespace-scope object with a non-trivial constructor.
+basaltc walks them with simple loops; there is no priority sorting at this stage because the linker script has already sorted by priority via `SORT_BY_INIT_PRIORITY`.
+
+=== Calling main
+
+[source,rust]
+----
+let ret = main_fn(argc, argv, envp);
+exit(ret);
+----
+
+That is the entire user-visible startup.
+`main_fn(argc, argv, envp)` is the application's `main`, with the standard three-argument signature.
+When `main` returns, basaltc enters `exit` to run the teardown sequence.
+
+== Lifecycle Diagram
+
+[plantuml]
+....
+@startuml
+skinparam defaultFontSize 10
+
+start
+:rtld (ld-trona.so)\nrelocates executable\nand DT_NEEDED libraries;
+:_start (crt_start.S)\nsave stack_ptr\nload init/fini bounds;
+:__libc_start_main(main_fn, stack_ptr, ...);
+note right
+  Common Runtime Init
+end note
+:Parse argc/argv/envp;
+:env::init_environ(envp);
+:Save SAVED_AUXV;
+:trona::runtime_set_auxv;
+:init_ipc_from_auxv\n(IPC buffer @ 0x200000);
+:init_mm_from_auxv\n(slot allocator + posix_mm);
+:tls::init_main_thread_tls;
+note right
+  C / POSIX Layer
+end note
+:setprogname(argv[0]);
+:Probe fd 0 → open /dev/console if absent;
+:stdio::ensure_stdio_init;
+:rune::init_rune_locale;
+:Save .fini_array bounds;
+:call_preinit_array (forward);
+:call_init_array (forward);
+:main(argc, argv, envp);
+:exit(status);
+note right
+  Teardown
+end note
+:atexit handlers (reverse);
+:__cxa_finalize\n(C++ destructors);
+:call_fini_array (reverse);
+:stdio::fflush_all;
+:_exit → trona_posix::posix_exit;
+stop
+@enduml
+....
+
+== After main: exit() Teardown
+
+The teardown side belongs to xref:runtime/atexit-and-exit.adoc[atexit and Process Exit], but the entry point is in the same file:
+
+[source,rust]
+----
+pub unsafe extern "C" fn exit(status: i32) -> ! {
+    // 1. atexit handlers in reverse order (under lock)
+    // 2. __cxa_finalize(NULL) — C++ destructors registered via __cxa_atexit
+    // 3. .fini_array in reverse order
+    // 4. stdio::fflush_all
+    // 5. _exit(status) → trona_posix::posix_exit
+}
+----
+
+`_exit` and `_Exit` skip every step except the final `posix_exit`. Use them when the process is in an inconsistent state (after a fatal error from a fork-then-exec child, for example) and the destructor side effects would do more harm than good.
+
+== Constraints on Early Code
+
+Because the initialization order is fixed, the following constraints apply to anything that runs before or during `__libc_start_main`:
+
+* `_start` and `crt_start.S` cannot make IPC calls (the IPC buffer is not yet mapped).
+* Code that runs before `init_main_thread_tls` cannot rely on `errno` being thread-local — it falls back to a global.
+* `posix_mm` is not initialized until after the slot allocator, so `mmap` cannot be called during slot allocator setup.
+* `.init_array` constructors run after the locale is initialized, so it is safe to call `isalpha` and `tolower` from a global C++ constructor.
+* `.init_array` constructors run after stdio is set up, so it is safe to call `printf` from a global C++ constructor.
+* `.init_array` constructors run before `main`, so any C++ static initializer that calls into trona will go through the same TLS-aware path as `main` itself.
+
+== Related Pages
+
+* xref:runtime/atexit-and-exit.adoc[atexit and Process Exit] — what happens after `main` returns
+* xref:runtime/dynamic-linking.adoc[Dynamic Linking] — `ld-trona.so` and `dlopen` cooperation
+* xref:runtime/heap-and-malloc.adoc[Heap and malloc] — heap setup runs lazily on first allocation
+* xref:../internals/trona-boundary.adoc[trona Boundary] — TLS layout and the trona substrate's role
+* xref:../arch/multi-arch-dispatch.adoc[Multi-Architecture Dispatch] — how `crt_start.S` becomes per-architecture

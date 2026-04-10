@@ -1,0 +1,327 @@
+= Build System
+:description: How Meson drives rustc, clang, and lld to produce libc.so, libc++.so, and the static CRT objects
+
+basalt has no `Cargo.toml` or `CMakeLists.txt`.
+The entire build is driven by Meson via direct invocations of `rustc`, `clang`, and `lld` through `custom_target` rules.
+This page walks through the four steps that produce `libc.so`, the optional libc++ build, and the build options that gate everything.
+
+== Top-Level Entry Point
+
+The basalt subtree is entered from `lib/basalt/meson.build`:
+
+[source,meson]
+----
+subdir('c')
+
+_libcxx_opt = get_option('build_libcxx')
+_libcxx_src_dir = meson.project_source_root() / 'toolchain' / 'llvm-project' / 'libcxx' / 'src'
+_build_libcxx = (_libcxx_opt == 'true') or
+                (_libcxx_opt == 'auto' and fs.is_dir(_libcxx_src_dir))
+if _build_libcxx
+  subdir('cpp')
+endif
+----
+
+`build_libcxx` accepts `auto` (build if the LLVM submodule is present), `true` (require it), or `false` (never build).
+`auto` is the default — checking out SaltyOS without the LLVM submodule still gets a working `libc.so`, but no `libc++.so`.
+
+== basaltc Pipeline
+
+`lib/basalt/c/meson.build` runs four `custom_target` rules in dependency order:
+
+[plantuml]
+....
+@startuml
+skinparam defaultFontSize 11
+
+rectangle "src/lib.rs\n(44 modules)" as SRC
+rectangle "libtrona.rmeta\nlibtrona_posix.rmeta" as TRONA_META
+rectangle "rustc" as RUSTC
+rectangle "basaltc.o\nbasaltc.rmeta" as BCO
+rectangle "src/arch/{arch}/setjmp.S" as SJ_S
+rectangle "src/arch/{arch}/crt_start.S" as CRT_S
+rectangle "clang -c" as CLANG
+rectangle "setjmp.o" as SJ_O
+rectangle "crt_start.o" as CRT_O
+rectangle "core.o\ncompiler_builtins.o" as RUNTIME
+rectangle "lld" as LLD
+rectangle "libc.so" as LIBC
+
+SRC --> RUSTC
+TRONA_META --> RUSTC : --extern
+RUSTC --> BCO
+SJ_S --> CLANG
+CRT_S --> CLANG
+CLANG --> SJ_O
+CLANG --> CRT_O
+BCO --> LLD
+SJ_O --> LLD
+RUNTIME --> LLD
+LLD --> LIBC
+
+note right of CRT_O
+  NOT linked into libc.so —
+  statically linked into
+  each application binary
+end note
+@enduml
+....
+
+=== Step 1: rustc → basaltc.o + basaltc.rmeta
+
+[source,meson]
+----
+basaltc_rust = custom_target('basaltc_rust',
+  input: files('src/lib.rs'),
+  output: ['basaltc.o', 'basaltc.rmeta'],
+  command: [rustc,
+    rust_userland_args,
+    '--emit=obj=@OUTPUT0@,metadata=@OUTPUT1@,dep-info=@DEPFILE@',
+    '--crate-name=basaltc',
+    '--crate-type=lib',
+    '--extern', 'trona=' + libtrona_build_dir / 'libtrona.rmeta',
+    '--extern', 'trona_posix=' + libtrona_build_dir / 'libtrona_posix.rmeta',
+    '@INPUT@',
+  ],
+  depends: [core, compiler_builtins, libtrona_rust, trona_posix],
+)
+----
+
+Key observations:
+
+* `rust_userland_args` is the shared userland Rust flag set defined in the top-level Meson build. It includes `--edition=2024`, `--target=x86_64-unknown-saltyos` (or aarch64), `-C panic=abort`, `-C opt-level=2`, `-C relocation-model=pic`. The custom rustc target spec is required because the `*-unknown-saltyos` triples are only known to the patched stage1 compiler in `toolchain/rust/`.
+* The dual `--emit` produces both an object file (linked into `libc.so`) and an `.rmeta` (used by other Rust crates that need to call basaltc as a Rust crate, including `ld-trona.so` and selected userland servers).
+* The `depends:` list pulls in `core` and `compiler_builtins` (built once from `rust-src` at the top level) and the trona crates that basaltc imports.
+
+=== Step 2: setjmp.S → setjmp.o
+
+[source,meson]
+----
+setjmp_obj = custom_target('setjmp_asm',
+  input: files('src/arch' / arch / 'setjmp.S'),
+  output: 'setjmp.o',
+  command: [cc_cmd, '--target=' + c_target, '-c', '@INPUT@', '-o', '@OUTPUT@'],
+)
+----
+
+`setjmp.S` and `longjmp` save and restore the callee-saved register set on each architecture.
+Pure assembly because Rust cannot represent the register-level control flow of `longjmp` portably.
+Linked into `libc.so` so any caller of `setjmp` resolves the symbols dynamically.
+
+=== Step 3: crt_start.S → crt_start.o
+
+[source,meson]
+----
+crt_start_obj = custom_target('crt_start_asm',
+  input: files('src/arch' / arch / 'crt_start.S'),
+  output: 'crt_start.o',
+  command: [cc_cmd, '--target=' + c_target, '-c', '@INPUT@', '-o', '@OUTPUT@'],
+)
+----
+
+`crt_start.S` defines `_start`, the ELF entry point.
+It sets up the initial stack frame, parses `argv`/`envp`/`auxv`, and tail-calls `__libc_start_main` (defined in `src/crt.rs`).
+This object is **deliberately not linked into `libc.so`**: each application binary's link command pulls `crt_start.o` in directly.
+If `crt_start.o` were inside `libc.so`, the shared library would carry an unresolved reference to `main`, which would fail at link time for any executable that does not provide `main` (e.g., shared libraries themselves).
+See xref:runtime/crt-startup.adoc[CRT Startup] for the runtime side.
+
+=== Step 4: lld → libc.so
+
+[source,meson]
+----
+libc_so = custom_target('libc_so',
+  input: [basaltc_obj, setjmp_obj, core_obj, compiler_builtins_obj],
+  output: 'libc.so',
+  depends: [libtrona_so],
+  command: [cc_cmd,
+    '--target=' + c_target,
+    '-shared',
+    '-nostdlib', '-nostartfiles',
+    '-fno-stack-protector',
+    '-Wl,-soname,libc.so',
+    '-T', basaltc_link,
+    '-L', libtrona_build_dir,
+    '-o', '@OUTPUT@',
+    '@INPUT@',
+    '-ltrona',
+  ],
+)
+----
+
+`cc_cmd` is `clang` with `-fuse-ld=lld` already in scope; the link is fully self-contained.
+Notable flags:
+
+`-shared`:: Build a position-independent shared library.
+`-nostdlib -nostartfiles`:: Do not link in any host libc, host crt1, host startfiles. We provide our own.
+`-fno-stack-protector`:: basaltc does provide a `__stack_chk_fail` (in `stack_protector.rs`), but the link does not request canary insertion at compile time.
+`-T basaltc.ld`:: Per-architecture linker script (`lib/basalt/c/arch/{x86_64,aarch64}/basaltc.ld`). It page-aligns `.text`, `.rodata`, `.data`, and `.bss`, keeps `.init_array` / `.fini_array` for global C++ constructors and atexit hooks, and discards `.comment`, `.note.*`, and `.eh_frame*`.
+`-ltrona`:: Records `libtrona.so` as a `DT_NEEDED` so the runtime dynamic linker brings trona in before basaltc resolves any symbols.
+
+After Step 4, `libc.so` is a complete shared library: stdio, malloc, pthread, sockets — all the symbols any port could ask for, with `DT_NEEDED libtrona.so` for the system call layer.
+
+== libc++ Pipeline
+
+`lib/basalt/cpp/meson.build` is more elaborate.
+It compiles 48 libcxx sources, 18 libcxxabi sources, 2 libunwind C++ sources, 2 C sources, and 2 assembly sources, then links the entire result with lld.
+
+[plantuml]
+....
+@startuml
+skinparam defaultFontSize 11
+
+cloud "toolchain/llvm-project" {
+  [libcxx/src/*.cpp\n(47 sources)] as CXX_SRC
+  [libcxxabi/src/*.cpp\n(18 sources)] as ABI_SRC
+  [libunwind/src/*.cpp,*.c,*.S\n(6 sources)] as UNW_SRC
+}
+
+[__config_site] as CFG
+[clang custom_target\n× ~73] as CLANG
+[*.o objects] as OBJS
+[lld] as LLD
+[libc++.so] as CXXSO
+[libc.so] as LIBC
+[libtrona.so] as TRONA
+[compiler-rt builtins] as RT
+
+CXX_SRC --> CLANG
+ABI_SRC --> CLANG
+UNW_SRC --> CLANG
+CFG --> CLANG : -include
+CLANG --> OBJS
+OBJS --> LLD
+RT --> LLD
+LIBC --> LLD : -lc
+TRONA --> LLD : -ltrona
+LLD --> CXXSO
+@enduml
+....
+
+=== Per-Source custom_target
+
+Each `.cpp` file becomes a single `custom_target`:
+
+[source,meson]
+----
+foreach src : _cxx_srcs
+  _name = 'cxx_' + src.replace('/', '_').replace('.cpp', '')
+  _all_objs += custom_target(_name,
+    output: _name + '.o',
+    depfile: _name + '.d',
+    command: [cc_cmd,
+      _cxx_flags,
+      '-MMD', '-MF', '@DEPFILE@',
+      '-c', _libcxx_src / src,
+      '-o', '@OUTPUT@',
+    ],
+  )
+endforeach
+----
+
+The pattern repeats for `_cxxabi_srcs`, `_libunwind_cpp_srcs`, `_libunwind_c_srcs`, and `_libunwind_asm_srcs`.
+Per-source `custom_target` is verbose but gives Meson maximum parallelism and per-file dependency tracking via the depfile.
+
+=== Compile Flag Set
+
+`_cxx_flags` is the canonical libc++ flag bundle:
+
+[source,bash]
+----
+--target=<arch-saltyos>
+-std=c++23
+-fPIC
+-fno-rtti
+-funwind-tables
+-ffreestanding
+-nostdinc
+-nostdlib
+-D_LIBCPP_BUILDING_LIBRARY
+-DLIBCXX_BUILDING_LIBCXXABI
+-DLIBCXXABI_BAREMETAL
+-DLIBCXXABI_SILENT_TERMINATE
+-isystem <cpp source dir>          # __config_site, __assertion_handler
+-isystem <libcxx/include>
+-isystem <libcxxabi/include>
+-isystem <clang resource dir>      # freestanding stddef/stdint/float/stdarg
+-isystem <basaltc/include>
+-include <__config_site>
+----
+
+Two details deserve attention:
+
+* `-fno-rtti` is in `_cxx_flags` but is **stripped from `_cxxabi_flags`** before the libcxxabi compile loop. libcxxabi *is* the RTTI implementation (`dynamic_cast`, `typeid`, the typeinfo objects themselves), so it must be compiled with RTTI enabled. Mirrors upstream LLVM CMake behavior.
+* `-nostdinc` blocks all host system headers, not just C++ headers. The `-isystem` chain provides every header explicitly: SaltyOS configuration → libcxx → libcxxabi → clang resource → basaltc. This guarantees that no host libc pollution leaks into the build.
+
+=== libunwind
+
+libunwind has three flag sets because it mixes languages: `_libunwind_flags` for `.cpp` files (no exceptions, freestanding C++23), `_libunwind_c_flags` for `.c` files (`-std=c11` instead of `-std=c++23`), and a minimal flag set for `.S` files (just `--target` and `-fPIC`).
+Six sources total: `libunwind.cpp`, `Unwind-EHABI.cpp`, `UnwindLevel1.c`, `UnwindLevel1-gcc-ext.c`, `UnwindRegistersRestore.S`, `UnwindRegistersSave.S`.
+
+=== Linking libc++.so
+
+[source,meson]
+----
+libcxx_so = custom_target('libcxx_so',
+  input: _all_objs,
+  output: 'libc++.so',
+  command: [cc_cmd,
+    '--target=' + c_target,
+    '-shared',
+    '-nostdlib', '-nostartfiles',
+    '-fuse-ld=lld',
+    '-Wl,-soname,libc++.so',
+    '-z', 'max-page-size=4096',
+    '-o', '@OUTPUT@',
+    '@INPUT@',
+    _clang_rt_builtins,
+    '-L', basaltc_build_dir, '-lc',
+    '-L', libtrona_build_dir, '-ltrona',
+  ],
+  depends: [libc_so, libtrona_so],
+)
+----
+
+`_clang_rt_builtins` is found at build time via `clang --target=... -print-libgcc-file-name`.
+It points at `libclang_rt.builtins-<arch>.a`, which provides 128-bit float helpers (`__lttf2`, `__trunctfdf2`, etc.) used by `charconv.cpp`.
+Following Fuchsia's approach, basalt links the builtins statically into each shared library that needs them rather than relying on a system-wide compiler-rt.
+
+DT_NEEDED entries on the resulting `libc++.so`: `libc.so`, `libtrona.so`.
+
+== Build Options
+
+[cols="1,1,3"]
+|===
+| Option | Default | Effect
+
+| `build_libcxx`
+| `auto`
+| `auto` builds libc++ if the LLVM submodule is present, otherwise skips. `true` requires the submodule; `false` never builds.
+
+| `arch`
+| `x86_64`
+| Architecture for the entire SaltyOS build, including basalt. Selects the rustc target spec, the assembly variant of `crt_start.S` and `setjmp.S`, the linker script, and the libc++ `--target` flag.
+|===
+
+basalt does not own per-component options.
+The flags it consumes (`rust_userland_args`, `cc_cmd`, `c_target`) are defined at the top-level `meson.build` and shared with kernite, trona, and userland.
+
+== Adding a New basaltc Source File
+
+Adding a new top-level Rust module to basaltc takes one source change and one rebuild step:
+
+. Create the new `.rs` file in `lib/basalt/c/src/`.
+. Add `pub mod my_new_module;` to `lib/basalt/c/src/lib.rs`.
+. Run `just distclean && just setup && just build`.
+
+The distclean is necessary because `lib.rs` is the only source file declared in `c/meson.build`. Meson re-resolves the dependency graph from `lib.rs` on each rustc invocation, but the top-level discovery happens at `meson setup` time.
+
+Adding a new C header is even simpler: drop it into `lib/basalt/c/include/` (or a subdirectory) and run `just build`. The header collection step uses a `find` at setup time, so changes to existing headers do not require re-setup, but adding a new header file does.
+
+For new libc++ sources, edit the `_cxx_srcs`, `_cxxabi_srcs`, or `_libunwind_*_srcs` lists in `lib/basalt/cpp/meson.build` and rebuild.
+
+== Related Pages
+
+* xref:architecture.adoc[Architecture] — module map and dependency direction
+* xref:runtime/crt-startup.adoc[CRT Startup] — what the `crt_start.o` produced here actually does
+* xref:cxx/cxx-runtime.adoc[libc++ Runtime] — what the `libc++.so` produced here exposes
+* xref:cxx/cxx-config-site.adoc[libc++ Configuration] — the `__config_site` referenced via `-include`

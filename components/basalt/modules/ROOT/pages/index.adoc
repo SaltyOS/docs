@@ -1,10 +1,114 @@
-= basalt
+= Basalt
+:description: SaltyOS C/C++ standard library stack — basaltc (libc.so) and libc++ runtime
 
-This component is the placeholder for SaltyOS libc and CRT documentation.
+Basalt is the SaltyOS C and C++ standard library stack.
+It contains two cooperating runtimes shipped together:
 
-Planned scope:
+basaltc::
+A POSIX-compatible C standard library written in Rust, built as `libc.so`.
+44 modules covering stdio, unistd, pthread, sockets, time, math, regex, locale, dynamic linking, and a FreeBSD compatibility layer.
+Every system operation is delegated to xref:trona::index.adoc[trona] (`trona_posix`), which talks to userland servers via xref:kernite::ipc/endpoints.adoc[kernel IPC].
 
-* libc surface and headers
-* CRT startup and runtime behavior
-* porting guide for C software
-* compatibility notes
+libc++::
+The LLVM C++ runtime, built in-tree from the `toolchain/llvm-project` submodule against basaltc.
+Produces `libc++.so` (libcxx + libcxxabi + libunwind, all linked into one shared library) plus a SaltyOS `__config_site` that pins the configuration: C-locale only, exceptions on, RTTI off in libcxx, hardening off, `getentropy()` random backend.
+
+Both libraries are loaded by the runtime dynamic linker `ld-trona.so` at process startup.
+Static C runtime objects (`crt_start.o`, `setjmp.o`) are linked directly into application binaries instead of `libc.so`.
+
+== At a Glance
+
+[cols="1h,3"]
+|===
+| Languages | Rust 2024 (basaltc), C/C++23 (libc++)
+| basaltc modules | 44 top-level Rust modules (~26,000 lines)
+| Public C headers | 118 in `lib/basalt/c/include/`
+| Architectures | x86_64, aarch64
+| Output artifacts | `libc.so`, `libc++.so`, `crt_start.o`, `setjmp.o`
+| Static dependencies | `libtrona.so`, `libtrona_posix.so`, compiler-rt builtins
+| Threading | POSIX threads via `trona_posix::pthread` (futex-based)
+| Locale | C locale only (Fuchsia model)
+| Exceptions | Enabled in libc++ via libunwind DWARF EH
+| RTTI | Disabled in libcxx, enabled in libcxxabi (where the implementation lives)
+|===
+
+== Components
+
+[plantuml]
+....
+@startuml
+skinparam componentStyle rectangle
+skinparam defaultFontSize 11
+
+package "lib/basalt" {
+  package "c (basaltc)" {
+    [Rust modules\n(44 mods)] as RUST
+    [crt_start.S] as CRT
+    [setjmp.S] as SJ
+    [include/*.h] as HDR
+  }
+  package "cpp (libc++)" {
+    [libcxx] as CXX
+    [libcxxabi] as CXXABI
+    [libunwind] as UNW
+  }
+}
+
+[libtrona.so] as TRONA
+[libtrona_posix.so] as POSIX
+[application] as APP
+
+RUST --> POSIX : extern crate
+RUST --> TRONA : extern crate
+HDR ..> RUST : declares
+CRT --> APP : statically\nlinked
+SJ --> RUST : in libc.so
+
+CXX --> CXXABI : static\nlink
+CXX --> UNW : static\nlink
+CXX --> RUST : DT_NEEDED libc.so
+CXX --> TRONA : DT_NEEDED libtrona.so
+@enduml
+....
+
+The component split exists for two reasons.
+First, `crt_start.o` defines `_start` and resolves `main`, so it must be statically linked into each binary — leaving it inside `libc.so` would create an unresolved `main` reference in the shared library.
+Second, libc++ depends on basaltc but basaltc must remain free of C++ runtime requirements, so the two libraries cannot share a translation unit.
+
+== New to SaltyOS Userland?
+
+Start with the xref:saltyos::index.adoc[SaltyOS overview] to see how userland servers, the C library, and the kernel relate.
+Then come back here for the basalt-specific guides:
+
+* xref:guides/porting-a-c-program.adoc[Porting a C Program] — walk a FreeBSD utility through the SaltyOS port system.
+* xref:guides/adding-a-libc-function.adoc[Adding a libc Function] — extend basaltc with a new POSIX or BSD function.
+* xref:guides/first-contribution.adoc[First Contribution] — build basalt locally and submit your first patch.
+
+== Technical Reference
+
+* For the source layout, module list, and dependency direction, read xref:architecture.adoc[Architecture].
+* For the build pipeline that produces `libc.so` and `libc++.so`, read xref:build-system.adoc[Build System].
+* For how a process actually starts running, read xref:runtime/crt-startup.adoc[CRT Startup].
+* For the heap allocator and `errno` storage, read xref:runtime/heap-and-malloc.adoc[Heap and malloc] and xref:internals/trona-boundary.adoc[trona Boundary].
+* For the dispatch mechanism that picks SSE2 or NEON math/string backends at compile time, read xref:arch/multi-arch-dispatch.adoc[Multi-Architecture Dispatch].
+* For the libc++ build composition and `__config_site` flags, read xref:cxx/cxx-runtime.adoc[libc++ Runtime] and xref:cxx/cxx-config-site.adoc[libc++ Configuration].
+
+== Design Philosophy
+
+Three principles shape basalt:
+
+Thin C ABI over a Rust core::
+Every public C function is a `#[unsafe(no_mangle)] pub extern "C"` Rust function.
+Pointer translation, errno mapping, and option parsing live in Rust; the C side has zero hand-written bridge code.
+This gives strong type checking inside the library while presenting a familiar C interface to ports.
+
+Delegate, do not reimplement::
+basaltc does not own filesystem state, process tables, network stacks, or signal queues.
+Those live in userland servers and are reached through `trona_posix`.
+basaltc is a thin shim that converts C calling conventions to IPC.
+The exceptions are pure-data modules (regex, iconv, sha512, ctype, getopt) and arch-optimized primitives (string, mem, math) where there is no system state to delegate to.
+
+Take libc++ from upstream, configure it explicitly::
+The C++ runtime is the unmodified LLVM in-tree libcxx/libcxxabi/libunwind.
+SaltyOS contributes a single compile-time header (`__config_site`) and a Meson build that compiles each `.cpp` directly via `custom_target`, so there is no upstream CMake to track.
+Configuration choices that diverge from defaults (locale backend, hardening, random source) are pinned in that one file.

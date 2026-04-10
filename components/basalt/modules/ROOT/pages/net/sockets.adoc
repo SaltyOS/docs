@@ -1,0 +1,316 @@
+= Sockets
+:description: BSD/POSIX socket API delegating to netsrv via trona_posix, plus AF_UNIX, getaddrinfo, and the dnssrv path
+
+basaltc's socket layer (`socket.rs`, ~1,700 lines) implements the BSD socket API on top of `trona_posix::socket::*` and `trona_posix::dns::*`.
+The functions are slightly thicker than other basaltc shims because the C struct layouts (`sockaddr`, `sockaddr_in`, `sockaddr_in6`, `addrinfo`, `msghdr`, `iovec`) need careful translation when crossing the IPC boundary.
+This page covers the function surface, the AF_UNIX vs AF_INET vs AF_INET6 dispatch, the `getaddrinfo` flow through dnssrv, and the BSD `SOL_SOCKET` quirks that ports rely on.
+
+== API Surface
+
+[cols="1,3"]
+|===
+| Group | Functions
+
+| Lifecycle
+| `socket`, `bind`, `listen`, `accept`, `accept4`, `connect`, `shutdown`, `close` (via unistd), `socketpair`
+
+| Data
+| `send`, `recv`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `read`/`write` (via unistd)
+
+| Options
+| `getsockopt`, `setsockopt`, `getsockname`, `getpeername`
+
+| Multiplexing
+| `select` (via select.rs), `poll`, `pselect`, `ppoll`, `epoll_create`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`
+
+| Name resolution
+| `getaddrinfo`, `freeaddrinfo`, `gai_strerror`, `getnameinfo`, `gethostbyname`, `gethostbyname_r`, `gethostbyaddr`, `gethostbyaddr_r`, `getservbyname`, `getservbyport`, `getprotobyname`, `getprotobynumber`
+
+| Address conversion
+| `inet_aton`, `inet_addr`, `inet_ntoa`, `inet_pton`, `inet_ntop`, `htons`, `htonl`, `ntohs`, `ntohl` (in `inet.rs`)
+
+| Interface enumeration
+| `getifaddrs`, `freeifaddrs`, `if_nameindex`, `if_freenameindex`, `if_indextoname`, `if_nametoindex` (in `netif.rs`)
+
+| File transfer
+| `sendfile`
+|===
+
+== Address Family Dispatch
+
+`socket(domain, type, protocol)` returns an fd that points at one of three backend servers depending on `domain`:
+
+[cols="1,3"]
+|===
+| Domain | Backend
+
+| `AF_UNIX` (`AF_LOCAL`)
+| The vfsserver's UNIX domain socket subsystem. AF_UNIX sockets live in the filesystem namespace.
+
+| `AF_INET`
+| netsrv (smoltcp-based TCP/UDP/ICMP stack).
+
+| `AF_INET6`
+| netsrv (same stack, IPv6 path).
+|===
+
+basaltc itself does not know which backend serves the new fd — `trona_posix::socket::posix_socket(domain, type, protocol)` does the dispatch internally and returns an fd that already carries the right capability.
+Subsequent calls (`send`, `recv`, etc.) routed through `trona_posix::socket::*` reach the appropriate server through the same fd-to-capability mapping that any other system call uses (see xref:../internals/trona-boundary.adoc[trona Boundary]).
+
+[plantuml]
+....
+@startuml
+skinparam defaultFontSize 11
+
+[basaltc socket()] as BC
+[trona_posix::posix_socket] as TP
+
+[vfsserver\nAF_UNIX] as VFS
+[netsrv\nAF_INET / AF_INET6] as NET
+
+BC --> TP
+TP --> VFS : domain == AF_UNIX
+TP --> NET : domain == AF_INET\ndomain == AF_INET6
+
+[basaltc send/recv\nbasaltc setsockopt] as OPS
+[fd table\n(trona_posix)] as FDT
+
+OPS --> TP
+TP --> FDT : lookup capability\nby fd
+FDT --> VFS
+FDT --> NET
+@enduml
+....
+
+== Lifecycle Functions
+
+`socket(domain, type, protocol)`::
+Creates a new socket and allocates an fd in the calling process's fd table. Returns the fd or -1 on failure.
+
+`bind(fd, addr, addrlen)`::
+Binds the socket to a local address. For `AF_INET`, this is a `sockaddr_in` with port and IPv4 address. For `AF_UNIX`, a `sockaddr_un` with a filesystem path. basaltc forwards the address bytes verbatim to `trona_posix::socket::posix_bind`.
+
+`listen(fd, backlog)`::
+Marks the socket as accepting connections. `backlog` is the maximum queue depth for pending connections.
+
+`accept(fd, addr, addrlen)`::
+Blocks until a new connection arrives, then returns a fresh fd for the accepted connection. Optionally fills `addr` with the peer's address.
+
+`accept4(fd, addr, addrlen, flags)`::
+Same as `accept` plus `SOCK_NONBLOCK` and `SOCK_CLOEXEC` flags applied to the new fd atomically.
+
+`connect(fd, addr, addrlen)`::
+Initiates an outgoing connection. For TCP, blocks until the handshake completes or the connection is refused. For UDP, sets the default destination address.
+
+`shutdown(fd, how)`::
+Half-closes a socket. `how` is `SHUT_RD` (no more reads), `SHUT_WR` (no more writes), or `SHUT_RDWR` (both).
+
+`socketpair(domain, type, protocol, sv[2])`::
+Creates a pair of connected sockets in `sv[0]` and `sv[1]`. Only `AF_UNIX` is supported. Returns 0 or -1.
+
+== Data Transfer
+
+`send`/`recv`/`sendto`/`recvfrom`/`sendmsg`/`recvmsg` are the data movement primitives.
+`send(fd, buf, len, flags)` is shorthand for `sendto(fd, buf, len, flags, NULL, 0)`.
+`recv` is shorthand for `recvfrom` with `NULL` source address.
+
+The `flags` argument supports:
+
+[cols="1,3"]
+|===
+| Flag | Meaning
+
+| `MSG_DONTWAIT`
+| Non-blocking. Return -1 with `EAGAIN` if the operation would block.
+
+| `MSG_PEEK`
+| Read without consuming. The same data is returned by the next read.
+
+| `MSG_TRUNC`
+| For UDP, return the full datagram length even if `buf` was too small to hold it.
+
+| `MSG_NOSIGNAL`
+| Do not generate `SIGPIPE` on broken connection. Return `EPIPE` instead.
+
+| `MSG_WAITALL`
+| For TCP, block until the full requested length is received (or the connection closes).
+
+| `MSG_OOB`
+| Out-of-band data. Not supported for AF_INET; accepted for compatibility but ignored.
+|===
+
+`sendmsg`/`recvmsg` use the `msghdr` struct, which carries an iov array, a separate destination address, and a control message buffer (for fd passing on AF_UNIX).
+basaltc passes the struct through unchanged to `trona_posix::socket::posix_sendmsg` / `posix_recvmsg`.
+
+== AF_UNIX File Descriptor Passing
+
+AF_UNIX sockets support passing file descriptors between processes via `SCM_RIGHTS` control messages:
+
+[source,c]
+----
+struct msghdr msg = {0};
+char buf[CMSG_SPACE(sizeof(int) * 3)];
+msg.msg_control = buf;
+msg.msg_controllen = sizeof(buf);
+struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+cmsg->cmsg_level = SOL_SOCKET;
+cmsg->cmsg_type = SCM_RIGHTS;
+cmsg->cmsg_len = CMSG_LEN(sizeof(int) * 3);
+int *fds = (int *) CMSG_DATA(cmsg);
+fds[0] = open("/tmp/foo", O_RDONLY);
+fds[1] = ...;
+fds[2] = ...;
+sendmsg(sock, &msg, 0);
+----
+
+basaltc supports the standard CMSG macros (`CMSG_FIRSTHDR`, `CMSG_NXTHDR`, `CMSG_DATA`, `CMSG_LEN`, `CMSG_SPACE`) declared in `<sys/socket.h>`.
+The actual fd transfer happens in vfsserver's UNIX domain implementation: when the sender writes the message, vfsserver duplicates the fd's underlying capability into the receiver's CSpace and assigns a fresh fd index.
+
+This is the only standard SaltyOS mechanism for sharing file descriptors across process boundaries.
+
+== getsockopt / setsockopt
+
+Socket options are addressed by `(level, optname)`.
+Levels include:
+
+[cols="1,3"]
+|===
+| Level | Options
+
+| `SOL_SOCKET`
+| `SO_REUSEADDR`, `SO_REUSEPORT`, `SO_KEEPALIVE`, `SO_LINGER`, `SO_BROADCAST`, `SO_SNDBUF`, `SO_RCVBUF`, `SO_SNDTIMEO`, `SO_RCVTIMEO`, `SO_ERROR`, `SO_TYPE`, `SO_DOMAIN`, `SO_PROTOCOL`, `SO_DEBUG`, `SO_OOBINLINE`, `SO_DONTROUTE`, `SO_PASSCRED`, `SO_PEERCRED`
+
+| `IPPROTO_IP`
+| `IP_TTL`, `IP_TOS`, `IP_HDRINCL`, `IP_OPTIONS`, `IP_MULTICAST_TTL`, `IP_MULTICAST_LOOP`, `IP_ADD_MEMBERSHIP`, `IP_DROP_MEMBERSHIP`
+
+| `IPPROTO_IPV6`
+| `IPV6_V6ONLY`, `IPV6_UNICAST_HOPS`, `IPV6_MULTICAST_HOPS`, `IPV6_JOIN_GROUP`, `IPV6_LEAVE_GROUP`
+
+| `IPPROTO_TCP`
+| `TCP_NODELAY`, `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`, `TCP_MAXSEG`
+
+| `IPPROTO_UDP`
+| `UDP_CORK`, `UDP_GRO`
+|===
+
+Many of these are accepted by basaltc but the behavior depends on netsrv's smoltcp backend.
+Settings like `SO_REUSEADDR` and `TCP_NODELAY` work as expected.
+Settings like `SO_LINGER` and the multicast group operations are partially implemented in netsrv.
+Ports that depend on subtle socket option semantics should test against the actual server behavior, not assume parity with Linux.
+
+== getaddrinfo
+
+`getaddrinfo(node, service, hints, res)` resolves a hostname or service name to one or more `addrinfo` structs:
+
+[source,rust]
+----
+pub unsafe extern "C" fn getaddrinfo(
+    node: *const u8, service: *const u8,
+    hints: *const Addrinfo, res: *mut *mut Addrinfo,
+) -> i32 {
+    // 1. Parse hints (family, socktype, protocol, flags)
+    // 2. If node is an IP literal, skip DNS and use it directly.
+    // 3. Otherwise call trona_posix::dns::posix_getaddrinfo, which talks to dnssrv.
+    // 4. For each returned address, allocate an Addrinfo struct via malloc.
+    // 5. Link them into a chain and store the head in *res.
+    // 6. Return 0 or a getaddrinfo error code (EAI_AGAIN, EAI_NONAME, etc.)
+}
+----
+
+The DNS lookup runs entirely in dnssrv (the SaltyOS recursive caching resolver).
+basaltc forwards the hostname through `trona_posix::dns::*`, which constructs the DNS server IPC message and waits for the reply.
+basaltc then iterates over the returned address list and allocates one `addrinfo` per address.
+
+`freeaddrinfo` walks the chain and frees each entry.
+The implementation maintains the fact that all addrinfo structs in a chain were allocated by the same `getaddrinfo` call, so a single `freeaddrinfo` cleans up the entire chain.
+
+`gai_strerror(errcode)` returns a static string for the EAI_* error codes.
+Implemented as a switch-case with no allocation.
+
+== gethostbyname (Legacy)
+
+`gethostbyname(name)` is the old non-thread-safe interface from POSIX 1990:
+
+[source,c]
+----
+struct hostent *h = gethostbyname("example.com");
+if (h) {
+    printf("%s -> %s\n", h->h_name, inet_ntoa(*(struct in_addr*)h->h_addr));
+}
+----
+
+basaltc implements it as a wrapper around `getaddrinfo` plus a per-thread TLS buffer holding the `hostent` struct.
+The reentrant variant `gethostbyname_r` uses caller-supplied buffers and is preferred for new code.
+
+`gethostbyaddr` and its `_r` form do the reverse lookup, also through dnssrv.
+
+`getservbyname`, `getservbyport`, `getprotobyname`, `getprotobynumber` walk basaltc-internal static tables of well-known services and protocols (no IPC).
+
+== AF_UNIX Address
+
+`sockaddr_un` carries a path:
+
+[source,c]
+----
+struct sockaddr_un {
+    sa_family_t sun_family;   // AF_UNIX
+    char        sun_path[108];
+};
+----
+
+The 108-byte path size matches Linux.
+Names starting with `\0` are abstract sockets (Linux extension); basaltc accepts the syntax but the underlying vfsserver currently treats them as filesystem paths beneath the root, which is not the same as Linux abstract sockets.
+Ports using the abstract namespace need to be aware of this difference.
+
+== epoll
+
+`epoll_create`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` are implemented because several ports (curl with multi-handle, libevent backends) require them:
+
+[source,rust]
+----
+pub unsafe extern "C" fn epoll_create(size: i32) -> i32 {
+    let result = unsafe { trona_posix::epoll::posix_epoll_create(size) };
+    // ... usual errno conversion ...
+}
+
+pub unsafe extern "C" fn epoll_ctl(
+    epfd: i32, op: i32, fd: i32, event: *mut EpollEvent,
+) -> i32 {
+    unsafe { trona_posix::epoll::posix_epoll_ctl(epfd, op, fd, event) }
+}
+
+pub unsafe extern "C" fn epoll_wait(
+    epfd: i32, events: *mut EpollEvent, maxevents: i32, timeout: i32,
+) -> i32 {
+    unsafe { trona_posix::epoll::posix_epoll_wait(epfd, events, maxevents, timeout) }
+}
+----
+
+The epoll fd is a special vfs fd that holds an interest set.
+`epoll_ctl(EPOLL_CTL_ADD, fd, event)` registers `fd` for interest, `EPOLL_CTL_MOD` updates the interest mask, `EPOLL_CTL_DEL` removes it.
+`epoll_wait` blocks for up to `timeout` milliseconds and returns the ready events.
+
+basaltc does not interpret the event mask — netsrv and vfsserver do.
+
+== sendfile
+
+`sendfile(out_fd, in_fd, offset, count)` transfers data directly from one fd to another without bouncing through user space:
+
+[source,rust]
+----
+pub unsafe extern "C" fn sendfile(
+    out_fd: i32, in_fd: i32, offset: *mut i64, count: usize,
+) -> isize {
+    let result = unsafe { trona_posix::posix_sendfile(out_fd, in_fd, offset, count) };
+    // ... usual errno conversion ...
+}
+----
+
+The implementation in netsrv/vfsserver may or may not actually achieve zero-copy depending on the source and destination types.
+For TCP-to-file or file-to-TCP, the servers can pass shared memory regions; for cross-server transfers, a bounce through a kernel-managed buffer is required.
+
+== Related Pages
+
+* xref:net/poll-and-select.adoc[Poll and Select] — `select` reduction and the relationship to `poll`
+* xref:../io/files-and-directories.adoc[Files and Directories] — `read`/`write` on a socket fd
+* xref:../internals/trona-boundary.adoc[trona Boundary] — `trona_posix::socket::*` and `trona_posix::dns::*`

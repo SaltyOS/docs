@@ -1,0 +1,171 @@
+= FreeBSD Compatibility Layer
+:description: compat/freebsd modules — login_cap, bsd_misc, libutil, xo, cap_fileargs, capsicum, mntent, statvfs, umtx, rune, md5
+
+`lib/basalt/c/src/compat/freebsd/` contains 16 Rust modules that implement FreeBSD-specific APIs needed by ported BSD utilities.
+Some modules are real implementations (md5, rune table, bsd_sort, libutil); others are stubs that return success without doing anything substantive (capsicum, mntent, login_cap).
+This page enumerates each module, identifies which ones are real and which are stubs, and notes the practical implications for ports.
+
+== Module List
+
+[cols="1,1,3"]
+|===
+| Module | Status | Purpose
+
+| `bsd_err.rs`
+| Real
+| `err`, `errx`, `warn`, `warnx`, `verr`, `verrx`, `vwarn`, `vwarnx` — BSD diagnostic functions. See xref:../env/environment-and-args.adoc[Environment and Arguments].
+
+| `bsd_flags.rs`
+| Real
+| `fflagstostr`, `strtofflags` — BSD file flags ↔ string conversion. Used by `ls -l` to display flags like `uchg`, `schg`, `sappnd`.
+
+| `bsd_io.rs`
+| Real
+| Small BSD-specific I/O helpers like `fgetln` (read a line returning length and pointer rather than NUL-termination).
+
+| `bsd_misc.rs`
+| Real
+| `getbsize` (block-size environment helper), `setprogname`, `getprogname` (program name globals), and other small BSD-specific helpers. Note: `arc4random` lives in `lib/basalt/c/src/stdlib.rs` (not under `compat/freebsd/`) and `humanize_number` / `expand_number` live in `compat/freebsd/libutil.rs`.
+
+| `bsd_sort.rs`
+| Real
+| `mergesort`, `heapsort` — alternative sort algorithms with the BSD signature (`int (*cmp)(const void *, const void *)`). Pure Rust implementations.
+
+| `bsd_stdio.rs`
+| Real
+| FreeBSD `__stdinp`, `__stdoutp`, `__stderrp` aliases used by FreeBSD's macro-style `stdin`/`stdout`/`stderr` definitions.
+
+| `cap_fileargs.rs`
+| Stub
+| Capsicum file arguments. Accepts the API surface but does no capability work — returns successful results that effectively pass through to the regular file API.
+
+| `capsicum.rs`
+| Stub
+| Capsicum cap_rights surface (`cap_enter`, `cap_rights_init`, `cap_rights_limit`, `cap_ioctls_limit`, `cap_fcntls_limit`). All functions accept their arguments and return success without enforcing anything.
+
+| `libutil.rs`
+| Real
+| FreeBSD libutil functions: `humanize_number`, `expand_number`, `pidfile_open`, `pidfile_remove`, `flopen`, `realhostname`, `properties_read`. The pidfile and properties functions delegate to VFS through the regular file I/O.
+
+| `login_cap.rs`
+| Stub (mostly)
+| `/etc/login.conf` (login class capabilities) interface: `login_getclass`, `login_close`, `login_getstyle`, `login_getcapstr`, `login_getcaplist`, `login_getcaptime`, `login_getcapnum`, `login_getcapsize`, `login_getcapbool`. Returns default values; does not parse `/etc/login.conf`.
+
+| `md5.rs`
+| Real
+| RFC 1321 MD5 implementation. Used by `crypt` for `$1$` password hashes and by ports that hash arbitrary data.
+
+| `mntent.rs`
+| Stub
+| `getmntent`, `setmntent`, `endmntent`, `addmntent`, `hasmntopt`. Returns NULL from `setmntent` (no `/etc/fstab` parsing).
+
+| `rune.rs`
+| Real
+| FreeBSD `_RuneLocale` struct and the C-locale rune table. Used by `<ctype.h>` macros via `init_rune_locale()` at startup.
+
+| `statvfs.rs`
+| Stub
+| `statvfs`, `fstatvfs`. Returns plausible defaults (block size = 4096, total blocks = a large number, free blocks = a smaller number) without querying actual filesystem state.
+
+| `umtx.rs`
+| Stub
+| FreeBSD's `_umtx_op` syscall surface. Accepts arguments and returns -1 with `ENOSYS`. FreeBSD code that uses pthread instead of `_umtx_op` directly works fine.
+
+| `xo.rs`
+| Stub
+| libxo structured output library. Implements `xo_emit`, `xo_open_container`, `xo_close_container`, `xo_attr` etc. as forwarders to `printf`, ignoring the structured-output formatting annotations. Output is plain text only — no JSON or XML mode.
+|===
+
+== Real Implementations
+
+The "real" modules implement the BSD function as specified.
+Ports that use them get the same behavior they would on FreeBSD:
+
+`bsd_err.rs`::
+The `err`/`warn` family is essential for BSD utilities. basaltc's implementation is byte-for-byte compatible with FreeBSD's.
+
+`bsd_flags.rs`::
+File flags are used by `chflags` and `ls -lO`. basaltc parses and formats the standard flag names. The underlying file flags are stored in the file's metadata via VFS, but very few SaltyOS ports actually rely on them.
+
+`bsd_misc.rs`::
+Small BSD-specific helpers (`getbsize`, `setprogname`, `getprogname`). The actual `arc4random` ChaCha20 CSPRNG seeded from `getentropy()` lives in `stdlib.rs` rather than this file — see xref:../env/environment-and-args.adoc[Environment and Arguments].
+
+`bsd_sort.rs`::
+`mergesort` and `heapsort` give callers a choice of algorithm with the same signature as `qsort`. Real implementations, no fall-through to `qsort`.
+
+`bsd_io.rs`::
+`fgetln` returns a pointer into the FILE's read buffer (zero-copy), unlike `fgets` which copies into a caller buffer. Real implementation that respects the FILE buffer state.
+
+`bsd_stdio.rs`::
+The `__stdoutp` / `__stdinp` / `__stderrp` aliases are pointers initialized at startup. See xref:../io/stdio.adoc[Buffered I/O] for details.
+
+`md5.rs`::
+RFC 1321 MD5 with the standard `MD5_CTX` state struct. Used by `crypt($1$)`, by ports that hash data, and by `tar` for archive integrity.
+
+`rune.rs`::
+The C-locale rune table with `_RuneLocale` struct compatible with FreeBSD. The `init_rune_locale()` function copies the static C rune table into the active state at startup.
+
+`libutil.rs`::
+Real implementations of `humanize_number`, `expand_number`, `dehumanize_number`, `fgetln`, and other libutil entry points. These are written from FreeBSD's published semantics and are used by `head(1)`, `tail(1)`, `df(1)`, and similar utilities.
+
+== Stub Implementations
+
+The "stub" modules accept the API but do not implement the underlying functionality:
+
+`cap_fileargs.rs` and `capsicum.rs`::
+Capsicum is FreeBSD's capability-based security framework. SaltyOS has its own capability system in the kernel, but it does not expose Capsicum semantics to userland. The stubs let ports that include the Capsicum API surface link, but the security guarantees Capsicum is supposed to provide do not apply. Ports that depend on Capsicum for sandboxing should be patched to use seccomp-style restrictions or be marked unsafe to run on SaltyOS.
+
+`login_cap.rs`::
+`/etc/login.conf` provides per-user resource limits and authentication settings. basaltc returns the default class for everyone — no parsing happens. Ports that consult login_cap to set process limits or session parameters get the defaults instead. This is enough for port operation but not for production multi-user systems.
+
+`mntent.rs`::
+The mount-point enumeration interface (`/etc/fstab` reading). basaltc's stub returns "no mounts" because SaltyOS does not yet have a `/etc/fstab` convention. Ports that walk mount points (typically system administration tools) get an empty list.
+
+`statvfs.rs`::
+Filesystem statistics. The stub returns plausible defaults without querying actual disk usage. Programs like `df` will show the same values for every filesystem. A real implementation requires VFS protocol additions that have not been done yet.
+
+`umtx.rs`::
+FreeBSD's low-level mutex syscall. Returns `ENOSYS`. Ports that use this directly (rare — pthread is preferred) will fail. The pthread implementation is real and uses futex instead.
+
+`xo.rs`::
+libxo lets a program emit one structured representation that can be rendered as text, XML, JSON, or HTML. basaltc emits text only by passing the format strings to `printf` and ignoring the structured annotations. Ports that need JSON output (some `freebsd-utils` use it) get text output.
+
+== Why Stubs Instead of Errors?
+
+The stubs return success because:
+
+. They let ports **link** without requiring per-port source patches that remove the API call.
+. The non-stub behavior is what most callers actually want — most ports do not check the return value of `cap_enter` or `xo_open_container`.
+. The alternative (failing the call) would force ports to either patch the call sites or skip large code paths, both more invasive than accepting a stub.
+
+The cost is that ports relying on the actual functionality (Capsicum sandboxing, JSON output from `ls`) silently lose that functionality.
+This is a trade-off basaltc makes deliberately.
+The README at `lib/basalt/c/README.md` should list which stubs are present so port authors know what to expect.
+
+== When to Promote a Stub to Real
+
+A stub should be promoted to a real implementation when:
+
+. A SaltyOS port depends on the actual functionality, not the stub.
+. The underlying SaltyOS service (VFS, kernel, procmgr) supports the operation.
+. The implementation can be straightforward (no major design work needed).
+
+For example, `statvfs` would be straightforward to implement once VFS exposes filesystem statistics.
+`mntent` would follow naturally from a `/etc/fstab` convention being adopted.
+Capsicum requires more thought because SaltyOS's capability model differs from FreeBSD's, and a faithful Capsicum emulation would be a substantial project.
+
+== Linux vs BSD Errno
+
+A reminder from xref:../internals/trona-boundary.adoc[trona Boundary]: basaltc uses **Linux** errno numbers, not BSD numbers.
+This affects compat/freebsd modules that might compare errno against literals.
+The compat modules in basaltc are written against the basaltc errno values, so they are internally consistent — but a port that hardcodes BSD errno numbers in its own code will see different values than it would on FreeBSD.
+
+The most common breakage points are `EAGAIN` (BSD 35, Linux 11), `ENAMETOOLONG` (BSD 63, Linux 36), and `ELOOP` (BSD 62, Linux 40).
+Active SaltyOS ports already carry patches for these where needed.
+
+== Related Pages
+
+* xref:../env/environment-and-args.adoc[Environment and Arguments] — `bsd_err.rs` (`err`/`warn`) and `bsd_misc.rs` (`setprogname`)
+* xref:../env/users-and-groups.adoc[Users and Groups] — `md5.rs` provides `$1$` crypt support
+* xref:../text/locale-and-ctype.adoc[Locale, ctype and wchar] — `rune.rs` provides the C-locale rune table
+* xref:../internals/trona-boundary.adoc[trona Boundary] — Linux errno numbering as a BSD/Linux delta

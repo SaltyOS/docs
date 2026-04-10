@@ -1,0 +1,228 @@
+= Threads and Synchronization
+:content: pthread C ABI as a thin wrapper over trona_posix::pthread, futex-based mutex, and the differences from glibc
+
+basaltc's `pthread.rs` is the largest C ABI wrapper in the library: roughly 1,100 lines that translate the POSIX thread API into `trona_posix::pthread::*` calls.
+Almost every function is a one-line forwarder; the interesting code is in `trona_posix` itself, which builds threads on top of trona TCB capabilities and futex synchronization on top of the trona substrate's `Futex` syscall.
+This page documents the C ABI surface, the locking primitives, the per-thread state model, the differences from glibc, and the open issues.
+
+== API Surface
+
+[cols="1,3"]
+|===
+| Group | Functions
+
+| Thread lifecycle
+| `pthread_create`, `pthread_exit`, `pthread_join`, `pthread_detach`, `pthread_self`, `pthread_equal`, `pthread_kill`, `pthread_cancel`, `pthread_setcancelstate`, `pthread_setcanceltype`, `pthread_testcancel`
+
+| Mutex
+| `pthread_mutex_init`, `pthread_mutex_destroy`, `pthread_mutex_lock`, `pthread_mutex_unlock`, `pthread_mutex_trylock`, `pthread_mutex_timedlock`
+
+| Mutex attribute
+| `pthread_mutexattr_init`, `pthread_mutexattr_destroy`, `pthread_mutexattr_settype`, `pthread_mutexattr_gettype`, `pthread_mutexattr_setpshared`, `pthread_mutexattr_getpshared`
+
+| Condition variable
+| `pthread_cond_init`, `pthread_cond_destroy`, `pthread_cond_wait`, `pthread_cond_timedwait`, `pthread_cond_signal`, `pthread_cond_broadcast`
+
+| Read-write lock
+| `pthread_rwlock_init`, `pthread_rwlock_destroy`, `pthread_rwlock_rdlock`, `pthread_rwlock_tryrdlock`, `pthread_rwlock_wrlock`, `pthread_rwlock_trywrlock`, `pthread_rwlock_unlock`, `pthread_rwlock_timedrdlock`, `pthread_rwlock_timedwrlock`
+
+| Barrier
+| `pthread_barrier_init`, `pthread_barrier_destroy`, `pthread_barrier_wait`, `pthread_barrierattr_*`
+
+| Spinlock
+| `pthread_spin_init`, `pthread_spin_destroy`, `pthread_spin_lock`, `pthread_spin_trylock`, `pthread_spin_unlock`
+
+| Once
+| `pthread_once`
+
+| TLS keys
+| `pthread_key_create`, `pthread_key_delete`, `pthread_setspecific`, `pthread_getspecific`
+
+| Attributes
+| `pthread_attr_init`, `pthread_attr_destroy`, `pthread_attr_setstacksize`, `pthread_attr_getstacksize`, `pthread_attr_setdetachstate`, `pthread_attr_getdetachstate`, `pthread_attr_setguardsize`, `pthread_attr_getguardsize`
+|===
+
+The full list is roughly 60 functions.
+Almost every entry is the same shape:
+
+[source,rust]
+----
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_mutex_lock(m: *mut PthreadMutex) -> i32 {
+    unsafe { trona_posix::pthread::pthread_mutex_lock(m) }
+}
+----
+
+The wrapper exists because the C symbol must be `#[unsafe(no_mangle)] pub extern "C"`, and the public type must live in basaltc's `<pthread.h>` header.
+The actual implementation is in `trona_posix`, which has its own type aliases that match the basaltc-exported types.
+
+== Error Convention Difference
+
+POSIX pthread functions are unusual: they return errno values directly, **not** through the global `errno`.
+Returning 0 means success; returning a positive value means failure with that error code:
+
+[source,c]
+----
+int err = pthread_mutex_lock(&m);
+if (err != 0) {
+    fprintf(stderr, "lock failed: %s\n", strerror(err));
+}
+----
+
+basaltc preserves this convention.
+The wrappers do **not** call `errno::set_errno` and do **not** convert the return value to -1.
+This is the only basaltc API family with this convention; every other module uses the standard "set errno, return -1" pattern.
+
+If you forget and write `if (pthread_mutex_lock(&m) == -1)`, the test will silently fail to detect errors because pthread errors are positive integers (`EBUSY` = 16, `EINVAL` = 22, etc.).
+
+== Mutex Implementation
+
+Under the hood, every basaltc pthread mutex is a `trona_posix::pthread::Mutex`, which in turn wraps a futex word and a lock owner field.
+
+The acquire path uses the same three-phase protocol as basaltc's internal `trona::sync::Mutex`:
+
+. **CAS** — single compare-and-swap on the futex word from `UNLOCKED` to `LOCKED`. Most uncontended cases succeed here.
+. **Spin** — bounded spin loop checking the futex word, in case the holder is about to release.
+. **Futex wait** — only after spinning fails does the thread make a `Futex` syscall to block. This is the only path that enters the kernel.
+
+The release path is symmetric: CAS the word back to `UNLOCKED`. If the result indicates a waiter, issue a `Futex` wake.
+
+Mutex types supported via `pthread_mutexattr_settype`:
+
+[cols="1,3"]
+|===
+| Type | Behavior
+
+| `PTHREAD_MUTEX_NORMAL`
+| Default. Self-locking deadlocks (the same thread that holds the mutex blocks forever on second lock).
+
+| `PTHREAD_MUTEX_RECURSIVE`
+| The same thread can lock the mutex multiple times. Tracks an owner thread ID and a depth counter. Each `unlock` decrements the depth; the mutex is only really released when the depth hits zero.
+
+| `PTHREAD_MUTEX_ERRORCHECK`
+| Like normal but returns `EDEADLK` instead of deadlocking on self-lock. Useful for diagnostics.
+
+| `PTHREAD_MUTEX_DEFAULT`
+| Aliased to `NORMAL`.
+|===
+
+`PTHREAD_PROCESS_SHARED` mutexes (mutexes living in shared memory between processes) are accepted but currently behave as process-private. This is a known limitation.
+
+== Condition Variable Implementation
+
+`pthread_cond_wait(cv, mutex)` does the standard atomic-release-and-wait dance:
+
+. Read the cv's wait counter (a 64-bit sequence number bumped on every signal).
+. Release `mutex`.
+. `Futex` wait on the cv's wait counter, expecting the previously read value.
+. On wake, re-acquire `mutex`.
+
+`pthread_cond_signal(cv)` increments the wait counter and issues a `Futex` wake for one waiter.
+`pthread_cond_broadcast(cv)` increments the counter and wakes all waiters.
+
+This is the canonical futex condvar pattern from the futex(7) manual page.
+The implementation lives in `trona_posix::pthread`; basaltc's wrapper does no additional work.
+
+== Read-Write Lock
+
+`pthread_rwlock_*` is built on a 32-bit word with a reader count in the low bits and a writer flag in the high bit, plus a futex-based wait queue for blocked acquirers.
+
+Reader fairness is "writer preference": once a writer arrives, new readers queue behind it.
+This prevents writer starvation under continuous reader load, at the cost of slightly worse read latency.
+
+== Barrier and Spinlock
+
+`pthread_barrier_*` uses a counter and a generation number. When the count reaches the threshold, all waiters are released by incrementing the generation. Implemented via `Futex` wait/wake on the generation field.
+
+`pthread_spin_*` is a pure user-space spinlock — no futex, no kernel involvement.
+On uniprocessor configurations or when the holder is descheduled, the spinning thread can waste arbitrarily large amounts of CPU.
+Use spinlocks only when you can guarantee that critical sections are very short.
+
+== pthread_once
+
+[source,rust]
+----
+pub unsafe extern "C" fn pthread_once(
+    once: *mut PthreadOnce, init: extern "C" fn(),
+) -> i32 {
+    unsafe { trona_posix::pthread::pthread_once(once, init) }
+}
+----
+
+Standard double-checked locking with a futex.
+The init function runs exactly once across all threads, even under concurrent calls.
+
+== TLS Keys
+
+`pthread_key_create(key, destructor)` allocates a TLS key index from a per-process key table.
+`pthread_setspecific(key, value)` writes the value into the calling thread's per-key slot.
+`pthread_getspecific(key)` reads it back.
+
+The implementation supports up to `PTHREAD_KEYS_MAX = 64` keys.
+Each thread has a key array allocated lazily on first `setspecific` call.
+The destructor (if registered) runs at thread exit time for any key whose value is non-NULL.
+
+This is distinct from compiler `__thread` TLS storage, which uses the static TLS block established at thread creation.
+`pthread_key_*` is a runtime API for libraries that need TLS but cannot rely on compiler support; native Rust code uses `thread_local!` instead.
+
+== pthread_create
+
+[source,rust]
+----
+pub unsafe extern "C" fn pthread_create(
+    thread: *mut pthread_t,
+    attr: *const PthreadAttr,
+    start_routine: extern "C" fn(*mut c_void) -> *mut c_void,
+    arg: *mut c_void,
+) -> i32 {
+    unsafe { trona_posix::pthread::pthread_create(thread, attr, start_routine, arg) }
+}
+----
+
+Inside `trona_posix`, `pthread_create` performs the following steps:
+
+. Allocate a stack via `posix_mmap` (with a guard page below the bottom).
+. Allocate a TLS block matching the static TLS template (the `Tls` struct and any `__thread`/`thread_local` slots from loaded DSOs).
+. Allocate a TCB capability via the procmgr's `create_thread` IPC.
+. Set the new TCB's instruction pointer to a small assembly trampoline that loads the thread pointer, calls the start routine, calls `pthread_exit` with the return value.
+. Resume the new TCB.
+
+`pthread_t` is opaque to user code; basaltc declares it as a 16-byte struct in `<pthread.h>` matching the `trona_posix` Thread struct internally.
+
+== pthread_join
+
+[source,rust]
+----
+pub unsafe extern "C" fn pthread_join(thread: pthread_t, retval: *mut *mut c_void) -> i32 {
+    unsafe { trona_posix::pthread::pthread_join(thread, retval) }
+}
+----
+
+`pthread_join` blocks until the target thread exits, then writes the return value into `*retval` and frees the thread's stack and TCB.
+The implementation uses a futex on a "thread done" flag inside the joined thread's metadata block.
+
+`pthread_detach(thread)` flips a flag in the metadata so that the thread frees its own resources at exit time, removing the need for `pthread_join`.
+
+== Cancellation
+
+basaltc supports `pthread_cancel(thread)` and `pthread_setcancelstate(state, oldstate)` and `pthread_setcanceltype(type, oldtype)`, but the cancellation model is **deferred only** (`PTHREAD_CANCEL_DEFERRED`).
+Asynchronous cancellation (`PTHREAD_CANCEL_ASYNCHRONOUS`) is not supported.
+
+A canceled thread sees the cancellation request at the next cancellation point — typically inside a `pthread_testcancel()` call or during a blocking syscall (which currently does not actually trigger cancellation in basaltc, see "Open Issues" below).
+
+== Open Issues
+
+* **Cancellation in syscalls** — basaltc's wrappers do not check for cancellation before calling `trona_posix::*`. A `pthread_cancel`'d thread blocked in `read()` will not wake until the read completes naturally. POSIX requires `read` to be a cancellation point.
+* **`pthread_atfork`** is implemented as a no-op. Fork handlers are not called.
+* **Thread-local destructors** — `__cxa_thread_atexit` delegates to `__cxa_atexit`, so per-thread destructors run at process exit time, not at the owning thread's exit time. See xref:../runtime/atexit-and-exit.adoc[atexit and Process Exit].
+* **`PTHREAD_PROCESS_SHARED` mutexes** in shared memory are accepted but behave as process-private. This breaks cross-process locking schemes that rely on a shared mutex in mmap'd memory.
+* **Robust mutexes** (`PTHREAD_MUTEX_ROBUST`) are not implemented.
+* **Priority inheritance mutexes** (`PTHREAD_PRIO_INHERIT`) are accepted but treated as priority-none. The kernel scheduler does support priority inheritance for trona TCBs, but the userspace mutex protocol does not yet propagate that.
+
+These limitations are acceptable for the current SaltyOS port set (most ports use only the basic mutex/condvar/rwlock surface) but are noted here for ports that need more advanced features.
+
+== Related Pages
+
+* xref:process/processes-and-signals.adoc[Processes and Signals] — `pthread_kill` and `pthread_sigmask`
+* xref:../runtime/heap-and-malloc.adoc[Heap and malloc] — the same three-phase futex pattern is used for the heap mutex
+* xref:../internals/trona-boundary.adoc[trona Boundary] — `trona_posix::pthread::*` and the futex primitives in `trona::sync`

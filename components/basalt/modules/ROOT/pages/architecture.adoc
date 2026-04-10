@@ -1,0 +1,287 @@
+= Architecture
+:description: basalt source tree, module map, build artifacts, and dependency direction
+
+This page describes the source layout of `lib/basalt/`, the 44 Rust modules that make up basaltc, the include tree, the build artifacts, and the strict dependency direction between basalt and trona.
+
+== Repository Layout
+
+basalt lives at `lib/basalt/` in the SaltyOS tree:
+
+[cols="1,3"]
+|===
+| Directory | Contents
+
+| `lib/basalt/c/`
+| basaltc — the Rust C standard library, headers, linker scripts, and architecture-specific assembly. Built into `libc.so` plus `crt_start.o` and `setjmp.o`.
+
+| `lib/basalt/c/src/`
+| 44 top-level Rust modules implementing the public C ABI. Each module is a thin Rust file declaring `#[unsafe(no_mangle)] pub extern "C"` functions that delegate to `trona_posix` or call into a pure-Rust implementation.
+
+| `lib/basalt/c/src/arch/`
+| Architecture-specific subtrees (`x86_64/`, `aarch64/`) implementing the `ArchMath`, `ArchMem`, and `ArchString` traits, plus `crt_start.S` and `setjmp.S` per architecture.
+
+| `lib/basalt/c/src/compat/freebsd/`
+| FreeBSD compatibility layer: 16 modules that implement BSD-only APIs (`login_cap`, `bsd_misc`, `cap_fileargs`, `xo`, `rune`, etc.) needed by ported FreeBSD utilities.
+
+| `lib/basalt/c/include/`
+| 118 C headers covering POSIX, BSD extensions, and SaltyOS-specific additions. Subdirectories: `sys/`, `arpa/`, `net/`, `netinet/`, `netipsec/`, `casper/`, `libxo/`, `security/`, `machine/`.
+
+| `lib/basalt/c/arch/{x86_64,aarch64}/basaltc.ld`
+| Per-architecture linker scripts for `libc.so` (page-aligned segments, dynamic section management).
+
+| `lib/basalt/cpp/`
+| libc++ build wrapper. Compiles libcxx + libcxxabi + libunwind from `toolchain/llvm-project/` via `custom_target`. Contains the SaltyOS `__config_site` and `__assertion_handler`.
+|===
+
+The top-level entry point is `lib/basalt/meson.build`, which delegates to `c/meson.build` and (if the LLVM submodule is present) `cpp/meson.build`.
+
+== basaltc Module Map
+
+The 44 modules in `lib/basalt/c/src/lib.rs` group into nine categories.
+Each category corresponds to one or more documentation pages in this site.
+
+[cols="1,2,3"]
+|===
+| Category | Modules | Documentation
+
+| Process runtime
+| `crt`, `malloc`, `dlfcn`, `errno`, `stack_protector`
+| xref:runtime/crt-startup.adoc[CRT Startup], xref:runtime/heap-and-malloc.adoc[Heap and malloc], xref:runtime/dynamic-linking.adoc[Dynamic Linking], xref:runtime/atexit-and-exit.adoc[atexit]
+
+| File and stream I/O
+| `stdio`, `unistd`, `dirent`, `fts`, `glob`, `select`, `ioctl`
+| xref:io/stdio.adoc[Buffered I/O], xref:io/files-and-directories.adoc[Files and Directories]
+
+| Processes, signals, threads
+| `process`, `signal`, `pthread`, `jobctl`, `pty`, `ttyent`
+| xref:process/processes-and-signals.adoc[Processes and Signals], xref:process/threads-and-sync.adoc[Threads and Synchronization]
+
+| Text and locale
+| `string`, `mem`, `ctype`, `wchar`, `iconv`, `regex`, `locale`
+| xref:text/strings-and-memory.adoc[Strings and Memory], xref:text/locale-and-ctype.adoc[Locale, ctype and wchar], xref:text/regex.adoc[Regular Expressions]
+
+| Time and math
+| `time`, `math`
+| xref:time/time-and-tz.adoc[Time and Timezones], xref:math/math-library.adoc[Math Library]
+
+| Networking
+| `socket`, `netif`, `inet`
+| xref:net/sockets.adoc[Sockets], xref:net/poll-and-select.adoc[Poll and Select]
+
+| Environment and identity
+| `env`, `getopt`, `sysinfo`, `pwd`, `crypt`, `sha512`, `getrandom`
+| xref:env/environment-and-args.adoc[Environment and Arguments], xref:env/users-and-groups.adoc[Users and Groups]
+
+| Terminal and search
+| `termios`, `termcap`, `stdlib`, `search`, `misc`
+| xref:io/files-and-directories.adoc[Files and Directories], xref:env/environment-and-args.adoc[Environment]
+
+| Architecture and compatibility
+| `arch`, `compat`
+| xref:arch/multi-arch-dispatch.adoc[Multi-Architecture Dispatch], xref:compat/freebsd-compat.adoc[FreeBSD Compatibility]
+|===
+
+[plantuml]
+....
+@startuml
+skinparam packageStyle rectangle
+skinparam defaultFontSize 11
+
+package "basaltc" {
+  package "Runtime" {
+    [crt]
+    [malloc]
+    [dlfcn]
+    [errno]
+  }
+  package "I/O" {
+    [stdio]
+    [unistd]
+    [dirent]
+    [fts]
+    [glob]
+    [select]
+  }
+  package "Process" {
+    [process]
+    [signal]
+    [pthread]
+    [pty]
+  }
+  package "Text" {
+    [string]
+    [mem]
+    [ctype]
+    [wchar]
+    [iconv]
+    [regex]
+    [locale]
+  }
+  package "Net" {
+    [socket]
+    [netif]
+    [inet]
+  }
+  package "Env" {
+    [env]
+    [getopt]
+    [pwd]
+    [crypt]
+    [sysinfo]
+  }
+  package "Math/Time" {
+    [time]
+    [math]
+  }
+  package "Compat" {
+    [compat::freebsd]
+    [arch::x86_64]
+    [arch::aarch64]
+  }
+}
+@enduml
+....
+
+The `compat::freebsd` subtree contains 16 modules ported from FreeBSD: `bsd_err`, `bsd_flags`, `bsd_io`, `bsd_misc`, `bsd_sort`, `bsd_stdio`, `cap_fileargs`, `capsicum`, `libutil`, `login_cap`, `md5`, `mntent`, `rune`, `statvfs`, `umtx`, `xo`.
+See xref:compat/freebsd-compat.adoc[FreeBSD Compatibility] for which are real implementations and which are stubs.
+
+== Header Layout
+
+`lib/basalt/c/include/` is the public C ABI surface, with 118 headers organized by POSIX section:
+
+[cols="1,3"]
+|===
+| Subdirectory | Coverage
+
+| (top level)
+| 75 headers: POSIX core (`stdio.h`, `stdlib.h`, `unistd.h`, `pthread.h`, `signal.h`, `dirent.h`, `fcntl.h`, `time.h`, `math.h`, `errno.h`, `string.h`, `termios.h`, `dlfcn.h`, `regex.h`, `glob.h`, `fts.h`, `pwd.h`, `grp.h`), BSD extensions (`err.h`, `libutil.h`, `login_cap.h`, `md5.h`, `paths.h`), SaltyOS additions (`xlocale.h`, `iconv.h`).
+
+| `sys/`
+| 23 headers: `types.h`, `stat.h`, `socket.h`, `select.h`, `time.h`, `wait.h`, `uio.h`, `ioctl.h`, `mman.h`, `resource.h`, `mount.h`, `param.h`, `cdefs.h`, `endian.h`, `random.h`, `auxv.h`, `cpuset.h`, `domainset.h`, `acl.h`, `capsicum.h`, `mac.h`, `statvfs.h`, `syscall.h`, `sysctl.h`, `file.h`.
+
+| `arpa/`, `net/`, `netinet/`, `netipsec/`
+| Internet and network headers: `inet.h`, `if.h`, `in.h`, `tcp.h`, `ip.h`, `ip_icmp.h`, IPsec.
+
+| `casper/`
+| Capsicum capability-mode wrappers: `cap_fileargs.h`, `cap_net.h`, `cap_dns.h`. Stub-level implementations live in `compat/freebsd/cap_fileargs.rs` and `capsicum.rs`.
+
+| `libxo/`
+| `xo.h` — text-mode shim for the FreeBSD libxo structured output library.
+
+| `security/`
+| OpenPAM headers (`pam_appl.h`, `pam_modules.h`, `openpam.h`, etc.) for ports that link against PAM.
+
+| `machine/`
+| Architecture-private machine definitions referenced by some `sys/` headers.
+|===
+
+== Build Artifacts
+
+Building basalt produces five distinct artifacts:
+
+[cols="1,1,3"]
+|===
+| Artifact | Producer | Consumer
+
+| `libc.so`
+| `c/meson.build` (rustc + lld)
+| Every dynamically linked C/C++ executable. DT_NEEDED in libc++.
+
+| `setjmp.o`
+| `c/meson.build` (clang ASM)
+| Linked into `libc.so`. Provides `setjmp`/`longjmp` (callee-saved register save/restore).
+
+| `crt_start.o`
+| `c/meson.build` (clang ASM)
+| Linked statically into each executable. Defines `_start` and calls `main`. Deliberately excluded from `libc.so` so the shared library has no unresolved `main` reference.
+
+| `libc++.so`
+| `cpp/meson.build` (47 cxx + 18 cxxabi + 4 unwind sources, all via `custom_target`, then linked with lld)
+| Every C++ executable. DT_NEEDED on `libc.so` and `libtrona.so`.
+
+| `basaltc.rmeta`
+| `c/meson.build` (rustc metadata)
+| Other Rust crates that need to call into basaltc as a Rust crate, including the runtime dynamic linker and selected userland servers.
+|===
+
+== Dependency Direction
+
+basalt depends on trona; trona depends on the kernel ABI (UAPI); nothing depends back upward.
+The build enforces this:
+
+[plantuml]
+....
+@startuml
+skinparam componentStyle rectangle
+skinparam defaultFontSize 11
+
+[Application binary] as APP
+[libc++.so\n(libcxx + libcxxabi + libunwind)] as CXX
+[libc.so\n(basaltc)] as LIBC
+[crt_start.o] as CRT
+[libtrona_posix.so] as POSIX
+[libtrona.so\n(substrate)] as TRONA
+[kernite syscall ABI] as KERN
+
+APP --> CRT : static
+APP --> CXX : DT_NEEDED
+APP --> LIBC : DT_NEEDED
+CXX --> LIBC : DT_NEEDED
+CXX --> TRONA : DT_NEEDED
+LIBC --> POSIX : Rust extern crate
+LIBC --> TRONA : Rust extern crate
+POSIX --> TRONA
+TRONA --> KERN : syscall / Invoke
+@enduml
+....
+
+Concretely, `lib/basalt/c/meson.build` declares `--extern trona=libtrona.rmeta` and `--extern trona_posix=libtrona_posix.rmeta` for the rustc invocation that compiles `basaltc`.
+The link step adds `-L libtrona_build_dir -ltrona` so that `libc.so` carries a DT_NEEDED entry for `libtrona.so`.
+There is no `--extern basaltc` anywhere in trona — the dependency is one-way.
+
+For details on which basaltc modules talk to which `trona_posix` functions, see xref:internals/trona-boundary.adoc[trona Boundary].
+
+== Architecture Abstraction
+
+basaltc supports x86_64 and aarch64 through the `arch` module.
+Three traits — `ArchMath`, `ArchMem`, `ArchString` — declare the operations whose implementations differ per CPU.
+Each architecture provides a concrete type (`X86_64Arch`, `AArch64Arch`) implementing the traits, and `lib/basalt/c/src/arch/mod.rs` defines `pub type Arch = ...` selected by `#[cfg(target_arch)]`.
+Generic code calls `Arch::sqrt(x)`, `Arch::memcpy(...)`, etc., and the compiler monomorphizes to the concrete type with no runtime branch.
+
+The trait surface covers:
+
+* Math: `sqrt`, `floor`, `ceil`, `sin`, `cos`, `tan`, `atan2`, `log`, `log2`, `log10`, `exp`, `exp2`, `pow`, `fmod`, `remainder`, `fma`, `scalbn`, plus `sqrtf`, `trunc`, `rint`.
+* Memory: `memcpy`, `memset`, `memmove`, `memcmp`, `memchr`.
+* String: `strlen`.
+
+Functions that do not benefit from SIMD (`fpclassify`, `copysign`, `fabs`, `strcpy`, `strcmp`) live in the generic modules and use `Arch::*` only as building blocks.
+
+The x86_64 backend has two math implementations side by side: `math_x87.rs` (legacy x87 80-bit FPU) and `math_sse2.rs` (SSE2 packed double).
+SSE2 is the default; the `arch::x86_64` selection happens in `mod.rs` at compile time.
+The aarch64 backend uses NEON for everything and has a single `mod.rs` covering math, memory, and string.
+
+See xref:arch/multi-arch-dispatch.adoc[Multi-Architecture Dispatch] for the full trait definitions and the concrete code generation.
+
+== Safety Model
+
+`#![no_std]` Rust::
+basaltc uses only `core`, never `alloc`. The heap allocator is implemented inside basaltc (via xref:runtime/heap-and-malloc.adoc[malloc.rs]), so the order of operations matters: code that runs before the allocator is up cannot allocate.
+
+Single FFI surface::
+Every public C function is `#[unsafe(no_mangle)] pub extern "C"` in a Rust module. There is no hand-written C wrapper layer. Pointer translation, errno mapping, and length conversion all happen inside the Rust function.
+
+Errno is thread-local::
+`__errno_location()` returns a pointer into the current thread's `trona_posix::tls::Tls` struct. A pre-TLS fallback global handles the brief window before `__libc_start_main` initializes TLS. See xref:internals/trona-boundary.adoc[trona Boundary].
+
+Unsafe blocks are explicit::
+Rust 2024 edition rules apply: every unsafe operation inside an `unsafe fn` requires an explicit `unsafe {}` block. `static mut` references are forbidden — basaltc uses `addr_of!` / `addr_of_mut!` and `SyncUnsafeCell` for global mutable state. Every `unsafe` block carries a `// SAFETY:` comment.
+
+No panic in production paths::
+Panics ultimately call into `trona`'s panic handler. basaltc avoids `.unwrap()` and `.expect()` outside startup code; failures map to errno values returned through the C ABI.
+
+== Related Pages
+
+* xref:build-system.adoc[Build System] — how Meson drives rustc, clang, and lld to produce the artifacts above.
+* xref:runtime/crt-startup.adoc[CRT Startup] — what happens between `_start` and `main`.
+* xref:internals/trona-boundary.adoc[trona Boundary] — module-by-module map of trona vs pure-Rust dependencies.
+* xref:cxx/cxx-runtime.adoc[libc++ Runtime] — how the C++ side is composed and built.

@@ -1,0 +1,299 @@
+= Buffered I/O (stdio)
+:description: FILE struct, buffer modes, printf engine, funopen, and the BSD aliases used by ported FreeBSD utilities
+
+basaltc's stdio implementation lives in `lib/basalt/c/src/stdio.rs` and provides the C standard `FILE`-based I/O layer.
+Each `FILE` wraps a POSIX file descriptor with an optional 1024-byte buffer, supports the standard `_IOFBF`, `_IOLBF`, `_IONBF` modes, includes the printf format engine, and exports the BSD `__stdoutp` / `__stdinp` / `__stderrp` aliases that ported FreeBSD utilities expect.
+This page covers the FILE layout, the open-file pool, the buffer mode rules, the printf engine, the BSD compatibility surface, and the funopen extension.
+
+== The FILE Struct
+
+[source,rust]
+----
+const BUF_SIZE: usize = 1024;
+
+#[repr(C)]
+pub struct FILE {
+    _file: i32,            // POSIX fd, -1 when closed
+    flags: u32,            // FILE_READ | FILE_WRITE | FILE_APPEND | FILE_EOF | FILE_ERROR
+    buf: [u8; 1024],       // 1 KB inline buffer
+    buf_pos: usize,        // current position within buf
+    buf_len: usize,        // valid bytes in buf (read mode)
+    ungetc_char: i32,      // -1 if no pushback
+    buf_mode: i32,         // _IOFBF | _IOLBF | _IONBF
+    slot_in_use: u32,      // OPEN_FILES pool entry
+    lock: trona::sync::TypedMutex,  // recursive
+    cookie: *mut u8,       // funopen cookie
+    read_fn:  Option<...>, // funopen callbacks
+    write_fn: Option<...>,
+    seek_fn:  Option<...>,
+    close_fn: Option<...>,
+}
+----
+
+The struct is `#[repr(C)]` because some ports take pointers to its fields directly (FreeBSD `__sFILE` macros assume known offsets) and because basaltc exports the type for inclusion in `<stdio.h>`.
+The 1 KB inline buffer is the canonical size used by glibc and FreeBSD libc; basaltc does not currently support larger or smaller buffers (`setvbuf` accepts the size argument but always uses the inline 1024 bytes).
+
+[cols="1,3"]
+|===
+| Flag | Meaning
+
+| `FILE_READ`
+| The file is open for reading.
+
+| `FILE_WRITE`
+| The file is open for writing.
+
+| `FILE_APPEND`
+| Writes are appended at end-of-file (`O_APPEND`).
+
+| `FILE_EOF`
+| Read returned 0 bytes; `feof(fp)` returns true. Cleared by `clearerr` and `fseek`.
+
+| `FILE_ERROR`
+| The most recent operation returned a system error. `ferror(fp)` returns true.
+|===
+
+== The Three Standard Streams
+
+`stdin`, `stdout`, `stderr` are not heap-allocated.
+They live in three `static mut` slots in basaltc, defined at compile time:
+
+[source,rust]
+----
+static mut STDIN_FILE:  FILE = FILE::new(0, FILE_READ,  _IOFBF);
+static mut STDOUT_FILE: FILE = FILE::new(1, FILE_WRITE, _IOLBF);
+static mut STDERR_FILE: FILE = FILE::new(2, FILE_WRITE, _IONBF);
+
+pub static mut stdin:  *mut FILE = core::ptr::null_mut();
+pub static mut stdout: *mut FILE = core::ptr::null_mut();
+pub static mut stderr: *mut FILE = core::ptr::null_mut();
+----
+
+Defaults:
+
+* `stdin` — full buffering (1 KB).
+* `stdout` — line buffering (flush on newline). Standard convention for terminals.
+* `stderr` — unbuffered (every write flushes immediately). Standard convention for diagnostics.
+
+The exported `stdin`/`stdout`/`stderr` symbols start as null pointers.
+`__libc_start_main` calls `ensure_stdio_init()` early in the C/POSIX layer, which assigns the three pointers to the static slots.
+A `Once` guard makes the initialization idempotent.
+
+The same `do_stdio_init` function also writes to the FreeBSD aliases:
+
+[source,rust]
+----
+crate::compat::freebsd::bsd_stdio::__stdinp = stdin;
+crate::compat::freebsd::bsd_stdio::__stdoutp = stdout;
+crate::compat::freebsd::bsd_stdio::__stderrp = stderr;
+----
+
+These aliases exist because the FreeBSD `<stdio.h>` defines `stdin`/`stdout`/`stderr` as macros expanding to `__stdinp`/`__stdoutp`/`__stderrp`.
+Ports compiled against the basaltc headers do not need the aliases (basaltc's `<stdio.h>` declares `stdin`/`stdout`/`stderr` as variables directly), but ports compiled against patched FreeBSD headers do, and the aliases are exported unconditionally so both styles link.
+
+== The Open File Pool
+
+basaltc supports up to 16 simultaneously open `FILE*` streams (3 reserved for stdin/stdout/stderr, 13 available for `fopen`):
+
+[source,rust]
+----
+const MAX_OPEN_FILES: usize = 16;
+static mut OPEN_FILES: [FILE; MAX_OPEN_FILES] = ...;
+----
+
+`fopen(path, mode)` walks the array looking for a slot with `slot_in_use == 0`, claims it, calls `posix_open` to get a real file descriptor, and returns a pointer to the slot.
+`fclose(fp)` flushes the buffer, calls `posix_close` on the underlying fd, marks the slot free, and returns 0.
+
+The fixed pool avoids heap allocation for `FILE*` and matches the constraints of the small-footprint userland (most SaltyOS programs have one or two open streams at a time).
+The limit can be raised by editing `MAX_OPEN_FILES` and recompiling — there is no runtime tunable.
+
+When the pool is exhausted, `fopen` returns NULL and sets `errno` to `EMFILE`.
+
+== Buffer Modes
+
+[cols="1,1,3"]
+|===
+| Mode | Constant | Behavior
+
+| Full
+| `_IOFBF` (0)
+| Reads pull `BUF_SIZE` bytes at a time from the fd. Writes accumulate until the buffer is full, then flush as one large `posix_write`. Default for `fopen`-opened files.
+
+| Line
+| `_IOLBF` (1)
+| Same as full, but writes also flush whenever a newline is written. Default for `stdout` (terminal-friendly).
+
+| Unbuffered
+| `_IONBF` (2)
+| Every write becomes one `posix_write` with no buffering. Default for `stderr`.
+|===
+
+`setvbuf(fp, buf, mode, size)` accepts any of the three constants but ignores the `buf` and `size` arguments — basaltc always uses the inline 1024-byte buffer.
+This is technically non-conformant (POSIX says the user-provided buffer should be used) but is acceptable for ported software because most callers either pass `NULL` for `buf` (meaning "library decides") or use `setvbuf` only to switch modes.
+
+== The Path from printf to posix_write
+
+When `printf("hello %d\n", 42)` runs, the data flows through the following path:
+
+[plantuml]
+....
+@startuml
+skinparam defaultFontSize 11
+
+start
+:printf("hello %d\\n", 42);
+:vfprintf(stdout, fmt, args);
+:format_impl walks fmt;
+note right
+  - emit literal bytes
+  - %d → integer to ASCII
+  - %s → string copy
+  - %f → double to ASCII
+  - track width / precision / flags
+end note
+:Each byte → fputc(byte, stdout);
+:fputc → buffered write into stdout->buf;
+if (mode == _IONBF) then (yes)
+  :immediate flush;
+elseif (mode == _IOLBF and byte == '\\n') then (yes)
+  :flush buffer;
+elseif (buf_pos == BUF_SIZE) then (yes)
+  :flush buffer;
+else (no)
+  :return;
+endif
+:flush_buffer:\nposix_write(fd, buf, len);
+:libtrona_posix → trona::ipc::Send;
+:kernite syscall → vfsserver IPC;
+:vfsserver writes to console / file;
+stop
+@enduml
+....
+
+Each emitted byte goes through the same buffer-mode check, so a `printf` with line-buffered `stdout` writing a 200-character line will issue exactly one `posix_write` of 200 bytes — not one per character.
+
+Format conversion (`%d`, `%s`, etc.) happens in `format_impl`, which walks the format string and dispatches to per-conversion helpers.
+The helpers write directly into a small stack-allocated scratch buffer for numeric conversions (no heap allocation).
+String conversions (`%s`) use the source pointer directly.
+Width and precision are applied during emission, not after, so a `%-20s` left-pads inline.
+
+Supported conversions (`format_impl`):
+
+[cols="1,3"]
+|===
+| Specifier | Purpose
+
+| `%d`, `%i`
+| Signed decimal integer
+
+| `%u`
+| Unsigned decimal integer
+
+| `%x`, `%X`
+| Hexadecimal (lowercase / uppercase)
+
+| `%o`
+| Octal
+
+| `%s`
+| NUL-terminated string
+
+| `%c`
+| Single character
+
+| `%p`
+| Pointer (formatted as `0x` hex)
+
+| `%f`, `%F`
+| Floating-point fixed notation
+
+| `%e`, `%E`
+| Floating-point scientific notation
+
+| `%g`, `%G`
+| Floating-point shortest-of-fixed-or-scientific
+
+| `%n`
+| Stores the number of bytes written so far in the int pointer argument
+
+| `%%`
+| Literal `%`
+|===
+
+Length modifiers `h`, `hh`, `l`, `ll`, `z`, `j`, `t`, `L` are recognized.
+Flag characters `-`, `+`, ` `, `#`, `0` are honored.
+Width and precision can be `*` (read from `va_list`) or a numeric literal.
+
+== ungetc
+
+`ungetc(c, fp)` pushes a single byte back into the read buffer:
+
+[source,rust]
+----
+ungetc_char: i32,  // -1 if no pushback
+----
+
+The next `fgetc(fp)` returns the pushed byte and resets `ungetc_char` to `-1`.
+basaltc supports exactly one byte of pushback at a time, which matches the POSIX guarantee. Calling `ungetc` twice without an intervening `fgetc` overwrites the pending byte.
+After `ungetc`, the EOF flag is cleared.
+
+== funopen — BSD Extension
+
+`funopen(cookie, readfn, writefn, seekfn, closefn)` creates a custom `FILE*` whose I/O calls are user-supplied callbacks instead of `posix_read`/`posix_write`/`posix_lseek`/`posix_close`:
+
+[source,rust]
+----
+type FunopenReadFn  = unsafe extern "C" fn(*mut u8, *mut u8, i32) -> i32;
+type FunopenWriteFn = unsafe extern "C" fn(*mut u8, *const u8, i32) -> i32;
+type FunopenSeekFn  = unsafe extern "C" fn(*mut u8, i64, i32) -> i64;
+type FunopenCloseFn = unsafe extern "C" fn(*mut u8) -> i32;
+----
+
+The `cookie` is an opaque user pointer passed to every callback.
+Any callback may be `NULL` (functionality not supported).
+basaltc detects the callbacks at flush time and routes through the user-supplied function instead of `posix_*`.
+
+This extension is needed by FreeBSD ports that build in-memory `FILE*` streams (libxo's structured output, ports that wrap memory regions in stdio).
+The implementation is opt-in: a normal `fopen`-returned FILE has all callbacks set to `None` and goes through the regular `posix_*` path.
+
+`fmemopen` and `open_memstream` (POSIX 2008 functions for memory-backed streams) are built on top of `funopen` internally.
+
+== Per-FILE Locking
+
+Each FILE has a recursive `TypedMutex` for stdio-level locking.
+The mutex is recursive so that a `printf` from inside a SIGINT handler that also calls printf does not self-deadlock.
+
+`flockfile`, `funlockfile`, and `ftrylockfile` (POSIX) are implemented as direct calls on the FILE's mutex.
+basaltc's regular `fputc`/`fwrite`/`fread`/`fprintf` entry points **do not** acquire the lock automatically.
+This is a known partial-conformance issue: POSIX requires every stdio function to be implicitly thread-safe via FILE-level locking.
+basaltc currently leaves it to the caller to acquire `flockfile` for multi-threaded code that shares a FILE.
+The static `stdin`/`stdout`/`stderr` slots are usually not contended in practice because most SaltyOS programs are single-threaded.
+
+This is an open work item; see the comment in `lib/basalt/c/src/lib.rs`:
+
+____
+basaltc — SaltyOS C Standard Library
+Core subsystems (malloc, errno) are thread-safe via spinlocks and TLS. stdio FILE operations are not yet fully locked.
+____
+
+== The fflush_all Path
+
+`exit()` calls `fflush_all()` before `_exit` so buffered writes reach the kernel:
+
+[source,rust]
+----
+pub fn fflush_all() {
+    // Walk OPEN_FILES + the three standard streams; flush each.
+}
+----
+
+`fflush_all` does not need a lock because exit teardown is single-threaded by convention (signal handlers are masked, no new threads can spawn).
+It walks every FILE slot whose `slot_in_use` flag is set plus the three standard streams, calls `fflush` on each, and ignores any errors (the process is exiting anyway).
+
+== Related Pages
+
+* xref:io/files-and-directories.adoc[Files and Directories] — the underlying `posix_*` calls that stdio uses
+* xref:../runtime/crt-startup.adoc[CRT Startup] — `ensure_stdio_init` and the `/dev/console` fallback for fds 0/1/2
+* xref:../runtime/atexit-and-exit.adoc[atexit and Process Exit] — when `fflush_all` runs
+* xref:../compat/freebsd-compat.adoc[FreeBSD Compatibility] — the `__stdinp`/`__stdoutp`/`__stderrp` aliases
+* xref:../internals/trona-boundary.adoc[trona Boundary] — `trona_posix::posix_*` and `TypedMutex`

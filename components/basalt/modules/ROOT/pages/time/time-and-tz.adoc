@@ -1,0 +1,349 @@
+= Time and Timezones
+:description: POSIX time, clock_gettime, strftime, POSIX TZ string parsing, DST transitions, reentrancy buffer strategy
+
+`time.rs` (~1,650 lines) is one of the largest basaltc modules.
+It covers the POSIX time interface (time, clock_gettime, gettimeofday, nanosleep), the calendar conversion family (gmtime, localtime, mktime, ctime, asctime), and the strftime/strptime formatters.
+The implementation includes a from-scratch POSIX TZ string parser with DST transition handling, a Gregorian-calendar conversion, and uses the per-thread TLS reentrancy buffer for the non-`_r` variants.
+This page covers the function inventory, the POSIX TZ format, the conversion algorithm, the DST rule format, and the reentrancy strategy.
+
+== API Inventory
+
+[cols="1,3"]
+|===
+| Group | Functions
+
+| Wall clock
+| `time`, `gettimeofday`, `settimeofday`
+
+| Monotonic and process clocks
+| `clock`, `clock_gettime`, `clock_settime`, `clock_getres`, `clock_nanosleep`, `nanosleep`
+
+| Calendar conversion
+| `gmtime`, `gmtime_r`, `localtime`, `localtime_r`, `mktime`, `timegm`, `timelocal`
+
+| Formatted output
+| `ctime`, `ctime_r`, `asctime`, `asctime_r`, `strftime`, `strftime_l`, `wcsftime`
+
+| Formatted input
+| `strptime`
+
+| Difference and validation
+| `difftime`
+
+| Interval timers
+| `getitimer`, `setitimer`, `alarm`
+
+| Timezone setup
+| `tzset`, `tzname`, `timezone`, `daylight`
+|===
+
+== Wall Clock and Monotonic Clock
+
+`time(t)` returns the current Unix timestamp (seconds since 1970-01-01 UTC) and optionally writes it to `*t`.
+Implemented as a one-line wrapper around `clock_gettime(CLOCK_REALTIME, &ts)` with the nanoseconds discarded.
+
+`clock_gettime(clk, ts)` exposes two clock IDs in the basaltc public header (`<time.h>`):
+
+[cols="1,3"]
+|===
+| Clock ID | Source
+
+| `CLOCK_REALTIME` (0)
+| Wall clock from procmgr's time service. May jump if the system clock is set.
+
+| `CLOCK_MONOTONIC` (1)
+| Monotonic time since boot. Never jumps.
+|===
+
+Both route through `trona_posix::time::posix_clock_gettime`, which constructs the appropriate kernel call.
+The `CLOCK_PROCESS_CPUTIME_ID` and `CLOCK_THREAD_CPUTIME_ID` constants from POSIX 2008 are not currently exposed in `<time.h>`, so portable C code that needs per-process or per-thread CPU time has no public way to request them on basaltc today.
+
+`gettimeofday(tv, tz)` is the legacy interface; basaltc implements it on top of `clock_gettime(CLOCK_REALTIME)` and ignores the `tz` argument (POSIX 2008 deprecates the timezone parameter).
+
+== nanosleep and clock_nanosleep
+
+`nanosleep(req, rem)` sleeps for the requested duration:
+
+[source,rust]
+----
+pub unsafe extern "C" fn nanosleep(
+    req: *const Timespec, rem: *mut Timespec,
+) -> i32 {
+    let result = unsafe { trona_posix::time::posix_nanosleep(req, rem) };
+    if result < 0 {
+        errno::set_errno(-result as i32);
+        return -1;
+    }
+    0
+}
+----
+
+The `rem` argument receives the unslept time if the sleep is interrupted by a signal.
+On SaltyOS this rarely happens because signals are cooperative — see xref:../process/processes-and-signals.adoc[Processes and Signals] — so `rem` is usually zeroed even if a signal arrives.
+
+`clock_nanosleep(clk, flags, req, rem)` adds clock selection (`CLOCK_REALTIME` vs `CLOCK_MONOTONIC`) and absolute timeout (`TIMER_ABSTIME`).
+Useful for "sleep until a specific wall-clock instant" patterns.
+
+== Calendar Conversion
+
+The `gmtime` / `localtime` family converts a Unix timestamp to a `struct tm`:
+
+[source,c]
+----
+struct tm {
+    int tm_sec;     // 0..60
+    int tm_min;     // 0..59
+    int tm_hour;    // 0..23
+    int tm_mday;    // 1..31
+    int tm_mon;     // 0..11
+    int tm_year;    // years since 1900
+    int tm_wday;    // 0..6 (Sunday = 0)
+    int tm_yday;    // 0..365
+    int tm_isdst;   // -1, 0, or 1
+};
+----
+
+`gmtime(t)` converts to UTC.
+`localtime(t)` converts to the local time zone (which is `tzset`-determined; see below).
+Both have `_r` variants that take a caller-supplied output buffer:
+
+[source,c]
+----
+struct tm out;
+gmtime_r(&t, &out);
+----
+
+The non-`_r` variants return a pointer to a per-thread TLS buffer (`Tls::libc_tm_buf`).
+This means a single thread can call `gmtime` and `localtime` interleaved without losing data — but if you save the pointer and call again, the second call overwrites the first.
+Use `_r` for any code that holds onto the result.
+
+== Gregorian Algorithm
+
+The conversion from Unix timestamp to `(year, month, day, hour, minute, second)` uses a closed-form Gregorian-calendar algorithm:
+
+. Compute days since 1970-01-01 by integer division of the timestamp by 86400.
+. Compute the second-of-day by modulo.
+. Walk forward from 1970 year by year, subtracting 365 or 366 days, until the year fits.
+. Walk forward through the months of that year, subtracting per-month day counts, until the month fits.
+. The remaining day count + 1 is the `tm_mday`.
+. Compute `tm_wday` from a known reference: 1970-01-01 is a Thursday (`tm_wday = 4`).
+. Compute `tm_yday` from the day-of-year accumulator.
+
+There is no leap-second handling — the conversion treats every day as exactly 86400 seconds.
+Leap seconds are deliberately omitted because the Unix kernel and almost all userland software make the same simplification.
+
+`mktime(tm)` is the inverse: given a `struct tm` interpreted as local time, return the Unix timestamp.
+The implementation walks the same algorithm in reverse and applies the local TZ offset (positive for east of UTC, negative for west).
+
+`timegm(tm)` is the same conversion treating the input as UTC instead of local time.
+
+== POSIX TZ String Format
+
+`tzset` reads the `TZ` environment variable and parses it into a usable timezone description.
+basaltc supports the POSIX TZ string format:
+
+[source]
+----
+STD<offset>[DST[<offset>][,<start>,<end>]]
+----
+
+Examples:
+
+* `UTC0` — UTC, no DST
+* `EST5EDT,M3.2.0,M11.1.0` — US Eastern Time with DST starting second Sunday of March, ending first Sunday of November
+* `CET-1CEST,M3.5.0,M10.5.0/3` — Central European Time with DST starting last Sunday of March, ending last Sunday of October at 03:00
+* `JST-9` — Japan Standard Time, no DST
+
+The offset is **west-positive**: `EST5` means EST is 5 hours west of UTC (so to convert UTC to EST you subtract 5).
+This is the inverse of the more intuitive "east-positive" convention used by ISO 8601 zone offsets.
+basaltc converts internally so users see the right answer regardless.
+
+The DST rules use the format:
+
+[source]
+----
+M<month>.<week>.<day>[/<hour>]
+----
+
+* `month` — 1 through 12
+* `week` — 1 through 4 for "Nth weekday of month", 5 for "last weekday of month"
+* `day` — 0 (Sunday) through 6 (Saturday)
+* `hour` — local time at which the transition takes effect, default 02:00
+
+`M3.2.0` means "March, second week, Sunday" — i.e., the second Sunday of March.
+
+basaltc parses this format by hand into a small `TzInfo` struct stored in `static mut TZ_INFO`.
+`tzset` is called the first time `localtime` runs, or any time the user explicitly invokes it.
+
+== DST Transition Logic
+
+Once parsed, `localtime` checks each input timestamp against the current year's DST window:
+
+. Compute the year of the timestamp.
+. Compute the absolute timestamps of that year's DST start and DST end transitions using the rule format.
+. If the timestamp is between start and end, apply the DST offset (typically standard offset minus 1 hour); otherwise apply the standard offset.
+
+The algorithm correctly handles:
+
+* Northern hemisphere DST (March to November)
+* Southern hemisphere DST (October to March, where the year wraps)
+* Years without DST (no rule given)
+* Leap years (the DST start/end days shift by one day relative to the year start)
+
+It does not handle:
+
+* Historical DST rule changes (e.g., the US 2007 rule change). basaltc applies the current rule to all years.
+* Sub-minute DST offsets. The DST offset is in whole hours.
+* Fractional time-zone offsets like Newfoundland (UTC-3:30) or Nepal (UTC+5:45). The offset must be in whole hours.
+
+For most ports, the simplifications are acceptable.
+For software that needs the full IANA `tzdata` database, basaltc cannot help — it does not parse `/etc/localtime` or any binary timezone format.
+
+== strftime
+
+`strftime(buf, max, fmt, tm)` formats a `struct tm` according to the format string:
+
+[source,c]
+----
+char buf[64];
+strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tm);
+----
+
+Supported format specifiers (POSIX subset plus a few common extensions):
+
+[cols="1,3"]
+|===
+| Specifier | Output
+
+| `%Y`
+| 4-digit year
+
+| `%y`
+| 2-digit year
+
+| `%m`
+| Month (01–12)
+
+| `%d`
+| Day of month (01–31)
+
+| `%e`
+| Day of month, space-padded (` 1`–`31`)
+
+| `%H`
+| Hour, 24-hour (00–23)
+
+| `%I`
+| Hour, 12-hour (01–12)
+
+| `%M`
+| Minute (00–59)
+
+| `%S`
+| Second (00–60)
+
+| `%p`
+| `AM` or `PM`
+
+| `%a`
+| Abbreviated weekday name
+
+| `%A`
+| Full weekday name
+
+| `%b`, `%h`
+| Abbreviated month name
+
+| `%B`
+| Full month name
+
+| `%j`
+| Day of year (001–366)
+
+| `%w`
+| Day of week (0=Sunday)
+
+| `%U`, `%W`
+| Week number
+
+| `%Z`
+| Timezone name (`tzname[isdst]`)
+
+| `%z`
+| Timezone offset (`+0900`)
+
+| `%c`
+| Locale's date and time representation (C-locale format)
+
+| `%x`, `%X`
+| Locale's date / time representation (C-locale format)
+
+| `%n`, `%t`
+| Newline / tab
+
+| `%%`
+| Literal %
+
+| `%s`
+| Unix timestamp (GNU extension, supported)
+|===
+
+The day and month names come from the C-locale tables in `time.rs` — see xref:text/locale-and-ctype.adoc[Locale, ctype and wchar] for the C-locale-only policy.
+
+== strptime
+
+`strptime(buf, fmt, tm)` is the inverse: parse a string according to a format and populate a `struct tm`.
+basaltc supports the same subset of specifiers as `strftime`, plus the GNU extensions for case-insensitive matching of month/day names.
+
+`strptime` is necessary for ports that read date strings (log parsers, web servers, mail clients).
+
+== Reentrancy Buffer Layout
+
+The non-`_r` calendar functions return pointers into a per-thread `Tls::libc_*_buf` field:
+
+[cols="1,3"]
+|===
+| Function | TLS field
+
+| `gmtime(t)`, `localtime(t)`
+| `Tls::libc_tm_buf` (`struct tm`, ~36 bytes)
+
+| `asctime(tm)`
+| `Tls::libc_asctime_buf` (`[u8; 26]`)
+
+| `ctime(t)`
+| `Tls::libc_ctime_buf` (`[u8; 26]`)
+|===
+
+The buffers are accessed through `trona_posix::tls` accessors, which return the field address inside the calling thread's `Tls` struct.
+This means each thread has its own buffer, so two threads can call `localtime` concurrently without overwriting each other's results.
+
+The `_r` variants take a caller-supplied buffer and bypass the TLS slot entirely. They are preferred for any new code, but the non-`_r` forms exist for backwards compatibility and are perfectly safe in single-threaded code.
+
+== Interval Timers
+
+`alarm(seconds)` sets a one-shot SIGALRM timer.
+`setitimer(which, new, old)` and `getitimer(which, val)` provide the more general POSIX interface for `ITIMER_REAL`, `ITIMER_VIRTUAL`, `ITIMER_PROF`.
+
+basaltc implements `alarm` directly: it computes the absolute deadline, registers a kernel timer through `trona_posix::time`, and the kernel posts a SIGALRM notification at the deadline.
+
+`setitimer` is implemented similarly but supports periodic intervals — the same timer fires repeatedly until canceled.
+
+POSIX timers (`timer_create`, `timer_settime`, `timer_gettime`, `timer_delete`) are not yet wrapped at the C ABI level on basaltc, even though `trona_posix::time` exposes them.
+This is a known gap; ports that need POSIX timers should request them through `trona_posix` directly or wait for basaltc support.
+
+== Constraints
+
+* **No leap second support** — every day is exactly 86400 seconds.
+* **No tzdata** — the IANA database is not bundled. Only POSIX TZ strings work.
+* **Whole-hour offsets only** — fractional zones (India, Nepal, Newfoundland) are not representable.
+* **Current DST rule applied to all years** — historical rule changes are ignored.
+* **No locale switching** — `strftime` always uses the C-locale month/day names.
+
+These match the constraints of the SaltyOS port set today and have not blocked practical use.
+
+== Related Pages
+
+* xref:../process/processes-and-signals.adoc[Processes and Signals] — `alarm` posts SIGALRM through the cooperative signal model
+* xref:text/locale-and-ctype.adoc[Locale, ctype and wchar] — C-locale-only policy and the day/month name tables
+* xref:../internals/trona-boundary.adoc[trona Boundary] — `trona_posix::time::*` and the TLS reentrancy buffers

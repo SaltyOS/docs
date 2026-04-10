@@ -1,0 +1,239 @@
+= Locale, ctype and wchar
+:description: C-locale only policy, FreeBSD rune table, ctype macros, wide character conversion, iconv tables, xlocale extensions
+
+basaltc adopts the Fuchsia model for locale: the only locale supported is `"C"` (also known as `"POSIX"`).
+The reasoning is that internationalization belongs in higher-level libraries like ICU, where it can be configured per-application, instead of in libc where it pulls in megabytes of locale data and complicates every string operation.
+The cost of this choice is that programs which depend on locale-aware sorting, formatting, or character classification get the C-locale answer regardless of `LANG` / `LC_*` environment variables.
+
+This page covers the locale policy, the FreeBSD rune table, the ctype macros, the wide character / multibyte conversion functions, the iconv module, and the xlocale extension.
+
+== The C-Locale-Only Policy
+
+[source,rust]
+----
+// locale.rs
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn setlocale(_category: i32, locale: *const u8) -> *mut u8 {
+    // Accept any locale string but always return "C".
+    static C_LOCALE: [u8; 2] = *b"C\0";
+    C_LOCALE.as_ptr() as *mut u8
+}
+----
+
+`setlocale(LC_ALL, "")` (the typical "use the user's preferred locale") returns `"C"`.
+`setlocale(LC_ALL, "en_US.UTF-8")` returns `"C"`.
+`setlocale(LC_ALL, NULL)` (query) returns `"C"`.
+There is no error path; every call succeeds.
+
+`localeconv()` returns a pointer to a static `struct lconv` populated with C-locale defaults: `decimal_point = "."`, `thousands_sep = ""`, currency strings empty, etc.
+
+`nl_langinfo(item)` returns C-locale strings for the standard items: codeset = "ASCII", date/time formats from POSIX C locale, day/month names in English, etc.
+
+== The Rune Table
+
+The `ctype.h` macros (`isalpha`, `isdigit`, `isalnum`, `isspace`, `isprint`, `iscntrl`, `isupper`, `islower`, `ispunct`, `isxdigit`, `tolower`, `toupper`) are implemented via the FreeBSD `_RuneLocale` ABI ported into `compat/freebsd/rune.rs`.
+The implementation matches FreeBSD's binary layout exactly so that ports compiled against FreeBSD-style `<ctype.h>` headers see the symbols and offsets they expect.
+
+[source,rust]
+----
+#[repr(C)]
+pub struct RuneLocale {
+    pub __magic: [u8; 8],
+    pub __encoding: [u8; 32],
+    pub __sgetrune: Option<SgetRuneFn>,
+    pub __sputrune: Option<SputRuneFn>,
+    pub __invalid_rune: i32,
+    pub __runetype: [u64; 256],   // category bitmask per byte
+    pub __maplower: [i32; 256],   // tolower mapping per byte
+    pub __mapupper: [i32; 256],   // toupper mapping per byte
+    pub __runetype_ext: RuneRange,
+    pub __maplower_ext: RuneRange,
+    pub __mapupper_ext: RuneRange,
+    pub __variable: *mut core::ffi::c_void,
+    pub __variable_len: i32,
+}
+
+#[unsafe(no_mangle)]
+pub static mut _DefaultRuneLocale: RuneLocale = ...;
+#[unsafe(no_mangle)]
+pub static mut _CurrentRuneLocale: *const RuneLocale = ...;
+----
+
+Each entry of `__runetype` covers one byte value and stores a bitmask of FreeBSD `_CTYPE_*` category flags (`_CTYPE_A` for alphabetic, `_CTYPE_D` for digit, `_CTYPE_S` for whitespace, etc.).
+The classification macros in `<ctype.h>` look up the byte's index in `_CurrentRuneLocale->__runetype` and AND-test against the requested category:
+
+[source,c]
+----
+#define isalpha(c) (_CurrentRuneLocale->__runetype[(unsigned char)(c)] & (_CTYPE_U|_CTYPE_L))
+#define isdigit(c) (_CurrentRuneLocale->__runetype[(unsigned char)(c)] & _CTYPE_D)
+----
+
+Out-of-line versions of all the `is*` and `to*` functions are also provided for callers that take their address (the macros are not addressable).
+
+`init_rune_locale()` is called from `__libc_start_main` (see xref:../runtime/crt-startup.adoc[CRT Startup]) to populate `_DefaultRuneLocale` and point `_CurrentRuneLocale` at it.
+Because basaltc supports only the C locale, the populate step runs once at startup and there is no per-locale switching.
+
+== Wide Character Conversion
+
+`wchar.rs` implements the C wide character API on top of the rune table and a small set of UTF-8 encoder/decoder routines.
+Despite the C-locale-only policy, basaltc supports UTF-8 multibyte sequences through the `mbrtowc` family because that is the de facto encoding for everything outside ASCII.
+
+[cols="1,3"]
+|===
+| Function | Behavior
+
+| `mblen(s, n)`
+| Length of the next multibyte character in `s`. Returns 1 for ASCII, the byte count for UTF-8 sequences.
+
+| `mbtowc(pwc, s, n)`
+| Decode one multibyte character to a wide character.
+
+| `wctomb(s, wc)`
+| Encode one wide character as multibyte (UTF-8).
+
+| `mbstowcs(pwcs, s, n)`
+| Decode an entire NUL-terminated multibyte string to wide characters.
+
+| `wcstombs(s, pwcs, n)`
+| Encode an entire wide string as multibyte.
+
+| `mbrtowc(pwc, s, n, ps)`
+| Restartable variant: takes an `mbstate_t` to handle partial sequences.
+
+| `wcrtomb(s, wc, ps)`
+| Restartable encoder.
+
+| `mbsrtowcs`, `wcsrtombs`
+| String-level restartable variants.
+
+| `wcwidth(wc)`
+| Display column width of a wide character. Returns 1 for printable ASCII, 0 or 1 for combining/normal characters, 2 for some CJK ranges.
+
+| `wcswidth(pwcs, n)`
+| Sum of `wcwidth` over a string.
+|===
+
+`wchar_t` is `i32` on basaltc (matching glibc and FreeBSD).
+
+The conversion uses a simple UTF-8 decoder: read the first byte, determine the sequence length from the leading bits, validate the continuation bytes, assemble the code point.
+There is no normalization, no case folding beyond the rune table, no script-aware processing.
+
+`wcwidth` includes the standard "wide" Unicode ranges (CJK ideographs, Hangul syllables, fullwidth Latin) so that terminal applications that need to know how many columns a string occupies get the right answer for the common cases.
+The table is the smaller portable wcwidth from FreeBSD; programs that need full Unicode 15 width support should use a higher-level library.
+
+== iconv
+
+`iconv.rs` (~900 lines) implements the standard iconv API for converting between character encodings:
+
+[source,c]
+----
+iconv_t cd = iconv_open("UTF-8", "ISO-8859-1");
+size_t r = iconv(cd, &inbuf, &inbytesleft, &outbuf, &outbytesleft);
+iconv_close(cd);
+----
+
+basaltc supports a subset of encodings via compiled-in conversion tables:
+
+* UTF-8
+* ASCII
+* ISO-8859-1 (Latin-1)
+* ISO-8859-15 (Latin-9)
+* CP1252 (Windows Western)
+* UTF-16 LE/BE
+* UTF-32 LE/BE
+
+The table approach is simple but limited: adding a new encoding requires editing the source.
+Ports that need GB2312, EUC-JP, Shift_JIS, etc., need to either avoid iconv or provide their own conversion path.
+
+`iconv_open` creates a converter object holding pointers to the source and destination encoding tables.
+`iconv` walks the input buffer, looks up each character in the source table, then encodes it via the destination table.
+`iconv_close` frees the converter.
+
+Errors:
+
+* `EILSEQ` — invalid byte sequence in input.
+* `EINVAL` — incomplete sequence at end of input.
+* `E2BIG` — output buffer too small.
+
+The implementation is pure Rust with no external dependencies — see xref:../internals/trona-boundary.adoc[trona Boundary] for the dependency table.
+
+== xlocale Extensions
+
+`xlocale.h` declares an extended locale API that takes an explicit `locale_t` parameter on every operation:
+
+[source,c]
+----
+locale_t loc = newlocale(LC_ALL_MASK, "C", (locale_t)0);
+int upper = toupper_l('a', loc);
+freelocale(loc);
+----
+
+basaltc implements `xlocale` as a no-op shim: `locale_t` is a void pointer, `newlocale` returns a sentinel, `toupper_l` ignores the locale argument and calls `toupper`, etc.
+
+This is enough for ports that include the xlocale headers and call the `_l` variants out of habit but do not actually depend on per-locale behavior.
+Ports that do depend on per-thread locale switching will get the C locale regardless.
+
+== ctype.h Macro Surface
+
+[cols="1,3"]
+|===
+| Function | C Locale Behavior
+
+| `isalpha`
+| `'A'..'Z'` and `'a'..'z'`
+
+| `isdigit`
+| `'0'..'9'`
+
+| `isalnum`
+| `isalpha` or `isdigit`
+
+| `isspace`
+| `' '`, `'\t'`, `'\n'`, `'\v'`, `'\f'`, `'\r'`
+
+| `isblank`
+| `' '`, `'\t'`
+
+| `isprint`
+| All printable ASCII (32 through 126)
+
+| `iscntrl`
+| All control characters (0 through 31, plus 127)
+
+| `isupper`, `islower`
+| Uppercase / lowercase ASCII letters
+
+| `isxdigit`
+| Hex digit (`0..9`, `a..f`, `A..F`)
+
+| `ispunct`
+| Printable but neither alphanumeric nor whitespace
+
+| `tolower`, `toupper`
+| ASCII case conversion. Non-letter inputs returned unchanged.
+
+| `isascii`, `toascii`
+| BSD extensions: input < 128, mask to low 7 bits.
+|===
+
+All function-form versions accept any int and return 0 for non-ASCII input.
+The macro-form versions in `<ctype.h>` are slightly faster because they inline the table lookup.
+
+== Caveats for Ported Software
+
+* **`strcoll(a, b)` is `strcmp(a, b)`** — there is no locale-aware collation.
+* **`strxfrm(dst, src, n)` copies bytes verbatim** — no transformation table.
+* **`isalpha('é')` returns 0** — non-ASCII bytes have all category bits cleared in the C locale rune table.
+* **`tolower('É')` returns `'É'`** — no conversion for non-ASCII.
+* **`mblen` and friends only handle UTF-8 and ASCII** — there is no codepage detection from the locale name.
+* **`fnmatch` and `glob` use `strcmp`** — pattern matching is byte-by-byte, with no locale collation.
+
+These behaviors are consistent and predictable, which is the entire point of the C-locale-only design.
+A port that needs full locale support should be patched to use ICU or a similar library.
+
+== Related Pages
+
+* xref:text/strings-and-memory.adoc[Strings and Memory] — `strcasecmp` / `strncasecmp` also use the rune table for ASCII case folding
+* xref:text/regex.adoc[Regular Expressions] — also strictly byte-by-byte, no locale collation
+* xref:../runtime/crt-startup.adoc[CRT Startup] — `init_rune_locale` runs early
+* xref:../compat/freebsd-compat.adoc[FreeBSD Compatibility] — the rune table is in `compat/freebsd/rune.rs`

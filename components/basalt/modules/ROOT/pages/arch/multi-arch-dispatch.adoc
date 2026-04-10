@@ -1,0 +1,223 @@
+= Multi-Architecture Dispatch
+:description: Compile-time monomorphization of math, memory, and string primitives via the Arch trait family
+
+basaltc supports x86_64 and aarch64 from a single source tree without runtime branching.
+The mechanism is a small trait family in `lib/basalt/c/src/arch/mod.rs` plus a compile-time type alias that resolves to the current target's concrete implementation.
+This page covers the trait surface, the per-architecture implementations, the SSE2 vs scalar fallback configuration, and how the same pattern applies to the assembly stubs.
+
+== The Three Traits
+
+`lib/basalt/c/src/arch/mod.rs` declares three traits.
+Each trait collects the operations that benefit from architecture-specific instructions; everything else stays in the architecture-independent generic modules (`math.rs`, `string.rs`, `mem.rs`).
+
+[source,rust]
+----
+pub trait ArchMath {
+    fn sqrt(x: f64) -> f64;
+    fn sqrtf(x: f32) -> f32;
+    fn floor(x: f64) -> f64;
+    fn ceil(x: f64) -> f64;
+    fn trunc(x: f64) -> f64;
+    fn rint(x: f64) -> f64;
+    fn sin(x: f64) -> f64;
+    fn cos(x: f64) -> f64;
+    fn tan(x: f64) -> f64;
+    fn atan2(y: f64, x: f64) -> f64;
+    fn log(x: f64) -> f64;
+    fn log2(x: f64) -> f64;
+    fn log10(x: f64) -> f64;
+    fn exp(x: f64) -> f64;
+    fn exp2(x: f64) -> f64;
+    fn pow(x: f64, y: f64) -> f64;
+    fn fmod(x: f64, y: f64) -> f64;
+    fn remainder(x: f64, y: f64) -> f64;
+    fn fma(x: f64, y: f64, z: f64) -> f64;
+    fn scalbn(x: f64, n: i32) -> f64;
+}
+
+pub trait ArchMem {
+    unsafe fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8;
+    unsafe fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8;
+    unsafe fn memmove(dst: *mut u8, src: *const u8, n: usize) -> *mut u8;
+    unsafe fn memcmp(s1: *const u8, s2: *const u8, n: usize) -> i32;
+    unsafe fn memchr(s: *const u8, c: i32, n: usize) -> *mut u8;
+}
+
+pub trait ArchString {
+    unsafe fn strlen(s: *const u8) -> usize;
+}
+----
+
+`ArchMath` covers everything that needs hardware floating-point support: SIMD square roots, transcendentals, FMA, IEEE rounding modes.
+Pure bit operations (`fpclassify`, `copysign`, `fabs`) are not in the trait — they live in `math.rs` and work on `u64`/`u32` bit patterns regardless of architecture.
+
+`ArchMem` covers the hot-path memory primitives that gain the most from SIMD: 16-byte SSE2 moves on x86_64, 16-byte NEON `Q` register moves on aarch64.
+Functions that the compiler already generates good code for (`bzero`, `memrchr`) stay in `mem.rs` as scalar Rust.
+
+`ArchString` is intentionally one-function: `strlen`.
+SIMD scan-for-zero (`pcmpeqb` + `pmovmskb` on x86_64, `cmeq` + `umaxv` on aarch64) is dramatically faster than a byte-by-byte loop, while the rest of `string.rs` (`strcmp`, `strchr`, `strstr`) gains less and stays generic.
+
+== Compile-Time Type Selection
+
+The end of `mod.rs` selects the concrete implementation:
+
+[source,rust]
+----
+#[cfg(target_arch = "x86_64")]
+pub mod x86_64;
+
+#[cfg(target_arch = "x86_64")]
+pub type Arch = x86_64::X86_64Arch;
+
+#[cfg(target_arch = "aarch64")]
+pub mod aarch64;
+
+#[cfg(target_arch = "aarch64")]
+pub type Arch = aarch64::AArch64Arch;
+----
+
+`Arch` is the only name generic code ever uses.
+A caller writes `Arch::sqrt(x)` or `unsafe { Arch::memcpy(dst, src, n) }`, and at compile time `Arch` resolves to `X86_64Arch` or `AArch64Arch` depending on the active target triple.
+Because all trait methods are `#[inline]`, the resulting code is identical to what you would get from a hand-written `cfg(target_arch)` chain — the trait adds no runtime cost and no indirection.
+
+[plantuml]
+....
+@startuml
+skinparam defaultFontSize 11
+
+rectangle "Generic basaltc code\n(math.rs / mem.rs / string.rs)" as GENERIC
+
+rectangle "trait ArchMath\ntrait ArchMem\ntrait ArchString" as TRAITS
+
+package "cfg(target_arch=\"x86_64\")" {
+  rectangle "X86_64Arch" as X64
+  rectangle "math_sse2 / math_x87\nmem_sse2 / string_sse2\nscalar fallbacks" as X64IMPL
+}
+
+package "cfg(target_arch=\"aarch64\")" {
+  rectangle "AArch64Arch" as A64
+  rectangle "NEON math\nNEON memcpy/memset/strlen" as A64IMPL
+}
+
+GENERIC --> TRAITS : Arch::sqrt(x)\nArch::memcpy(...)
+TRAITS --> X64 : pub type Arch = X86_64Arch
+TRAITS --> A64 : pub type Arch = AArch64Arch
+X64 --> X64IMPL
+A64 --> A64IMPL
+@enduml
+....
+
+== x86_64 Implementation
+
+`lib/basalt/c/src/arch/x86_64/mod.rs` declares `pub struct X86_64Arch;` and implements all three traits.
+Each trait method delegates to a function in one of four sub-modules: `math_sse2.rs`, `math_x87.rs`, `mem_sse2.rs`, `string_sse2.rs`.
+
+Two layers of compile-time selection are in play:
+
+* `#[cfg(target_arch = "x86_64")]` (in the parent `mod.rs`) decides whether to compile this whole subtree.
+* `#[cfg(basaltc_sse2)]` (inside the x86_64 subtree) toggles between SSE2-accelerated and scalar fallback paths.
+
+`basaltc_sse2` is a custom cfg flag set by the build. It is on by default on x86_64. Disabling it (for example, on a target without SSE2) replaces every SSE2 path with a hand-written scalar fallback inside the same file, so basaltc still builds.
+
+[source,rust]
+----
+impl super::ArchMath for X86_64Arch {
+    #[inline]
+    fn sqrt(x: f64) -> f64 {
+        #[cfg(basaltc_sse2)]
+        { unsafe { math_sse2::sqrt_sse2(x) } }
+        #[cfg(not(basaltc_sse2))]
+        { math_x87::sqrt_x87(x) }
+    }
+    ...
+}
+----
+
+=== Why Two Math Backends Coexist
+
+`math_x87.rs` and `math_sse2.rs` both live in the source tree even though only one is selected per build.
+The reason is the SSE2 instruction set covers `sqrtsd`/`sqrtss` cleanly but has no equivalent for transcendentals like `sin`, `cos`, `log`, `exp`.
+The SaltyOS x86_64 build always uses x87 for those (the `_x87` functions).
+Only `sqrt` and `sqrtf` are routed through SSE2 when `basaltc_sse2` is on; everything else falls through to x87 even in the SSE2 build.
+This split is visible directly in the trait impl: `floor`, `ceil`, `sin`, `cos`, etc., all call into `math_x87::*` unconditionally.
+
+=== Memory Implementation
+
+`mem_sse2.rs` provides 128-bit `movdqu`-based `memcpy`, `memset`, `memmove`, `memcmp`, and `memchr`. The fallback `scalar_*` functions in `mod.rs` are simple byte loops, used only when `basaltc_sse2` is off:
+
+[source,rust]
+----
+#[cfg(not(basaltc_sse2))]
+unsafe fn scalar_memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    unsafe {
+        let mut i = 0;
+        while i < n {
+            *dst.add(i) = *src.add(i);
+            i += 1;
+        }
+        dst
+    }
+}
+----
+
+The fallbacks exist so basaltc remains buildable on hypothetical x86_64 targets without SSE2 — they are not optimized.
+
+=== String Implementation
+
+`string_sse2.rs` provides `strlen_sse2`, which loads 16 bytes at a time, compares against zero with `pcmpeqb`, and uses `pmovmskb` to extract the result mask.
+A scan terminates as soon as the first byte's mask bit is set.
+The scalar fallback walks one byte at a time.
+
+== aarch64 Implementation
+
+`lib/basalt/c/src/arch/aarch64/mod.rs` declares `pub struct AArch64Arch;` and implements all three traits in a single 17 KB file.
+There is no SSE2 vs scalar split — NEON is mandatory on aarch64, so the implementations are unconditional.
+
+The arithmetic primitives use NEON intrinsics directly:
+
+* `sqrt` / `sqrtf` use the `FSQRT` instruction.
+* Transcendentals use a software implementation written in pure Rust on top of NEON FMA primitives.
+* `floor`, `ceil`, `trunc`, `rint` use the dedicated `FRINTM`, `FRINTP`, `FRINTZ`, `FRINTX` instructions, so they are typically faster than the x86_64 x87 equivalents.
+
+Memory primitives use 16-byte `Q` register loads/stores via `LDR`/`STR` and the NEON post-increment addressing modes for tail handling.
+`strlen` uses a 16-byte `LD1` followed by `CMEQ` against zero and `UMAXV` to detect any zero byte.
+
+== Assembly Stubs Follow the Same Pattern
+
+The architecture split is not limited to Rust modules.
+Two `.S` files have per-architecture variants:
+
+[cols="1,1,3"]
+|===
+| File | Architectures | Purpose
+
+| `crt_start.S`
+| `arch/x86_64/crt_start.S`, `arch/aarch64/crt_start.S`
+| ELF entry point. Selected by the Meson rule `'src/arch' / arch / 'crt_start.S'`. Defines `_start`, sets up the initial stack, parses `argc`/`argv`/`envp`/`auxv`, and calls `__libc_start_main`. See xref:../runtime/crt-startup.adoc[CRT Startup].
+
+| `setjmp.S`
+| `arch/x86_64/setjmp.S`, `arch/aarch64/setjmp.S`
+| `setjmp` and `longjmp`. Saves and restores the callee-saved register set. Linked into `libc.so` so dynamic callers can resolve the symbols.
+|===
+
+The Meson rule that builds these is in xref:../build-system.adoc[Build System]; the architecture path is selected at configure time from the `arch` Meson option.
+
+== Adding a New Architecture
+
+Adding a third architecture (for example, riscv64) requires:
+
+. Create `lib/basalt/c/src/arch/riscv64/mod.rs` with `pub struct RiscV64Arch;` and `impl ArchMath/ArchMem/ArchString for RiscV64Arch`.
+. Add the Rust modules for the actual primitives (`math_riscv.rs`, `mem_riscv.rs`, `string_riscv.rs`).
+. Add the `#[cfg(target_arch = "riscv64")]` block at the end of `mod.rs` selecting `pub type Arch = riscv64::RiscV64Arch;`.
+. Provide `crt_start.S` and `setjmp.S` under `lib/basalt/c/src/arch/riscv64/`.
+. Provide a linker script under `lib/basalt/c/arch/riscv64/basaltc.ld`.
+. Add `riscv64` to the `arch` choices in the top-level Meson options.
+
+The generic basaltc Rust code does not change. Every call site uses `Arch::*`, so the new architecture inherits the entire library for free as soon as the trait impls are in place.
+
+== Related Pages
+
+* xref:../architecture.adoc[Architecture] — overview of the architecture abstraction in context
+* xref:../math/math-library.adoc[Math Library] — how generic `math.rs` calls into `Arch::*`
+* xref:../text/strings-and-memory.adoc[Strings and Memory] — how generic `string.rs` and `mem.rs` use the trait
+* xref:../runtime/crt-startup.adoc[CRT Startup] — the assembly side of the architecture split

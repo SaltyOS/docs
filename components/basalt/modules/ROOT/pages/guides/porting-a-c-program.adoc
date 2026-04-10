@@ -1,0 +1,238 @@
+= Porting a C Program
+:description: How to bring a Unix utility into the SaltyOS port system, build it against basaltc, and patch around missing functions
+
+This guide walks through the process of porting an existing C program (typically a small Unix utility) to SaltyOS using the ports system in `ports/`.
+The example targets a FreeBSD-style utility, but the steps apply equally to a GNU autoconf project, a Meson project, or a hand-written Makefile.
+You will read it before you write a `.port` file, work through it the first time you bring up a new port, then refer back when you hit a missing libc function.
+
+== What "Porting" Means on SaltyOS
+
+A port consists of:
+
+. Upstream source (downloaded from a tarball URL or extracted from `ports/<name>/files/`).
+. A `<name>.port` INI file in `ports/<name>/` describing how to fetch, configure, build, and install the source.
+. Optional patches in `ports/<name>/patches/`.
+. Optional pre-built helpers, configuration overrides, or runtime files in `ports/<name>/files/`.
+
+The build runs through `tools/port/` (a Rust tool) which reads the `.port` file, downloads or copies the source, applies patches, runs the configure step, builds with the cross-compiler from the SaltyOS toolchain, and installs into the rootfs staging directory.
+
+The result is a binary linked against basaltc's `libc.so` (and optionally `libc++.so`) instead of glibc or the FreeBSD libc the upstream code was originally written for.
+
+== Step 1: Choose a Port
+
+Pick something small.
+A 500-line C utility (cat, true, false, basename, dirname) is the right size for a first port.
+Avoid:
+
+* Anything that uses GNU autoconf for the first port — debug autoconf-vs-basaltc disagreements after you have a few simple ports under your belt.
+* Anything that depends on a database (sqlite, libdb, lmdb).
+* Anything that links against more than two other libraries.
+* Anything that runs network code on first launch.
+
+Good first targets: a single-source utility from `freebsd-utils`, a tiny game like `bsdgames`, or a simple line-oriented filter like `tr` or `head`.
+
+== Step 2: Set Up the Port Directory
+
+[source,bash]
+----
+mkdir -p ports/<name>/{patches,files}
+touch ports/<name>/<name>.port
+----
+
+The port name should match the upstream name when possible, with hyphens (`freebsd-utils`) rather than underscores.
+
+== Step 3: Write the `.port` File
+
+A minimal `.port` file:
+
+[source,ini]
+----
+[port]
+name = mytool
+version = 1.2.3
+
+[source]
+url = https://example.org/mytool-1.2.3.tar.gz
+sha256 = <hash>
+
+[build]
+script = configure_and_make.sh
+
+[install]
+files = src/mytool=usr/bin/mytool
+----
+
+The `[port]` section names the port. The `[source]` section describes how to fetch the source — either a URL or a path under `ports/<name>/files/`. The `[build]` section says how to build (a shell script, a Meson invocation, a Make target, etc.). The `[install]` section maps build artifacts to rootfs paths.
+
+For a port that ships its source in-tree (no download), use:
+
+[source,ini]
+----
+[source]
+local = files/mytool-source/
+----
+
+For a Make-based build:
+
+[source,ini]
+----
+[build]
+make_args = CC=$CC AR=$AR CFLAGS=-I$SYSROOT/include
+----
+
+For a Meson-based build:
+
+[source,ini]
+----
+[build]
+meson_args = --prefix=/usr --buildtype=release
+----
+
+The `tools/port/` tool fills in `$CC`, `$AR`, `$SYSROOT`, etc., from the SaltyOS toolchain environment.
+
+== Step 4: First Build
+
+[source,bash]
+----
+just port mytool
+----
+
+This downloads (or copies) the source, applies patches, runs the build, and installs into `build-<arch>/sysroot/`.
+
+The first build will probably fail.
+Common failure modes:
+
+. **Header missing** — basaltc does not provide the header. See "Missing Headers" below.
+. **Function undefined** — basaltc does not provide the function. See "Missing Functions" below.
+. **Type mismatch** — basaltc declares the function with a slightly different signature than the upstream code expects. See "Type Mismatches" below.
+. **Linker error** — symbol resolution fails. Often a sign that one of the above is happening at link time instead of compile time.
+. **Configure script error** — autoconf detected a glibc-specific feature and the upstream code uses it unconditionally. See "Autoconf Quirks" below.
+
+== Step 5: Iterate
+
+For each error:
+
+. Read the upstream source to understand what the program needs.
+. Decide whether to (a) patch the upstream code to use a basaltc-supported alternative, or (b) extend basaltc to provide what the upstream needs.
+. For (a), write a patch in `ports/<name>/patches/NNN-description.patch`.
+. For (b), see xref:guides/adding-a-libc-function.adoc[Adding a libc Function].
+. Re-run `just port mytool` and continue.
+
+A new port typically takes a handful of patches.
+If a port needs more than ~10 patches, the upstream might be a poor fit for basaltc — consider whether the missing functionality should be in basaltc itself or whether the port is the wrong choice.
+
+== Missing Headers
+
+Most POSIX headers are present.
+Headers that are missing tend to be GNU-specific extensions (`<sys/sysmacros.h>`, `<linux/...>`, `<features.h>`) or platform-specific BSD/Linux ABI details.
+
+Solutions in order of preference:
+
+. **Use a different header**. Often the upstream code only needs a small piece of the missing header that is also declared in a standard header. For example, `major()`/`minor()`/`makedev()` are in `<sys/sysmacros.h>` on Linux but in `<sys/types.h>` on BSD; basaltc puts them in `<sys/types.h>`. Patch the upstream `#include` to use the right header.
+. **Conditionally compile**. Wrap the include in `#ifdef __linux__` or similar. The upstream code probably already has cross-platform conditionals.
+. **Add the header to basaltc**. Drop a new file into `lib/basalt/c/include/` with the necessary declarations. If the declarations are stub-able (return 0, return error), add stub implementations to basaltc as well. This is the right answer when several ports need the same header.
+
+== Missing Functions
+
+The most common case.
+When a function is undefined at link time:
+
+. Check `lib/basalt/c/include/<header>.h` to confirm the function is genuinely missing (not a typo or a misspelled signature).
+. Look at xref:../internals/trona-boundary.adoc[trona Boundary] to see if the function exists in `trona_posix` but lacks a basaltc wrapper. If so, adding the wrapper is mechanical — see xref:guides/adding-a-libc-function.adoc[Adding a libc Function].
+. If the function does not exist at any layer, decide whether to implement it (see xref:guides/adding-a-libc-function.adoc[Adding a libc Function]) or to patch the upstream to avoid it.
+
+Common missing functions in a typical first port:
+
+* `getline` — basaltc has it, but ports sometimes use `fgetln` (BSD) instead, which is also in basaltc.
+* `strlcpy` / `strlcat` — present in basaltc.
+* `err`/`warn` — present in basaltc.
+* `__assert_fail` — present (GNU spelling); BSD ports use `__assert` instead, also present.
+* GNU extension functions like `getopt_long_only`, `argp_parse`, `error_at_line` — implemented or partially implemented; check `getopt.rs` and `compat/freebsd/bsd_err.rs`.
+
+== Type Mismatches
+
+basaltc uses Linux-style types in most places (size_t = unsigned long, mode_t = unsigned int, off_t = long long).
+The differences from FreeBSD or musl are usually minor and only matter when a port casts a function pointer or stores a function in a struct.
+
+Common cases:
+
+* `int` vs `socklen_t` for socket lengths: basaltc uses `socklen_t = uint32_t`, matching Linux. Some ports declare `int len`; this works as long as the value fits in 32 bits.
+* `off_t` size: basaltc uses 64-bit `off_t` everywhere. Ports compiled on 32-bit Linux assume 32-bit `off_t` by default; pass `-D_FILE_OFFSET_BITS=64` to be explicit.
+* `void *` vs `char *` for memory functions: ANSI C uses `void *`, K&R C uses `char *`. basaltc's headers declare `void *`. Ports written against very old K&R code may need a cast.
+
+== Autoconf Quirks
+
+GNU autoconf is the most common source of port pain.
+Issues:
+
+* **`AC_FUNC_FORK` insists on a specific glibc-style fork**. basaltc has fork; the test fails because the autoconf check tries to actually run the test program, which cannot run on the build host. Pass `ac_cv_func_fork_works=yes` and `ac_cv_func_vfork_works=yes` in the configure environment.
+* **`config.guess` does not know `*-saltyos`**. The SaltyOS toolchain ships an updated config.guess; pass `--build=x86_64-unknown-saltyos` and `--host=x86_64-unknown-saltyos` explicitly.
+* **`AC_FUNC_MMAP` runs a runtime test**. Same issue as `AC_FUNC_FORK`. Set `ac_cv_func_mmap_fixed_mapped=yes`.
+* **Locale tests fail because `setlocale("en_US")` returns "C"**. Patch the autoconf macro out or set the result variable directly.
+
+The pattern is "set `ac_cv_*` variables in the configure environment to override autoconf's runtime tests".
+The SaltyOS port set has examples in `ports/freebsd-utils/freebsd-utils.port` and several other large ports.
+
+== libxo and Capsicum
+
+Many FreeBSD utilities link against libxo (structured output) and Capsicum (capability sandboxing).
+basaltc provides stubs for both — see xref:../compat/freebsd-compat.adoc[FreeBSD Compatibility].
+The stubs let the link succeed but the functionality is degraded:
+
+* libxo stubs emit plain text. JSON / XML / HTML output modes silently fall back to text.
+* Capsicum stubs accept the API calls but do not enforce sandbox restrictions. A port that depends on Capsicum for security has weaker guarantees on SaltyOS.
+
+If your port absolutely needs working libxo or Capsicum, you have three options:
+
+. Patch the port to skip the calls when running on SaltyOS.
+. Build a proper libxo from source as a separate port.
+. Implement the libxo / Capsicum surface in basaltc properly.
+
+For most ports, the degraded behavior is acceptable.
+
+== /etc/passwd, /etc/group, and User Accounts
+
+A port that calls `getpwnam`, `getlogin`, or similar needs `/etc/passwd` and `/etc/group` to exist with at least one entry.
+SaltyOS's rootfs build (`tools/mkrootfs`) generates these files from `images/etc/passwd` and `images/etc/group` in the source tree.
+A first-pass port can use `getpwuid(getuid())` and expect at least the `root` user (UID 0) to be present.
+
+If your port needs additional users, add them to `images/etc/passwd` (and `images/etc/shadow` if password authentication is needed).
+
+== Verification
+
+After the port builds, run the SaltyOS image and try the program from the shell:
+
+[source,bash]
+----
+just build
+just run
+# in the QEMU console:
+mytool --help
+mytool input.txt
+----
+
+Watch for:
+
+* Crash on startup → likely a basaltc init issue. Check the order of operations in `__libc_start_main` (xref:../runtime/crt-startup.adoc[CRT Startup]).
+* Crash partway through → segfault inside the port's own logic. Run with `-d cpu` in QEMU and capture the trap.
+* Wrong output → check stdio buffering (xref:../io/stdio.adoc[Buffered I/O]) and locale (xref:../text/locale-and-ctype.adoc[Locale, ctype and wchar]).
+* Hangs → likely a syscall waiting for input that will never come, or a futex deadlock.
+
+== Submitting the Port
+
+Once the port works:
+
+. Make sure all patches are minimal and have descriptive filenames.
+. Add the port to the `just port` discovery list (typically automatic if the `.port` file is in `ports/<name>/`).
+. Run `just build` to make sure the port builds in a clean tree.
+. Update `tools/mkrootfs` if the port produces files that should be included in the rootfs.
+. Open a pull request with a brief description of what the port is and what it depends on.
+
+== Related Pages
+
+* xref:guides/adding-a-libc-function.adoc[Adding a libc Function] — when the port needs a function basaltc does not have
+* xref:guides/first-contribution.adoc[First Contribution] — broader walkthrough of making a basalt change
+* xref:../compat/freebsd-compat.adoc[FreeBSD Compatibility] — details of the BSD compatibility layer
+* xref:../internals/trona-boundary.adoc[trona Boundary] — find out which functions delegate to which servers
+
+For higher-level design context on the ports system, see the design document `docs/design/ports.md` in the saltyos source tree.

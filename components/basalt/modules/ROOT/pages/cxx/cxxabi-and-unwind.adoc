@@ -1,0 +1,253 @@
+= libcxxabi and libunwind
+:description: Itanium C++ ABI implementation, RTTI, exception personality, and DWARF stack unwinding
+
+libc++ is the high-level C++ standard library, but the runtime mechanics of C++ — exception throwing and catching, RTTI / `dynamic_cast`, vtable destructors, thread-local destructors, the typeinfo objects themselves — live in **libcxxabi** and **libunwind**, two LLVM projects that basalt builds and statically links into `libc++.so`.
+This page covers what each project provides, how exception throwing and catching is wired together, the implications of `LIBCXXABI_BAREMETAL` and `LIBCXXABI_SILENT_TERMINATE`, and how `__cxa_atexit` integrates with basaltc.
+
+== libcxxabi
+
+`libcxxabi` implements the **Itanium C++ ABI**, which is the cross-platform standard for how C++ implementations represent and manipulate runtime objects.
+Despite the name, the Itanium ABI is used on every modern Unix architecture (x86_64 Linux, aarch64 Linux, FreeBSD, macOS, SaltyOS).
+Microsoft Windows uses a different ABI (MSVC); basalt does not need to support that for libc++.
+
+Functions provided by libcxxabi:
+
+[cols="1,3"]
+|===
+| Symbol | Purpose
+
+| `__cxa_throw`
+| Initiate a C++ exception throw. Allocates the exception object, fills the type info, and calls `_Unwind_RaiseException` to start unwinding.
+
+| `__cxa_catch_typeinfo`, `__cxa_begin_catch`, `__cxa_end_catch`
+| Per-`catch` block bookkeeping.
+
+| `__cxa_rethrow`
+| Re-throw the currently caught exception.
+
+| `__cxa_personality_v0`
+| The personality routine called by libunwind during stack unwinding. Decides which `catch` blocks match the thrown type. Implemented in `cxa_personality.cpp`.
+
+| `__cxa_demangle`
+| Demangle a mangled C++ name back into source form. Used by debuggers, by `std::type_info::name`, and by stack trace formatters.
+
+| `__cxa_atexit`, `__cxa_finalize`, `__cxa_thread_atexit`
+| Register destructors for objects with static or thread storage duration. basaltc provides these — see below.
+
+| `__cxa_guard_acquire`, `__cxa_guard_release`, `__cxa_guard_abort`
+| Thread-safe initialization of function-local statics (`static int x = compute();`).
+
+| `__cxa_pure_virtual`
+| Called when a pure virtual function is invoked through a destroyed object's vtable. Calls `abort`.
+
+| `__dynamic_cast`
+| Implementation of `dynamic_cast<T*>(p)`. Walks the type info tree to find the right offset.
+
+| `typeinfo` objects
+| For every C++ type, libcxxabi defines `__class_type_info`, `__si_class_type_info` (single inheritance), `__vmi_class_type_info` (virtual / multiple inheritance) instances. These are linked into the user's executable, not into `libc++.so`, but the **vtables** for these classes are in libcxxabi so all binaries share the same identity.
+
+| `operator new`, `operator delete`
+| Provided by `stdlib_new_delete.cpp` (libcxxabi) instead of `new.cpp` (libcxx). The libcxx version is excluded from `_cxx_srcs` because it conflicts with the libcxxabi version. The libcxxabi version calls `malloc`/`free` from basaltc.
+|===
+
+The 18 source files in `_cxxabi_srcs` (see xref:cxx/cxx-runtime.adoc[libc++ Runtime]) cover all of the above plus internal helpers like `fallback_malloc.cpp` (used during exception handling when the heap is unavailable) and `cxa_default_handlers.cpp` (provides `terminate` / `unexpected` defaults).
+
+== Why libcxxabi Has RTTI Enabled
+
+In `lib/basalt/cpp/meson.build`:
+
+[source,meson]
+----
+_cxx_flags = [..., '-fno-rtti', ...]   # libcxx compiles WITHOUT RTTI
+
+_cxxabi_flags = []
+foreach f : _cxx_flags
+  if f != '-fno-rtti'                  # libcxxabi compiles WITH RTTI
+    _cxxabi_flags += f
+  endif
+endforeach
+----
+
+The reason: libcxxabi **is** the RTTI implementation.
+It defines the `__class_type_info` hierarchy, the `__dynamic_cast` function, and the `typeinfo` objects themselves.
+Compiling libcxxabi with `-fno-rtti` would prevent it from emitting the RTTI infrastructure that the rest of the program needs.
+
+libcxx, on the other hand, does not need RTTI internally — it uses templates and concepts to dispatch on types, never `dynamic_cast`.
+Compiling libcxx with `-fno-rtti` saves a small amount of binary size and makes the build slightly faster.
+
+The result is that user code built **with** RTTI (`-frtti`, the default) sees full RTTI support: `typeid(x)` works, `dynamic_cast` works, exception type matching works.
+User code built **without** RTTI cannot use these features, but the runtime still has the typeinfo objects available because libcxxabi exported them.
+
+== Exception Throwing Flow
+
+When user code does `throw MyException(42)`:
+
+. The compiler generates a call to `__cxa_allocate_exception(sizeof(MyException))`.
+. The compiler calls `MyException`'s constructor on the allocated buffer.
+. The compiler calls `__cxa_throw(buffer, &typeid(MyException), &MyException::~MyException)`.
+. `__cxa_throw` (in libcxxabi) initializes the exception header, then calls `_Unwind_RaiseException` (in libunwind).
+. `_Unwind_RaiseException` walks the call stack frame by frame using the DWARF CFI tables, calling the personality routine (`__cxa_personality_v0`) for each frame.
+. The personality routine decides whether the current frame has a matching `catch` block. If yes, it tells libunwind to land at that block. If no, it tells libunwind to keep unwinding.
+. When a matching catch is found, libunwind restores the registers to the catch block's landing pad and resumes execution there.
+. The catch block calls `__cxa_begin_catch` to record that the exception is being handled.
+. After the catch block runs (with the exception object accessible via the parameter), it calls `__cxa_end_catch` to release the exception.
+. If `__cxa_end_catch` is the last user, it calls the exception's destructor and frees the buffer.
+
+If no catch is found, the personality routine returns "no handler" for every frame, libunwind reaches the bottom of the stack, and `__cxa_throw` calls `std::terminate()`, which by default calls `abort()`.
+
+[plantuml]
+....
+@startuml
+skinparam defaultFontSize 11
+
+participant "user code\nthrow" as USR
+participant "__cxa_throw\n(libcxxabi)" as THROW
+participant "_Unwind_RaiseException\n(libunwind)" as UNWIND
+participant "__cxa_personality_v0\n(libcxxabi)" as PERS
+participant "user catch block" as CATCH
+
+USR -> THROW : throw MyException(42)
+THROW -> UNWIND : _Unwind_RaiseException(exc)
+loop for each stack frame
+  UNWIND -> PERS : ask: does this frame catch MyException?
+  PERS --> UNWIND : no, continue
+end
+UNWIND -> PERS : (matching frame found)
+PERS --> UNWIND : install landing pad
+UNWIND -> CATCH : restore registers, jump
+CATCH -> CATCH : handle the exception
+CATCH -> CATCH : __cxa_end_catch
+@enduml
+....
+
+== libunwind
+
+`libunwind` is the low-level stack walker.
+It does not know anything about C++ — it knows about call stacks, function frames, register save/restore, and the DWARF Call Frame Information (CFI) tables that compilers emit alongside object code.
+
+The key entry points:
+
+[cols="1,3"]
+|===
+| Symbol | Purpose
+
+| `_Unwind_RaiseException`
+| Begin unwinding for a thrown exception. Walks the stack calling the personality routine for each frame.
+
+| `_Unwind_Resume`
+| Resume unwinding after a cleanup landing pad has run. Used to chain through `try` blocks and stack-allocated object destructors.
+
+| `_Unwind_GetIP`, `_Unwind_GetCFA`, `_Unwind_GetGR`, `_Unwind_SetGR`, `_Unwind_GetLanguageSpecificData`, `_Unwind_GetRegionStart`
+| Personality routine helpers — query and modify the unwind state during a stack walk.
+
+| `_Unwind_Backtrace`
+| User-callable: walk the stack and call a callback for each frame. Used by stack trace formatters.
+
+| `_Unwind_DeleteException`
+| Free an exception object after a destructor declines to handle it.
+|===
+
+The DWARF CFI tables are emitted by clang into `.eh_frame` sections at compile time.
+`libunwind` parses these at runtime when an exception starts unwinding.
+
+basaltc's linker script discards `.eh_frame*` from `libc.so` (`/DISCARD/ : { *(.eh_frame*) }`), but the application binary's link command keeps them — that is where the unwind tables for user code live.
+libunwind walks the user's `.eh_frame` to find the personality routine for each frame.
+
+`dl_iterate_phdr` is the discovery mechanism: libunwind calls it to enumerate loaded DSOs and find their `.eh_frame` sections.
+basaltc's `dlfcn.rs` provides `dl_iterate_phdr` (see xref:../runtime/dynamic-linking.adoc[Dynamic Linking]).
+
+== libunwind Source Composition
+
+[cols="1,3"]
+|===
+| File | Purpose
+
+| `libunwind.cpp`
+| Main C++ entry points: `_Unwind_RaiseException`, `_Unwind_Resume`, etc. Wraps the underlying register-save/CFI-walk machinery.
+
+| `Unwind-EHABI.cpp`
+| ARM EHABI variant of unwinding (used on aarch32). On aarch64 SaltyOS this is mostly inert; aarch64 uses DWARF.
+
+| `UnwindLevel1.c`, `UnwindLevel1-gcc-ext.c`
+| Low-level unwind primitives in C. Implement `_Unwind_*` library routines that the C++ part calls.
+
+| `UnwindRegistersRestore.S`
+| Architecture-specific assembly to restore the register file from a saved unwind context (used at the moment of jumping to a catch block).
+
+| `UnwindRegistersSave.S`
+| Architecture-specific assembly to capture the current register file into an unwind context (used at the start of a stack walk).
+|===
+
+The `.S` files are the only architecture-specific code in the libunwind build.
+basalt builds them with the architecture target flag and includes them in the same `libc++.so` link as the rest of libcxxabi and libcxx.
+
+== Configuration Macros
+
+`lib/basalt/cpp/meson.build` passes several macros via `-D` to the libcxxabi compile:
+
+[cols="1,3"]
+|===
+| Macro | Effect
+
+| `LIBCXXABI_BAREMETAL`
+| Drop assumptions about a hosted environment: no atexit-replacement initialization, no stdio-based logging, smaller terminate handler. Suitable for freestanding-style targets like SaltyOS.
+
+| `LIBCXXABI_SILENT_TERMINATE`
+| Make the default `std::terminate` handler call `_Exit` directly without printing a diagnostic message. Saves a few KB and avoids dragging stdio into the abort path.
+
+| `LIBCXX_BUILDING_LIBCXXABI`
+| Suppress libcxx's duplicate definitions of `type_info`, `exception`, `stdexcept` — those live in libcxxabi, and this macro tells libcxx not to redefine them.
+
+| `_LIBCPP_BUILDING_LIBRARY`
+| Standard libc++ macro that exposes internal symbols during the library compile.
+|===
+
+The `LIBCXXABI_ENABLE_EXCEPTIONS=OFF` mention in the meson.build header comment is misleading: that CMake variable disables building of the exception machinery in libcxxabi, but basalt still builds and uses libunwind, and libcxxabi sources are compiled **with** exceptions enabled (no `-fno-exceptions` in `_cxxabi_flags`). C++ exceptions work end-to-end on basalt.
+
+== __cxa_atexit Integration
+
+The C++ ABI defines `__cxa_atexit(destructor, arg, dso_handle)` for registering destructors of namespace-scope objects (`static MyClass instance;`) and for thread-local storage with non-trivial destructors.
+
+basaltc — **not** libcxxabi — provides `__cxa_atexit` (and `__cxa_finalize`).
+The implementation is in `lib/basalt/c/src/crt.rs`.
+The reason: `__cxa_atexit` needs to coordinate with C `atexit`, and the easiest way to do that is to have one implementation managing both arrays.
+
+libcxxabi's `cxa_thread_atexit.cpp` and the various cxa_*.cpp files call `__cxa_atexit` directly, picking up basaltc's implementation through the DT_NEEDED `libc.so` dependency at link time.
+
+See xref:../runtime/atexit-and-exit.adoc[atexit and Process Exit] for the C/C++ atexit pool details and the teardown sequence at process exit.
+
+== terminate and unexpected
+
+`std::terminate()` is called when an exception is thrown but not caught, or when an exception escapes a noexcept function, or when the destructor of a thrown exception throws.
+basaltc's libcxxabi configures `terminate` to call `_Exit(SIGABRT + 128)` directly because of `LIBCXXABI_SILENT_TERMINATE`.
+
+`std::unexpected()` is the (deprecated, removed in C++17) handler for dynamic exception specifications.
+libcxxabi still provides it for backward compatibility but the compiler does not emit calls to it for C++17 and later code.
+
+== Conclusion
+
+The C++ runtime stack on basalt is:
+
+[source]
+----
+user code
+   ↓ throw / catch / dynamic_cast / static initialization
+libcxx (templates, containers, iostreams)
+   ↓
+libcxxabi (typeinfo, personality, __cxa_throw, RTTI, __cxa_demangle)
+   ↓
+libunwind (DWARF CFI walk, register save/restore)
+   ↓
+basaltc (__cxa_atexit, malloc, dl_iterate_phdr, abort)
+   ↓
+trona / kernite
+----
+
+All four C++-runtime components live inside `libc++.so`. The application sees a single `DT_NEEDED libc++.so` and gets the entire pipeline — no separate `libcxxabi.so` or `libunwind.so` to manage.
+
+== Related Pages
+
+* xref:cxx/cxx-runtime.adoc[libc++ Runtime] — composition and source list
+* xref:cxx/cxx-config-site.adoc[libc++ Configuration] — `__config_site` macros that pin behavior
+* xref:../runtime/atexit-and-exit.adoc[atexit and Process Exit] — `__cxa_atexit` is in basaltc
+* xref:../runtime/dynamic-linking.adoc[Dynamic Linking] — `dl_iterate_phdr` for libunwind

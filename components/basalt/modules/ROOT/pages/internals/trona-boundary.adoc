@@ -1,0 +1,343 @@
+= The trona / trona_posix Boundary
+:description: Module-by-module dependency table, errno TLS layout, and the rule for what gets delegated vs implemented in basaltc
+
+basaltc is a thin shim over `trona_posix` for almost everything that touches kernel state, and a self-contained Rust implementation for everything that is pure data manipulation.
+The decision is consistent across the 44 top-level modules but is not obvious from the directory layout.
+This page enumerates the boundary explicitly: which modules talk to `trona_posix`, which talk only to `trona`, and which depend on neither and are pure Rust.
+It also documents the `errno` thread-local storage layout, the pre-TLS fallback, and the constraint that this layout imposes on early startup code.
+
+== The Three Categories
+
+Every basaltc module falls into exactly one of three buckets:
+
+[cols="1,4"]
+|===
+| Bucket | Why
+
+| **Delegates to `trona_posix`**
+| The function operates on kernel state — file descriptors, process state, signal masks, timers, sockets, memory mappings, futexes — that lives in a userland server reached via IPC. basaltc translates the C ABI to a `trona_posix` call, which constructs the IPC message and waits for the reply.
+
+| **Uses only `trona` substrate**
+| The function needs synchronization or substrate-level primitives (mutex, futex, IPC buffer, slot allocator) but does not need any service. Examples: `malloc` (futex mutex over a sbrk heap), `dlfcn` (slot allocation and ELF loading via mmap).
+
+| **Pure Rust, no dependency**
+| The function transforms in-process data only. Examples: `regex` (NFA matching), `iconv` (encoding tables), `sha512`, `getopt` (argv parsing), `ctype` (rune table lookup), `inet` (`htons`/`ntohs` byte swapping), the scalar fallbacks in `string.rs` and `mem.rs`.
+|===
+
+The third bucket is larger than people typically expect of a libc.
+Roughly a third of basaltc's code never touches anything outside the process, because the operations involved are computational rather than systemic.
+
+== Module Dependency Table
+
+The 44 top-level modules in `lib/basalt/c/src/lib.rs` map to the buckets as follows:
+
+[cols="2,1,4"]
+|===
+| Module | Bucket | Notes
+
+| `arch`
+| Pure Rust
+| Trait definitions and per-architecture impls. SIMD intrinsics from `core::arch`.
+
+| `crt`
+| trona_posix + trona
+| Calls `tls::init_main_thread_tls`, `mm::posix_mm_init`, `posix_dup`, `posix_close`, `posix_open`, `posix_exit` during startup. Uses `trona::ipc`, `trona::slot_alloc`, `trona::sync::Mutex` for IPC buffer setup and atexit lock.
+
+| `ctype`
+| Pure Rust
+| Reads `compat::freebsd::rune` tables in process memory.
+
+| `env`
+| Pure Rust
+| Manipulates the global `environ` pointer set up at startup. No IPC.
+
+| `errno`
+| trona_posix
+| Reads thread-local `errno` slot through `trona_posix::tls::current_errno()`. Falls back to a global `ERRNO` before TLS is up.
+
+| `malloc`
+| trona_posix + trona
+| Calls `trona_posix::mm::posix_sbrk` for heap extension. Uses `trona::sync::Mutex` for `HEAP_LOCK`.
+
+| `mem`
+| Pure Rust
+| Calls into `crate::arch::Arch::memcpy` etc. Architecture-optimized but no IPC.
+
+| `string`
+| Pure Rust
+| Same as `mem` — calls `Arch::strlen`, scalar implementations otherwise.
+
+| `stdio`
+| trona_posix
+| Every `FILE*` operation eventually calls `posix_read`, `posix_write`, `posix_lseek`, `posix_close`, `posix_open`, `posix_dup`. Buffer logic is pure Rust.
+
+| `unistd`
+| trona_posix
+| `posix_open`, `posix_read`, `posix_write`, `posix_lseek`, `posix_close`, `posix_dup`, `posix_dup2`, `posix_pipe`, `posix_fork`, `posix_execve`, `posix_chdir`, `posix_getcwd`, `posix_stat`, `posix_lstat`, `posix_fstat`, `posix_unlink`, `posix_mkdir`, `posix_rmdir`, `posix_chmod`, `posix_chown`, `posix_link`, `posix_symlink`, `posix_readlink`, `posix_access`, `posix_truncate`, `posix_ftruncate`, `posix_readv`, `posix_writev`, `posix_getpid`, `posix_getppid`, `posix_getuid`, `posix_getgid`, etc.
+
+| `process`
+| trona_posix + trona
+| `posix_fork`, `posix_execve`, `posix_waitpid`, `posix_kill`, `posix_exit`, plus `trona_posix::mm::*` for fork-time COW handshake.
+
+| `signal`
+| trona_posix
+| `signals::posix_signal`, `signals::posix_sigaction`, `signals::posix_sigprocmask`, `signals::posix_sigcheck`, `signals::posix_raise`. Cooperative dispatch via trona notification.
+
+| `dirent`
+| trona_posix
+| `dirent::posix_opendir`, `posix_readdir`, `posix_closedir`. The `DIR*` is a thin handle over a VFS directory IPC channel.
+
+| `jobctl`
+| trona_posix
+| `tty::tcgetpgrp`, `tcsetpgrp`, `setpgid`, `getpgid`, `setsid`, `getsid`.
+
+| `ioctl`
+| trona_posix
+| Single function `posix_ioctl` that routes the request to the appropriate userland server based on the fd type.
+
+| `termios`
+| trona_posix
+| Wraps `posix_ioctl` with the TC* request constants (`TCGETS`, `TCSETS`, etc.).
+
+| `termcap`
+| Pure Rust
+| Self-contained terminfo database lookups. No external state.
+
+| `regex`
+| Pure Rust
+| NFA compilation and matching. ~900 lines, zero external deps.
+
+| `time`
+| trona_posix
+| `time::posix_clock_gettime`, `posix_clock_settime`, `posix_gettimeofday`, `posix_nanosleep`. The TZ database parsing and `strftime` formatting are pure Rust on top.
+
+| `stdlib`
+| trona_posix (mkstemp/realpath only)
+| `atoi`, `strtol`, `qsort`, `bsearch` are pure Rust. `mkstemp` and `realpath` go through `posix_open`/`posix_stat`.
+
+| `wchar`
+| Pure Rust + locale tables
+| Wide character conversion uses the rune tables only.
+
+| `sysinfo`
+| trona_posix
+| `posix_uname`, `posix_sysconf`, `posix_getpagesize`.
+
+| `pwd`
+| trona_posix
+| `pwd::getpwnam`, `getpwuid`, `getgrnam`, `getgrgid`, `getlogin`. Backed by VFS reads of `/etc/passwd`, `/etc/group`, etc.
+
+| `locale`
+| Pure Rust
+| C-locale only. `setlocale("C")` succeeds, anything else returns the C locale unchanged.
+
+| `glob`
+| trona_posix (via dirent)
+| Pattern expansion calls `opendir`/`readdir` to walk directories.
+
+| `select`
+| trona_posix
+| Translates `fd_set` to a `pollfd[]` and calls `poll::posix_poll`.
+
+| `math`
+| Pure Rust + Arch
+| `fpclassify`, `copysign`, `fabs` are bit-twiddling. `sqrt`, `sin`, etc., go through `Arch::*` traits.
+
+| `misc`
+| trona_posix (getrandom)
+| `arc4random` family, `getrandom`, `getentropy` call `trona_posix::getrandom`. `mergesort`, `heapsort`, `qsort_r`, `bsearch_r` are pure Rust.
+
+| `pthread`
+| trona_posix
+| Almost entirely a thin C ABI wrapper over `trona_posix::pthread::*`. Mutex/condvar/rwlock/barrier/once/key all delegate.
+
+| `search`
+| Pure Rust
+| `bsearch`, `lfind`, `lsearch`, hash table primitives. No external state.
+
+| `dlfcn`
+| trona_posix + trona
+| `dlopen` walks VFS via `posix_open`/`posix_read`, allocates pages via `posix_mmap`/`posix_mprotect`. Uses `trona::sync::Mutex` for `DL_LOCK`.
+
+| `fts`
+| trona_posix (via dirent)
+| File tree walker. Uses `opendir`/`readdir` and `stat`.
+
+| `compat`
+| Mostly pure Rust
+| Sub-modules vary; see xref:../compat/freebsd-compat.adoc[FreeBSD Compatibility] for the breakdown.
+
+| `socket`
+| trona_posix
+| `socket::posix_socket`, `posix_bind`, `posix_listen`, `posix_accept`, `posix_connect`, `posix_send`, `posix_recv`, `posix_sendto`, `posix_recvfrom`, `posix_setsockopt`, `posix_getsockopt`, `posix_shutdown`, `posix_socketpair`. DNS via `dns::*`.
+
+| `netif`
+| trona_posix
+| `getifaddrs`, `if_nameindex` call into the network stack via socket IPC.
+
+| `inet`
+| Pure Rust
+| `inet_aton`, `inet_ntoa`, `htons`, `htonl`, `ntohs`, `ntohl` — pure byte swapping and ASCII parsing.
+
+| `getopt`
+| Pure Rust
+| Argv parser. POSIX `getopt` and GNU `getopt_long`. No global state outside its own static.
+
+| `getrandom`
+| trona_posix
+| `getrandom`, `getentropy` call `trona_posix::getrandom::getrandom`.
+
+| `iconv`
+| Pure Rust
+| Encoding conversion tables compiled in.
+
+| `sha512`
+| Pure Rust
+| SHA-512 transform. No state outside the caller's context.
+
+| `crypt`
+| Pure Rust + sha512
+| Password hashing. Uses sha512 internally.
+
+| `pty`
+| trona_posix
+| `openpty` calls `posix_open` on `/dev/ptmx` and `/dev/pts/N`. `forkpty` adds `posix_fork`.
+
+| `ttyent`
+| Pure Rust
+| `getttyent`, `getttynam`. Reads `/etc/ttys` via `stdio`.
+
+| `stack_protector`
+| trona panic
+| `__stack_chk_fail` calls into `trona`'s panic handler.
+|===
+
+Counts:
+
+[cols="1,1"]
+|===
+| Bucket | Modules
+
+| Delegates to `trona_posix`
+| 24 (`crt`, `errno`, `malloc`, `stdio`, `unistd`, `process`, `signal`, `dirent`, `jobctl`, `ioctl`, `termios`, `time`, `stdlib`, `sysinfo`, `pwd`, `glob`, `select`, `pthread`, `dlfcn`, `fts`, `socket`, `netif`, `getrandom`, `pty`)
+
+| `trona` substrate only
+| 3 (some uses overlap with the row above): `crt`, `malloc`, `dlfcn`, `stack_protector`
+
+| Pure Rust (no external dependency)
+| 17 (`arch`, `ctype`, `env`, `mem`, `string`, `termcap`, `regex`, `wchar`, `locale`, `math`, `search`, `inet`, `getopt`, `iconv`, `sha512`, `crypt`, `ttyent`, parts of `compat`, `misc`)
+|===
+
+The "trona substrate only" row is small because most modules that need substrate primitives also need a `trona_posix` system call somewhere.
+
+== Layered View
+
+[plantuml]
+....
+@startuml
+skinparam defaultFontSize 11
+
+package "basaltc Rust modules" {
+  rectangle "Pure Rust\n(arch, ctype, mem,\nstring, regex, wchar,\nlocale, math, search,\ninet, getopt, iconv,\nsha512, crypt, ttyent,\ntermcap, env)" as PURE
+  rectangle "Substrate-only\n(malloc, dlfcn,\nstack_protector)" as SUBSTRATE
+  rectangle "trona_posix users\n(stdio, unistd, process,\nsignal, pthread, socket,\ntime, dirent, fts, glob,\nselect, sysinfo, pwd,\npty, ioctl, termios,\ngetrandom, dirent)" as POSIX_USERS
+}
+
+[trona_posix] as TPOSIX
+[trona substrate] as TRONA
+[kernite syscall ABI] as KERN
+
+PURE -[hidden]-> SUBSTRATE
+SUBSTRATE --> TRONA
+POSIX_USERS --> TPOSIX
+TPOSIX --> TRONA
+TRONA --> KERN : syscall / Invoke
+@enduml
+....
+
+== errno: Thread-Local with Pre-TLS Fallback
+
+`errno` is the canonical example of how basaltc bridges thread-local state into the C ABI.
+The C standard requires `errno` to be a per-thread location reachable via the macro `errno`, which expands to `(*__errno_location())`.
+
+basaltc implements `__errno_location()` like this:
+
+[source,rust]
+----
+static mut ERRNO: i32 = 0;
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __errno_location() -> *mut i32 {
+    let tls_ptr = trona_posix::tls::current_errno();
+    if !tls_ptr.is_null() {
+        tls_ptr
+    } else {
+        &raw mut ERRNO
+    }
+}
+----
+
+Two paths:
+
+. If TLS is initialized, `trona_posix::tls::current_errno()` returns a pointer into the calling thread's TLS block — specifically into a field named `errno` inside the `Tls` struct.
+. If TLS is not yet initialized (the brief window between the kernel handing control to `_start` and `init_main_thread_tls()` returning), `current_errno()` returns null and basaltc falls back to a single global `ERRNO`.
+
+The fallback is safe because the only code that runs before TLS is up is single-threaded (the main thread) and runs sequentially. There are no concurrent writers to the global.
+
+Once `init_main_thread_tls()` returns, every `__errno_location()` call goes to the per-thread slot, and the global `ERRNO` is never read again.
+
+== The TLS Block
+
+`trona_posix::tls::Tls` is the per-thread struct that holds reentrancy buffers for basaltc:
+
+[cols="1,3"]
+|===
+| Field | Purpose
+
+| `errno`
+| The C `errno` value. Read by `__errno_location`, written by every `set_errno` call.
+
+| `libc_tm_buf`
+| A `struct tm` used by `localtime`, `gmtime`, `localtime_r` (when called with NULL `result`).
+
+| `libc_asctime_buf`
+| A 26-byte buffer for `asctime` and `asctime_r`'s default output.
+
+| `libc_ctime_buf`
+| A 26-byte buffer for `ctime` and `ctime_r`'s default output.
+
+| Additional reentrancy fields
+| `getlogin` buffer, `dlerror` buffer, `strerror` buffer, etc., as needed by individual modules.
+|===
+
+The struct lives in `trona_posix` rather than `basaltc` because the trona substrate needs to know the layout to allocate and initialize it during thread creation.
+The architecture thread pointer (`%fs` on x86_64, `TPIDR_EL0` on aarch64) points at the start of the struct, so `current_errno()` is just a load with a fixed offset from the thread pointer.
+
+basaltc functions that need any of these reentrancy buffers ask `trona_posix::tls::*` for the field address, then write into it.
+This means a thread that does not call any TLS-touching basaltc function never pays for the buffers — they are allocated lazily on first use.
+
+== Linux Errno Numbering
+
+basaltc uses Linux errno numbers (`EPERM=1`, `ENOENT=2`, `EIO=5`, `ENOMEM=12`, `EINVAL=22`, etc.), not BSD or POSIX-canonical numbers.
+This is a deliberate choice for compatibility with ports that hardcode error values, since the bulk of the SaltyOS port set is glibc-style software (cmake, perl, openssl) rather than pure FreeBSD code.
+
+The constants are defined in `lib/basalt/c/src/errno.rs` and mirrored in `lib/basalt/c/include/errno.h`.
+FreeBSD ports that test for BSD-numbered errnos (`ENOMEM=12` is the same on both, but `EAGAIN` is `35` on BSD and `11` on Linux/SaltyOS) need patches in their port files; the active SaltyOS ports already have these patches.
+
+This is a documented difference from FreeBSD that ports authors should be aware of — see xref:../compat/freebsd-compat.adoc[FreeBSD Compatibility].
+
+== Constraints Imposed by the Boundary
+
+Three rules follow from the layered architecture:
+
+. **No basaltc module can call into kernite directly.** All system calls go through `trona`. There is no `extern "C"` block in basaltc declaring `syscall` or any kernite function.
+. **basaltc cannot allocate trona objects.** `trona_posix` provides every primitive (TLS block, futex, IPC buffer, slot allocator entry); basaltc never types over a `trona::types::Capability` or constructs one.
+. **Errors propagate as integer return codes.** trona_posix returns negative values for failure (a negated errno). basaltc's wrapper translates: if the return is negative, it sets `errno = -result` and returns `-1` to the C caller. Successful results are passed through unchanged.
+
+== Related Pages
+
+* xref:../architecture.adoc[Architecture] — overview of the layered build
+* xref:../runtime/crt-startup.adoc[CRT Startup] — when the TLS block becomes valid
+* xref:../runtime/heap-and-malloc.adoc[Heap and malloc] — `trona::sync::Mutex` and `posix_sbrk` usage
+* xref:../runtime/dynamic-linking.adoc[Dynamic Linking] — substrate use without trona_posix delegation
+* xref:../compat/freebsd-compat.adoc[FreeBSD Compatibility] — Linux errno numbering and other BSD/Linux deltas
