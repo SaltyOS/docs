@@ -1,0 +1,291 @@
+= substrate Overview
+:description: The 18 modules of the substrate (trona) crate — what each one does, how they depend on each other, and the C ABI surface they export
+
+The substrate is the **trona crate** — the 8,875-line Rust library that sits directly on top of the kernite microkernel.
+Every other piece of userspace code in SaltyOS — basaltc, trona_posix, trona_loader, every server, every driver — eventually lands here.
+
+Substrate is deliberately thin: no heap allocation, no std, no async runtime.
+Everything it exposes is either a direct syscall wrapper, a typed helper over a kernel capability, a futex-based synchronization primitive, or an accessor for data that rtld or the CRT has already stashed somewhere.
+
+== The 18 modules
+
+`substrate/lib.rs` declares exactly these `pub mod` entries.
+Every subsequent substrate doc page drills into one of them.
+
+[cols="1,1,3"]
+|===
+| Module | Lines | What it is
+
+| `syscall`         | 196 | The kernel entry point. A single polymorphic `syscall(num, a0..a5) -> TronaResult` plus dedicated helpers for futex, `clock_gettime`, `getrandom`, `shutdown`, and the timed IPC variants. See xref:substrate/syscalls.adoc[Syscall Wrappers].
+| `ipc`             | 483 | The nine IPC primitives and the `TronaMsg` / `IpcContext` / `IpcBuffer` types. Every server call in SaltyOS goes through here. See xref:substrate/ipc.adoc[IPC].
+| `invoke`          | 689 | 75 typed wrappers over `SYS_INVOKE` — one per `(object type, operation)` pair. See xref:substrate/invoke.adoc[Capability Invocation].
+| `slot_alloc`      | 729 | Multi-segment bump allocator for CNode slots, with an async expansion protocol driven by a notification from procmgr. See xref:substrate/slot-allocator.adoc[Slot Allocator].
+| `sync`            | 1,150 | Futex-based mutex, rwlock, condvar, barrier, semaphore, once, and typed mutex. See xref:substrate/sync-primitives.adoc[Synchronization Primitives].
+| `tls`             | 788 | `ThreadDesc` pool, thread identity, per-thread IPC context, static TLS initialization hooks. Covered in xref:substrate/threads-and-workers.adoc[Threads, TLS, and Worker Pool].
+| `worker`          | 1,094 | The server event-loop skeleton used by every SaltyOS server — `run_workers()`, worker-slot state, current-worker accessor, timeout hooks. Covered in xref:substrate/threads-and-workers.adoc[Threads, TLS, and Worker Pool].
+| `pending`         | 206 | `PendingRequest` table for asynchronous server work — request id, wait reason, saved reply cap, client badge. Covered in xref:substrate/threads-and-workers.adoc[Threads, TLS, and Worker Pool].
+| `cap_table`       | 312 | Startup capability table. Builder used by procmgr; reader used by rtld to walk the role→slot table from `AT_TRONA_CAP_TABLE` and populate the weak-symbol cap slots in substrate. Covered in xref:substrate/layout-and-caps.adoc[VA Layout and Capability Table].
+| `caps`            | 126 | Safe getters over the `__trona_cap_*` weak symbols — `procmgr_ep()`, `vfs_ep()`, `mmsrv_ep()`, and so on. Covered in xref:substrate/layout-and-caps.adoc[VA Layout and Capability Table].
+| `layout`          | 456 | VA layout planner (IPC buffer, ELF code, stack, initrd, mmap regions) and CSpace layout planner (alloc / recv / expand slot ranges). Covered in xref:substrate/layout-and-caps.adoc[VA Layout and Capability Table].
+| `framebuffer`     | 59  | One function — `read_framebuffer_info()` — that reads the kernel boot info page at `BOOTINFO_VADDR` and returns a `FramebufferInfo` struct for the console driver.
+| `serial`          | 260 | Atomic serial-logging primitives (`LineBuf`, `serial_putc`, `serial_hex`) and the `uinfo!` / `udebug!` / `uwarn!` / `uerror!` macros gated by `ulog_*` compile-time cfgs.
+| `casefold`        | 84  | Character case folding entry points used by basaltc's locale layer.
+| `casefold_table`  | 1,471 | Unicode case-folding lookup table. Generated from `tools/data/CaseFolding-15.1.txt` by `tools/gen_casefold.py` — pure data, not hand-edited.
+| `consts`          | 17  | Pure re-export shim — `include!` from `uapi/consts/{kernel,posix,server}.rs`.
+| `protocol`        | 40  | Pure re-export shim — `include!` from `uapi/protocol/{vfs,procmgr,mmsrv,namesrv,posix,win32,server,rsrcsrv}.rs`.
+| `types`           | 16  | Pure re-export shim — `include!` from `uapi/types/{core,pe,posix}.rs`.
+|===
+
+Three of the 18 modules (`consts`, `protocol`, `types`) are zero-logic shims that pull in the shared `uapi/` tree.
+The remaining 15 are the actual substrate — roughly 8,200 lines of Rust code that implement everything between the kernel ABI and the POSIX/Rust surface.
+
+== Module groupings
+
+The 15 non-shim modules cluster into seven logical groups — this is the same grouping the rest of the substrate section uses for navigation.
+
+[cols="1,3,2"]
+|===
+| Group | Modules | Documented in
+
+| Kernel entry path          | `syscall`, `ipc`, `invoke`           | xref:substrate/syscalls.adoc[Syscall Wrappers], xref:substrate/ipc.adoc[IPC], xref:substrate/invoke.adoc[Capability Invocation]
+| Capability allocation      | `slot_alloc`                         | xref:substrate/slot-allocator.adoc[Slot Allocator]
+| Synchronization            | `sync`                               | xref:substrate/sync-primitives.adoc[Synchronization Primitives]
+| Threads and servers        | `tls`, `worker`, `pending`           | xref:substrate/threads-and-workers.adoc[Threads, TLS, and Worker Pool]
+| Layout and well-known caps | `layout`, `cap_table`, `caps`        | xref:substrate/layout-and-caps.adoc[VA Layout and Capability Table]
+| Environment access         | `framebuffer`                        | this page
+| Diagnostics and data       | `serial`, `casefold`, `casefold_table` | this page
+|===
+
+The rest of this page covers the small helpers that do not deserve their own dedicated page — the serial logging macros, the framebuffer reader, and the case-folding tables.
+
+== Global state in `substrate/lib.rs`
+
+`substrate/lib.rs` declares a small number of mutable statics that are the central point of contact between substrate and the rest of the runtime.
+Each of them is annotated `#[linkage = "weak"]` except `__trona_ipc_ctx`, which is strongly exported so that early-boot code (CRT, rtld) can always find it.
+
+=== IPC context
+
+[source,rust]
+----
+#[unsafe(no_mangle)]
+pub static mut __trona_ipc_ctx: IpcContext = IpcContext::new();
+----
+
+The per-process IPC context — pointer to the thread's IPC buffer plus a send-cap counter.
+It is initialized by `rtld` or the CRT before `main` runs, and read through `tls::current_ipc_ctx()`.
+
+In a multi-threaded process the substrate TLS module overrides the accessor so that each thread uses its own IPC context from its `ThreadLocalBlock` rather than the global.
+Early boot (single-threaded CRT) falls back to `__trona_ipc_ctx`.
+
+=== Slot allocator seed
+
+[source,rust]
+----
+#[unsafe(no_mangle)]
+#[linkage = "weak"]
+pub static mut __trona_next_frame_slot: u64 = 64;
+
+#[unsafe(no_mangle)]
+#[linkage = "weak"]
+pub static mut __trona_cspace_ntfn: u64 = 0;
+----
+
+`__trona_next_frame_slot` is the next free CNode slot after startup has completed.
+The default value (`64`) is the historical frame-slot floor; `rtld` overrides it with the real per-process value derived from `AT_TRONA_CSPACE_LAYOUT`.
+
+`__trona_cspace_ntfn` is the notification capability slot the slot allocator signals when it runs out of CNode slots and needs procmgr to provision a sub-CNode.
+See xref:substrate/slot-allocator.adoc[Slot Allocator] for the expansion protocol.
+
+=== Well-known capability slots (`__trona_cap_*`)
+
+Substrate declares 14 weak-symbol slots that the startup path writes into — one per role.
+They are read back through the safe getters in `substrate/caps.rs` (`procmgr_ep()`, `vfs_ep()`, `mmsrv_ep()`, and so on).
+
+[cols="1,2"]
+|===
+| Symbol | Role
+
+| `__trona_cap_procmgr_ep`       | `ROLE_PROCMGR_CONTROL`
+| `__trona_cap_vfs_ep`           | `ROLE_VFS_CLIENT`
+| `__trona_cap_namesrv_ep`       | `ROLE_NAMESRV_CLIENT`
+| `__trona_cap_mmsrv_ep`         | `ROLE_MMSRV_CLIENT`
+| `__trona_cap_rsrcsrv_ep`       | `ROLE_RSRCSRV_CLIENT`
+| `__trona_cap_console_ep`       | `ROLE_CONSOLE_CLIENT`
+| `__trona_cap_service_ep`       | `ROLE_SERVICE_EP`
+| `__trona_cap_win32srv_ep`      | `ROLE_WIN32SRV_CLIENT`
+| `__trona_cap_signal_ntfn`      | `ROLE_SIGNAL_NTFN`
+| `__trona_cap_readiness_ntfn`   | `ROLE_READINESS_NTFN`
+| `__trona_cap_initrd_untyped`   | `ROLE_INITRD_UNTYPED`
+| `__trona_cap_fb_untyped`       | `ROLE_FB_UNTYPED`
+| `__trona_cap_pci_ioport`       | `ROLE_PCI_IOPORT`
+| `__trona_cap_com1_ioport`      | `ROLE_COM1_IOPORT`
+|===
+
+A slot value of `0` means the spawner did not provision that capability for this process — callers must tolerate `0` or fail loudly when the cap is strictly required.
+
+=== TLS metadata
+
+Rtld exports the TLS template and per-module metadata into six additional weak symbols:
+
+[source,rust]
+----
+pub static mut __trona_tls_template: u64 = 0;     // VA of .tdata image
+pub static mut __trona_tls_filesz: u64 = 0;       // initialized byte count
+pub static mut __trona_tls_memsz: u64 = 0;        // total static TLS size
+pub static mut __trona_tls_align: u64 = 1;        // max alignment
+pub static mut __trona_tls_module_count: u64 = 0; // populated entries
+pub static mut __trona_tls_modules: [StaticTlsModule; MAX_STATIC_TLS_MODULES] = [...];
+----
+
+The TLS module in substrate reads these at thread-creation time to allocate and zero-fill the new thread's TLS block.
+See xref:substrate/threads-and-workers.adoc[Threads, TLS, and Worker Pool] for the full mechanism.
+
+== C ABI exports
+
+`substrate/lib.rs` exposes roughly 43 `#[unsafe(no_mangle)] pub extern "C"` functions that form the C-callable surface of the library.
+This is the surface basaltc's C code calls, and it is the surface the PLT resolver of `ld-trona.so` binds against when it walks `libtrona.so`'s dynamic symbols.
+
+The exports fall into five categories:
+
+=== IPC
+
+[cols="1,3"]
+|===
+| Function | Role
+
+| `trona_send(ep, msg)`                        | Wrapper around `ipc::send_ctx`.
+| `trona_recv(ep, msg, badge)`                 | Wrapper around `ipc::recv_ctx`.
+| `trona_call(ep, msg, reply)`                 | Wrapper around `ipc::call_ctx`.
+| `trona_reply_recv(ep, reply, out_msg, badge)`| Wrapper around `ipc::reply_recv_ctx`.
+| `trona_nbsend(ep, msg)`                      | Wrapper around `ipc::nbsend_ctx`.
+|===
+
+=== Notifications
+
+[cols="1,3"]
+|===
+| Function | Role
+
+| `trona_signal(ntfn, bits)` | Signal a notification with a bitmask. Returns 0 on success.
+| `trona_wait(ntfn) -> u64`  | Block until the notification has any pending bit; returns the cleared bitmask.
+| `trona_poll(ntfn, *bits)`  | Non-blocking poll variant.
+|===
+
+=== Invokes
+
+The most numerous category — there is one `trona_*` wrapper per common invoke operation.
+Examples:
+
+- `trona_invoke(cap, label, arg0..arg3)` — the universal raw entry point
+- `trona_untyped_retype(untyped, new_type, size_bits, dest_slot)`
+- `trona_tcb_configure(tcb, rip, rsp, ipc_buf)`
+- `trona_vspace_map(vspace, frame, vaddr, flags)`
+- `trona_cnode_copy(src_cnode, src_slot, dest_cnode, dest_slot, rights)`
+- `trona_irq_handler_ack(irq_handler)`
+
+See xref:substrate/invoke.adoc[Capability Invocation] for the full list of typed wrappers.
+
+=== Futex
+
+[cols="1,3"]
+|===
+| Function | Role
+
+| `trona_futex_wait(addr, expected)` | Wrapper for `SYS_FUTEX` with `FUTEX_WAIT`.
+| `trona_futex_wake(addr, count)`    | Wrapper for `SYS_FUTEX` with `FUTEX_WAKE`.
+|===
+
+These are what basaltc's pthread C ABI uses as its locking primitive.
+The actual Rust code in `substrate/sync.rs` also calls the same syscall but goes through an internal path rather than through the C wrapper.
+
+=== Miscellaneous
+
+[cols="1,3"]
+|===
+| Function | Role
+
+| `trona_yield()`              | `SYS_YIELD`.
+| `trona_debug_putchar(c)`     | `SYS_DEBUG_PUTCHAR`.
+| `trona_debug_dump_state()`   | `SYS_DEBUG_DUMP_STATE`.
+| `trona_serial_puts(s)`       | Prints a NUL-terminated string via `serial::serial_putc`.
+| `trona_serial_hex(val)`      | Prints a hex u64 via `serial::serial_hex`.
+| `trona_runtime_set_auxv(auxv)`     | Stash the auxv pointer for later lookup; also walks the cap table to populate `__trona_cap_*`.
+| `trona_runtime_get_slot_pool(...)` | Return the slot allocator's (base, count, cspace_ntfn) triple resolved from auxv.
+|===
+
+The runtime_set_auxv path is the single narrow interface the static CRT path (basaltc's `crt_start.o`) uses to hand over the auxv contents to substrate before `main`.
+For dynamic binaries, rtld performs the same role via direct symbol writes.
+
+== The panic handler
+
+`substrate/lib.rs` installs the userspace panic handler for every binary that links against `libtrona.so`:
+
+[source,rust]
+----
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    let mut line = serial::LineBuf::new();
+    line.str(b"[PANIC] userspace");
+
+    if let Some(pid) = panic_getpid() {
+        line.str(b" pid=");
+        line.dec(pid);
+    }
+
+    if let Some(location) = info.location() {
+        // print file:line:column
+    }
+    // format info.message() and flush
+    line.flush();
+    loop {
+        syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+    }
+}
+----
+
+`panic_getpid()` makes a best-effort `PM_GETPID` IPC call so that the panic line includes the faulting process's PID — if procmgr is not reachable, the PID is omitted rather than recursively panicking.
+After the message is flushed, the thread spin-yields forever: substrate has no way to kill itself, so it simply stops doing anything until the scheduler decides to reclaim it (or until the debug shutdown path reboots the machine).
+
+== The diagnostics stack: serial and framebuffer
+
+`substrate/serial.rs` provides the concurrency-safe serial logging primitives that userland uses for anything that needs to reach the kernel debug console.
+The central type is `LineBuf` — a fixed-size accumulator that collects string fragments, hex values, and decimal values into a single atomic write:
+
+[source,rust]
+----
+let mut line = LineBuf::new();
+line.str(b"ipc-server: handled request ");
+line.hex(request_id);
+line.str(b" from badge ");
+line.dec(client_badge);
+line.putc(b'\n');
+line.flush();
+----
+
+All four `uinfo!` / `udebug!` / `uwarn!` / `uerror!` macros are thin wrappers that build a `LineBuf`, feed it from `format_args!`, and call `flush()` once at the end.
+Each macro is gated by a `cfg` (`ulog_info`, `ulog_debug`, `ulog_warn`, `ulog_trace`) that `lib/trona/meson.build` turns on based on the `userland_log_level` meson option.
+At the default `error` level, all four macros compile to nothing — there is zero runtime cost for disabled log statements.
+
+`substrate/framebuffer.rs` is much smaller — a single function that reads the kernel boot-info page at a fixed virtual address (`BOOTINFO_VADDR = 0x1FF000`) and returns a `FramebufferInfo` struct describing physical frame base, width, height, pitch, bpp, and RGB channel positions.
+Only the console driver calls this function; everyone else talks to the framebuffer through the display server's IPC protocol.
+
+== Case folding
+
+`substrate/casefold.rs` and `substrate/casefold_table.rs` together provide the Unicode case-folding surface that basaltc's locale layer uses for `wchar.h` entry points like `towlower` / `towupper` / `iswupper`.
+
+`casefold_table.rs` is **auto-generated** — do not hand-edit it.
+The 1,471 lines are produced by `tools/gen_casefold.py` reading `tools/data/CaseFolding-15.1.txt` (the official Unicode Character Database 15.1 file).
+The generator emits a compact lookup structure (bucket table + entry array) that `casefold.rs` queries through a small number of inline functions.
+
+`casefold.rs` itself is only 84 lines — the entry points that basaltc's `compat/freebsd/rune.rs` calls into, plus a fallback for characters that are outside the generated table.
+
+This is the same pattern basalt uses for its rune table: generated data + small runtime.
+Keeping the table in substrate rather than basalt means every SaltyOS process that needs case folding shares a single 1,471-line data blob rather than each libc.so doing its own.
+
+== Where to go next
+
+* xref:substrate/syscalls.adoc[Syscall Wrappers] — the single function that every substrate path eventually reaches.
+* xref:substrate/ipc.adoc[IPC] — the message-passing primitives used by every server interaction.
+* xref:substrate/invoke.adoc[Capability Invocation] — the typed kernel-object operation API.
+* xref:substrate/threads-and-workers.adoc[Threads, TLS, and Worker Pool] — thread infrastructure and the server event loop.
+* xref:substrate/layout-and-caps.adoc[VA Layout and Capability Table] — how the substrate knows where anything lives.

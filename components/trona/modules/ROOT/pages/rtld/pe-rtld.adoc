@@ -1,0 +1,158 @@
+= PE Dynamic Linker (ld-trona-pe.so)
+:description: Walking the PE rtld — entry, validation, base relocation, kernel32 import resolution via win32_csrss, and the jump to the PE entry point
+
+`ld-trona-pe.so` is the runtime loader SaltyOS uses for PE32+ binaries (Windows-style executables and DLLs).
+It is a separate component from xref:rtld/elf-rtld.adoc[the ELF rtld] — a PE process never has the ELF rtld in its address space, and vice versa.
+
+The PE rtld is much smaller than the ELF rtld:
+
+[cols="1,1,3"]
+|===
+| File | Lines | Role
+
+| `rtld/pe/rtld_pe_main.c`     | 844 | Single C source. Entry point, stack parsing, self-relocation, PE validation, base relocation pass, import resolution, jump to PE entry.
+| `rtld/pe/rtld_pe_internal.h` | 509 | Self-contained header with PE struct definitions, inline syscall macros (shared with the ELF rtld arch headers), and the rtld state struct.
+|===
+
+Notice there is no `rtld_resolve.S` for PE rtld — PE binaries do not have a lazy-binding PLT mechanism.
+Imports are resolved eagerly at load time and the resolved addresses are written into the Import Address Table (IAT).
+Once the rtld jumps to the PE entry point, the IAT contains absolute function addresses and there is no further runtime resolution.
+
+== The startup sequence
+
+The flow runs through `rtld_pe_main.c`:
+
+. **`_start`** (naked assembly stub at the top of `rtld_pe_main.c`).
+   Same shape as the ELF rtld: zero `%ebp`, pass `%rsp` as the first argument, call `pe_rtld_main`.
+. **`pe_rtld_main(sp)`** parses the user stack to find `argc`, `argv`, `envp`, and the auxv vector.
+. **Self-relocation.** The rtld walks its own RELA section (the PE rtld is itself an ELF — only the binaries it loads are PE) and applies every `R_RELATIVE` entry. This is the same trick the ELF rtld uses.
+. **Auxv extraction.** Walk the auxv looking for the SaltyOS PE-specific tags from the `0x2000` block:
+
+[cols="1,2,3"]
+|===
+| Tag | Constant | Role
+
+| `0x2000` | `AT_SALTYOS_PE_BASE`        | Pre-mapped base address of the PE image.
+| `0x2001` | `AT_SALTYOS_PE_SIZE`        | Size of the PE image mapping.
+| `0x2002` | `AT_SALTYOS_WIN32SRV`       | Endpoint capability for `win32_csrss` (used for import resolution and client registration).
+| `0x2003` | `AT_SALTYOS_KERNEL32_BASE`  | Pre-mapped base of `kernel32.dll`.
+| `0x2004` | `AT_SALTYOS_KERNEL32_SIZE`  | Size of the `kernel32.dll` mapping.
+|===
+
+The key difference from the ELF rtld is that the PE image and `kernel32.dll` are **already mapped** when the rtld starts.
+Procmgr does the mapping work as part of spawning the PE process — it loads the PE image via `trona_loader::pe_loader::pe_load` and `kernel32.dll` similarly, then hands the bases over to the rtld via auxv.
+The rtld does not have to allocate frames or call `vspace_map` itself.
+
+This is a different shape from the ELF rtld, where the rtld is responsible for loading every shared library out of the initrd CPIO at runtime.
+For PE, all the loading happens in procmgr.
+
+. **PE validation.** The rtld walks the PE headers exactly as `pe_validate` from the loader does:
+  .. DOS header at offset 0 → check `e_magic == MZ` → read `e_lfanew`.
+  .. PE signature at `e_lfanew` → check `PE\0\0`.
+  .. COFF header → check machine type matches the current architecture.
+  .. Optional header → check `magic == PE_OPT_MAGIC_PE32PLUS`.
+. **Base relocation.** If `image_base != AT_SALTYOS_PE_BASE`, the rtld walks `IMAGE_DIRECTORY_ENTRY_BASERELOC` and applies every `IMAGE_REL_BASED_DIR64` fixup, just like xref:../loader/pe-and-cpio.adoc[the PE loader's relocation pass].
+. **Import resolution.** This is where the PE rtld diverges most from the ELF rtld — see the next section.
+. **Jump to entry point.** A small assembly stub loads the saved auxv pointer back onto the stack and jumps to `image_base + entry_rva`. The PE rtld is no longer in the picture.
+
+== Import resolution via `W32_RESOLVE_IMPORT`
+
+PE binaries declare their imports through the `IMAGE_DIRECTORY_ENTRY_IMPORT` (index 1) data directory.
+Each entry is an `IMAGE_IMPORT_DESCRIPTOR` containing the imported DLL name, an Import Lookup Table (the names of the functions to import), and an Import Address Table (which the rtld must populate with the resolved addresses).
+
+The rtld walks every import descriptor and, for each function, sends a `W32_RESOLVE_IMPORT` (label `0x100`) IPC to `win32_csrss`:
+
+[source,c]
+----
+struct W32ResolveImportRequest {
+    uint64_t name_len;          // bytes in the function name
+    uint64_t ordinal_hint;      // ordinal hint, or 0 if name-based
+    uint8_t  name_bytes[...];   // function name (no NUL)
+};
+
+// Reply
+struct W32ResolveImportReply {
+    uint64_t kernel32_export_rva;  // 0 if not found
+};
+----
+
+The reply carries an RVA (relative virtual address) within `kernel32.dll`.
+The rtld converts it to an absolute address by adding `AT_SALTYOS_KERNEL32_BASE` and writes it into the IAT slot.
+
+This is different from how Windows resolves imports — Windows uses an in-process loader that walks the export table of the loaded DLL directly.
+SaltyOS routes the resolution through win32_csrss because:
+
+. The PE rtld is freestanding C and parsing PE export tables would duplicate logic that win32_csrss already has to maintain anyway (for `GetProcAddress`).
+. win32_csrss is the central authority for "what is the current `kernel32.dll`", which makes it easier to swap implementations.
+
+The cost is one IPC per imported function.
+For a typical PE binary that imports 20-30 functions from kernel32.dll, this adds maybe 1ms of startup latency on top of the loader's own work — negligible compared to the cost of mapping the binary in the first place.
+
+If `kernel32_export_rva` comes back as `0`, the rtld treats it as a resolution failure and aborts the process startup with a fatal error written to the kernel debug serial port.
+There is no warning-and-continue path for missing imports.
+
+== Why no DLL loading
+
+Importantly, the PE rtld does not load other DLLs on demand.
+The only DLL it knows about is `kernel32.dll`, which procmgr already mapped before the rtld started.
+PE binaries that try to import from other DLLs (`user32.dll`, `gdi32.dll`, …) will fail at import resolution time because `W32_RESOLVE_IMPORT` only knows how to look up `kernel32.dll` exports.
+
+This is a deliberate restriction: the test PE binaries that ship with SaltyOS (`hello_pe.c` in `userland/tests/`) only need `kernel32.dll` for now.
+Adding support for additional DLLs would require:
+
+. Bundling the additional DLL binaries into the initrd (or into a future ports system).
+. Teaching procmgr to map them when spawning a PE process.
+. Adding additional auxv tags (or a generalized table) to communicate the additional bases to the rtld.
+. Extending `W32_RESOLVE_IMPORT` to specify which DLL to look up in.
+
+None of this is hard but none of it is implemented yet either.
+
+== Why no lazy binding
+
+PE binaries do not have a lazy-binding mechanism analogous to the ELF PLT.
+Every imported function is bound at load time.
+This is the standard Windows PE behavior — the rtld matches it.
+
+The cost is that an import that is never called still pays the resolution IPC at startup.
+For typical PE binaries this is irrelevant; for a binary that imports a hundred functions and only calls three, it would be ~100 unnecessary IPCs.
+There is no plan to add lazy binding because none of the current PE binaries care.
+
+== Coexistence with the ELF rtld
+
+Within a single process, exactly one rtld is in the address space:
+
+- An ELF binary's `PT_INTERP` names `/lib/ld-trona.so`. Procmgr maps it as the interpreter and the kernel jumps to the ELF rtld.
+- A PE binary has no `PT_INTERP`; procmgr decides "this is a PE" by sniffing the file's first bytes (`MZ` magic) and maps `/lib/ld-trona-pe.so` as the interpreter instead.
+
+There is no path for a process to use both rtlds simultaneously.
+A PE binary cannot call into an ELF library, and vice versa, because the import resolution mechanisms are completely different.
+
+The line where this matters is `kernel32.dll` itself — `kernel32.dll` is a real PE binary and gets resolved by the PE rtld.
+It does not link against `libtrona.so` (which is an ELF) — it is a freestanding C file built with `clang --target=x86_64-w64-windows-gnu` that issues SaltyOS syscalls inline through inline assembly, exactly like the rtld does.
+See xref:../win32/kernel32-stub.adoc[kernel32.dll PE Stub].
+
+== Auxv tags consumed
+
+For reference, here is the full set of auxv tags the PE rtld looks at:
+
+[cols="1,2,3"]
+|===
+| Tag | Constant | Source
+
+| Standard | `AT_NULL`, `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_ENTRY`, `AT_BASE` | The kernel and procmgr pass these the same way they do for ELF binaries — but the rtld uses them only for self-relocation, not to find the target image.
+| `0x2000` | `AT_SALTYOS_PE_BASE`       | The actual PE image lives here.
+| `0x2001` | `AT_SALTYOS_PE_SIZE`       | Image size.
+| `0x2002` | `AT_SALTYOS_WIN32SRV`      | Endpoint cap for csrss IPC.
+| `0x2003` | `AT_SALTYOS_KERNEL32_BASE` | kernel32.dll lives here.
+| `0x2004` | `AT_SALTYOS_KERNEL32_SIZE` | kernel32.dll size.
+|===
+
+The PE rtld does not look at `AT_TRONA_*` tags at all because it does not link against libtrona.so — there are no `__trona_cap_*` weak symbols to populate.
+PE binaries that need to make SaltyOS IPC calls do so through inline syscall instructions emitted by `kernel32.dll`'s implementation, not through libtrona.
+
+== Related pages
+
+* xref:rtld/elf-rtld.adoc[ELF Dynamic Linker (ld-trona.so)] — the sister rtld for ELF binaries.
+* xref:../loader/pe-and-cpio.adoc[PE Loader and CPIO Archive] — the loader code procmgr uses to map the PE image before invoking this rtld.
+* xref:../win32/kernel32-stub.adoc[kernel32.dll PE Stub] — the DLL whose exports this rtld resolves.
+* xref:../abi/protocol-labels.adoc#_win32_personality_win32_rs[Win32 Protocol Labels] — `W32_RESOLVE_IMPORT` and the other Win32 IPC labels.

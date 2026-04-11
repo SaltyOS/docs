@@ -1,0 +1,203 @@
+= kernel32.dll PE Stub
+:description: The single C file that produces the kernel32.dll PE/COFF binary every PE binary on SaltyOS imports
+
+`kernel32_pe.c` is **the** Win32 implementation in SaltyOS today.
+It is a 1,503-line freestanding C file that gets compiled into a real PE/COFF DLL named `kernel32.dll`, which every PE binary on SaltyOS imports at runtime.
+There is no Rust component — the file is self-contained C with inline syscall stubs and a private definition of every type it needs.
+
+Why a separate C file rather than a Rust crate?
+Two reasons: (1) the resulting binary has to be PE/COFF, not ELF, and Rust's `--target=x86_64-w64-windows-gnu` codegen for `no_std` is workable but adds complexity that would require its own meson plumbing; (2) the file's job is so narrow — implement a dozen functions, each forwarding to a single IPC call — that the Rust scaffolding overhead would dominate.
+
+== What gets exported
+
+`kernel32.dll` ships exactly the symbols listed in `lib/trona/win32/kernel32_pe.def`:
+
+[source]
+----
+LIBRARY kernel32.dll
+
+EXPORTS
+  CloseHandle
+  ExitProcess
+  GetConsoleMode
+  GetCurrentProcess
+  GetCurrentProcessId
+  GetLastError
+  GetStdHandle
+  ReadConsoleA
+  SetConsoleMode
+  SetLastError
+  WriteConsoleA
+  WriteConsoleW
+  __trona_ipc_ctx DATA
+  __win32srv_ep DATA
+  __trona_cap_procmgr_ep DATA
+  __trona_cap_vfs_ep DATA
+----
+
+Twelve functions plus four data symbols (`DATA` directive marks them as exported globals rather than functions).
+
+That is the entire PE export surface.
+The C file actually defines additional functions (`CreateFileA`, `ReadFile`, `WriteFile`, `GetFileAttributesA`, `SetFileAttributesA`, `SetFilePointer`, `CreateNamedPipeA`, `ConnectNamedPipe`, `GetSecurityInfo`, `SetSecurityInfo`) but they are not in the `.def` file, so `lld-link` does not export them and PE binaries cannot call them.
+Those functions exist as in-progress implementations that have not yet been promoted to the export surface.
+
+== The data exports
+
+The four data exports are how `kernel32.dll` shares state with the loaded PE binary and (where applicable) with substrate's address space.
+
+[cols="1,3"]
+|===
+| Symbol | Role
+
+| `__trona_ipc_ctx`
+| The per-process `IpcContext` struct (IPC buffer pointer + send-cap counter). Defined in the `kernel32.dll` data section. Used by every IPC-emitting function in the file.
+
+| `__win32srv_ep`
+| The cached `win32_csrss` endpoint capability slot. Populated at process startup by the PE rtld via `AT_SALTYOS_WIN32SRV` auxv tag.
+
+| `__trona_cap_procmgr_ep`
+| The procmgr control endpoint slot. Populated at startup the same way.
+
+| `__trona_cap_vfs_ep`
+| The VFS endpoint slot.
+|===
+
+The two cap slots are how `kernel32.dll` issues IPC without going through `libtrona.so` — it owns its own copies of the well-known cap slots that substrate's `caps::*` getters would otherwise provide.
+
+These are populated by `ld-trona-pe.so` at process startup (see xref:../rtld/pe-rtld.adoc[PE Dynamic Linker]) by writing them into the data exports just like the ELF rtld does for `libtrona.so` weak symbols.
+
+== Function categories
+
+The 12 exported functions group into three categories:
+
+=== Console I/O — VFS-direct
+
+The four console functions all bypass `win32_csrss` and write to / read from the underlying VFS file descriptor directly.
+
+[cols="1,3"]
+|===
+| Function | Implementation
+
+| `WriteConsoleA(handle, buf, chars_to_write, written_out, reserved)`
+| Maps `handle` to a slot index, looks up the underlying VFS fd, chunks the buffer into 144-byte pieces, and sends `VFS_WRITE` (3) to `__trona_cap_vfs_ep` for each chunk. Accumulates the byte count in `*written_out`.
+
+| `WriteConsoleW(handle, buf, chars_to_write, written_out, reserved)`
+| Same as `WriteConsoleA` but converts UTF-16 LE input to UTF-8 inline. Each UTF-16 code point becomes 1-3 UTF-8 bytes depending on its value. The conversion happens chunk-by-chunk so no intermediate buffer is needed.
+
+| `ReadConsoleA(handle, buf, chars_to_read, read_out, control_chars)`
+| Sends `VFS_READ` (2) to the VFS endpoint with the requested byte count. Stores the actual bytes read in `*read_out`.
+
+| `GetConsoleMode(handle, mode_out)`
+| Returns hardcoded constants — `0x0007` (`ENABLE_PROCESSED_INPUT \| ENABLE_LINE_INPUT \| ENABLE_ECHO_INPUT`) for input handles and `0x0003` (`ENABLE_PROCESSED_OUTPUT \| ENABLE_WRAP_AT_EOL_OUTPUT`) for output handles. Does not consult any actual mode state.
+|===
+
+`SetConsoleMode(handle, mode)` accepts the call and returns `TRUE` without storing the mode anywhere — it is a no-op.
+A future contributor that needs real console mode handling will need to wire it through `win32_csrss` via `W32_GET_CONSOLE_MODE` / `W32_SET_CONSOLE_MODE`, neither of which is currently used.
+
+The 144-byte chunk size for `WriteConsoleA` is the largest payload that fits in the IPC buffer overflow region after subtracting the message header — bigger writes are split client-side rather than going through the bulk SHM transfer path.
+This works because PE console binaries rarely write more than a few hundred bytes per call.
+
+=== Standard handles
+
+`GetStdHandle(which)` maps the three pseudo-handle constants (`STD_INPUT_HANDLE = -10`, `STD_OUTPUT_HANDLE = -11`, `STD_ERROR_HANDLE = -12`) to slot indices `0`, `1`, `2` respectively, then encodes them as `(slot * 4) + 4` HANDLE values.
+
+The slot-to-fd mapping is hardcoded: slots 0, 1, 2 always alias VFS fds 0, 1, 2.
+There is no separate handle table being populated at runtime — the encoding is purely arithmetic.
+
+This means a PE binary that does `dup2(stderr, stdout)` on the POSIX side cannot redirect its stdout from inside the PE binary itself — every `WriteConsoleA(GetStdHandle(STD_OUTPUT_HANDLE), ...)` call always writes to VFS fd 1.
+Real handle table support would require the trona_win32 Rust crate to be built and consumed (or a major expansion of the C file).
+
+`CloseHandle(handle)` is currently a no-op for the standard handles and would close any other handle by sending `VFS_CLOSE` (4) — but since no other path creates non-standard handles, this code path is never actually exercised.
+
+=== Process
+
+[cols="1,3"]
+|===
+| Function | Implementation
+
+| `ExitProcess(exit_code)`
+| Sends a best-effort `W32_CLIENT_EXIT` (`0x106`, non-blocking) to `__win32srv_ep` to notify csrss the client is exiting (csrss may want to free console state or notify the parent shell). Then sends `PM_EXIT` (blocking) to `__trona_cap_procmgr_ep`. The `PM_EXIT` call never returns.
+
+| `GetCurrentProcess()`
+| Returns the pseudo-handle `(HANDLE) -1`. Matches Windows: this is a magic value that means "the caller's own process" and is not a real handle.
+
+| `GetCurrentProcessId()`
+| Sends `PM_GETPID` (4) to procmgr. The reply's `regs[0]` is the PID; the function returns it as a `DWORD`.
+|===
+
+The `W32_CLIENT_EXIT` IPC is best-effort and non-blocking because the procmgr `PM_EXIT` is the load-bearing call — if csrss happens to be unresponsive, the process should still be able to exit cleanly.
+
+=== Error handling
+
+[cols="1,3"]
+|===
+| Function | Implementation
+
+| `GetLastError()`
+| Reads a thread-local `last_error` variable. The variable is `__thread DWORD last_error` defined inside `kernel32_pe.c`, which the rtld initializes to zero.
+
+| `SetLastError(err)`
+| Writes the argument into the thread-local `last_error`.
+|===
+
+Other functions in the file set `last_error` whenever they detect an error before returning `FALSE` / `INVALID_HANDLE_VALUE` — for example, `WriteConsoleA` calls `set_trona_error_return_false(reply.label)` when the VFS reply is non-OK, which translates the substrate error to a Win32 error code via an inline switch statement and updates `last_error`.
+
+The error translation table inside `kernel32_pe.c` matches the one in `error.rs` from the unbuilt Rust crate.
+Both are duplicates of each other — neither is the source of truth.
+
+== The unexported functions
+
+The C file defines several additional functions that exist in the source but are not in the `.def` file, so they do not become PE exports:
+
+- `CreateFileA(name, access, share, security, disposition, attrs, template)` — would open a file via `VFS_POSIX_OPEN`. Implemented but unexported.
+- `ReadFile(handle, buf, len, read_out, overlapped)` — would call `VFS_READ`. Implemented but unexported.
+- `WriteFile(handle, buf, len, written_out, overlapped)` — would call `VFS_WRITE`. Implemented but unexported.
+- `SetFilePointer(handle, distance_low, distance_high, method)` — would call `VFS_LSEEK`. Implemented but unexported.
+- `GetFileAttributesA(name)` — would call `VFS_POSIX_STAT` and translate the mode bits. Implemented but unexported.
+- `SetFileAttributesA(name, attrs)` — partial implementation. Unexported.
+- `CreateNamedPipeA(...)`, `ConnectNamedPipe(...)` — partial implementations. Unexported.
+- `GetSecurityInfo(...)`, `SetSecurityInfo(...)` — partial implementations. Unexported.
+
+These are in-progress code that future maintainers can promote to the export surface by adding their names to `kernel32_pe.def` and rebuilding.
+Until they appear in the def file, PE binaries that try to import them will fail at the rtld import-resolution step.
+
+== How a PE call reaches the kernel
+
+Tracing `WriteConsoleA("hello\n")` end-to-end:
+
+. PE binary calls `WriteConsoleA` via its IAT entry. The IAT points at the `kernel32.dll` code address that the rtld populated during startup.
+. Inside `WriteConsoleA`, the function fetches `__trona_cap_vfs_ep` (a global in `kernel32.dll`'s own data section, populated by the rtld).
+. It builds a `TronaMsg { label = VFS_WRITE, length = 3, regs[0] = vfs_fd, regs[1] = 6, regs[2..] = "hello\n" }`.
+. It calls `trona_call(vfs_ep, &msg, &reply)` — `trona_call` is a static function inside `kernel32_pe.c` that wraps the inline `syscall` instruction.
+. The kernel takes the IPC fastpath, hands the message to VFS.
+. VFS writes the bytes to fd 1, which is the serial console driver.
+. VFS replies with `TRONA_OK` and the byte count.
+. `WriteConsoleA` returns `TRUE` and writes the byte count into `*written_out`.
+
+There is no `libtrona.so` involved at any point — `kernel32.dll` has its own inline syscall machinery and its own copy of every cap slot it needs.
+This makes `kernel32.dll` truly standalone: it can be loaded into a PE process that is **not** linked against `libtrona.so` at all.
+
+== Build details
+
+`kernel32.dll` is built by the top-level `lib/trona/meson.build`:
+
+. Compile `kernel32_pe.c` to `kernel32_pe.obj` using `clang --target=x86_64-w64-windows-gnu` (or `aarch64-w64-windows-gnu`) with `-ffreestanding -fno-stack-protector -fno-builtin -fvisibility=hidden`.
+. Link with `lld-link -dll -noentry -nodefaultlib -machine:amd64 -def:kernel32_pe.def -out:kernel32.dll kernel32_pe.obj`.
+
+Notes:
+
+- `-ffreestanding` because there is no libc available at compile time.
+- `-fvisibility=hidden` so only the symbols in the def file get exported. Combined with the `.def`, this gives a clean PE export table with exactly the listed symbols.
+- `-noentry` because `kernel32.dll` is a DLL — it has no `_DllMain` and no entry point. The PE rtld treats it as a passive symbol provider.
+- `-nodefaultlib` to prevent lld-link from trying to drag in any default Windows libraries.
+
+The resulting binary is around 30 KB, gets installed alongside `libtrona.so` in the rootfs, and is mapped by procmgr when a PE process is spawned.
+
+xref:../build-system.adoc[Build System] covers the full meson plumbing.
+
+== Related pages
+
+* xref:index.adoc[trona_win32 Overview] — the dead-code Rust crate that should eventually replace this C file.
+* xref:../abi/protocol-labels.adoc#_win32_personality_win32_rs[Win32 Protocol Labels] — the seven `W32_*` labels.
+* xref:../rtld/pe-rtld.adoc[PE Dynamic Linker] — the loader that maps `kernel32.dll` into PE processes and populates its data exports.
+* xref:../build-system.adoc[Build System] — the meson custom targets for `kernel32_pe.obj` and `kernel32.dll`.

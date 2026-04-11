@@ -1,0 +1,259 @@
+= Adding a Syscall or Invoke
+:description: Step-by-step contributor guide for adding a new syscall number or invoke label to SaltyOS
+
+This page walks through the contribution process for the two most common changes that touch the kernel↔userland boundary: adding a new syscall number, and adding a new invoke label on an existing capability type.
+
+The two cases share most of the same steps because the wire-level work is identical — the only difference is where the kernel dispatch arm lives.
+
+== Before you start
+
+Make sure you understand:
+
+- How a syscall reaches the kernel — xref:../substrate/syscalls.adoc[Syscall Wrappers].
+- How invokes are dispatched — xref:../substrate/invoke.adoc[Capability Invocation].
+- The TronaResult return contract — xref:../abi/syscall-abi.adoc[Syscall ABI].
+- What a `TronaMsg` and `IpcContext` look like — xref:../substrate/ipc.adoc[IPC].
+
+You will be touching code in three repositories of files: kernite, lib/trona/uapi/, and lib/trona/substrate/.
+Plan to make a single coordinated change across all three.
+
+== Adding a syscall
+
+Adding a new syscall is the heavier of the two changes because it requires a fresh kernel dispatch arm.
+
+=== 1. Pick a syscall number
+
+The next free number is one greater than the highest existing `SYS_*` constant in `lib/trona/uapi/consts/kernel.rs`.
+At the time of writing the highest is `SYS_NOTIF_RETURN = 27`, so a new syscall would be `28`.
+
+Check both kernite (`kernite/src/syscall/mod.rs`) and the uapi file to make sure no number is reused.
+The two are kept in sync by hand.
+
+=== 2. Define the constant
+
+Add the new constant to `lib/trona/uapi/consts/kernel.rs`:
+
+[source,rust]
+----
+pub const SYS_MY_NEW_OP: u64 = 28;
+----
+
+Pick a descriptive name that follows the existing convention — `SYS_<verb>` or `SYS_<NOUN>_<verb>` for verbs that need disambiguation.
+Examples: `SYS_GETRANDOM`, `SYS_DEBUG_PUTSTR`, `SYS_RECV_ANY_TIMED`.
+
+=== 3. Add the kernel handler
+
+In `kernite/src/syscall/mod.rs`, add a variant to the `Syscall` enum and its `TryFrom<u64>` impl:
+
+[source,rust]
+----
+pub enum Syscall {
+    // ... existing variants ...
+    MyNewOp = 28,
+}
+
+impl TryFrom<u64> for Syscall {
+    type Error = ();
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        match value {
+            // ... existing cases ...
+            28 => Ok(Syscall::MyNewOp),
+            _ => Err(()),
+        }
+    }
+}
+----
+
+Then add a dispatch arm in `syscall_handle_rust()`:
+
+[source,rust]
+----
+Syscall::MyNewOp => {
+    // your handler — typically reads args from registers, does the work,
+    // returns a TronaResult-equivalent (error_u64, value_u64) tuple
+    handle_my_new_op(arg0, arg1, arg2, arg3, arg4, arg5)
+}
+----
+
+The handler takes the 6 user-supplied arguments and returns the syscall result.
+What the handler actually does depends on the syscall — some are pure (return random bytes from RDRAND), some require a critical section (lock the scheduler, do something, unlock), some are blocking (suspend the current TCB until a wake condition is met).
+
+Lock ordering, IRQ save/restore, and the other safety conventions documented in xref:kernite::internals/lock-ordering.adoc[kernite: Lock ordering] apply.
+Do not freelance.
+
+=== 4. Add the substrate wrapper
+
+If the new syscall fits the pattern of "called from many places with awkward arguments", add a dedicated helper to `lib/trona/substrate/syscall.rs`:
+
+[source,rust]
+----
+#[inline]
+pub fn sys_my_new_op(arg0: u64, arg1: u64) -> u64 {
+    syscall(SYS_MY_NEW_OP, arg0, arg1, 0, 0, 0, 0).value
+}
+----
+
+If the syscall is called from only one site, do not add a helper — just call `syscall(SYS_MY_NEW_OP, ...)` inline at the call site.
+The bar for adding helpers in `syscall.rs` is "called from at least two files".
+
+=== 5. Add a C ABI export (optional)
+
+If the new syscall needs to be reachable from C code (basaltc, kernel32_pe.c), add a `#[unsafe(no_mangle)]` wrapper to `substrate/lib.rs`:
+
+[source,rust]
+----
+#[unsafe(no_mangle)]
+pub extern "C" fn trona_my_new_op(arg0: u64, arg1: u64) -> i32 {
+    sys_my_new_op(arg0, arg1) as i32
+}
+----
+
+Choose the right return type for the C side — `i32` for error-only operations, `u64` for value-only operations.
+
+=== 6. Update the spec
+
+Add an entry to `docs/spec/syscalls.md` in the saltyos tree describing what the syscall does, the argument layout, the error codes it can return, and any blocking semantics.
+
+The xref:../abi/syscall-abi.adoc[Syscall ABI] page in this Antora site is auto-derived from `uapi/consts/kernel.rs` and will pick up the new constant on the next docs build.
+You do not need to edit it manually, but you may want to expand the description.
+
+=== 7. Build and verify
+
+[source,bash]
+----
+just distclean
+just setup
+just build
+just run
+----
+
+The fresh `distclean` and `setup` are needed because adding a new constant to `uapi/consts/kernel.rs` does not automatically force a kernite recompile — meson tracks the file dependency through substrate but kernite reads the same file via its own copy of the constants.
+
+Verify by writing a small test in `userland/tests/test_runner/src/` that calls your new syscall and checks the result.
+
+== Adding an invoke label
+
+Adding an invoke label is lighter because the dispatch already exists — `SYS_INVOKE` is one of the 28 syscalls, and `handle_invoke()` is what dispatches on the label.
+
+=== 1. Pick a label number
+
+Look at xref:../abi/invoke-labels.adoc[Invoke Labels] for the existing groups:
+
+[cols="1,2"]
+|===
+| Range | Group
+
+| `0x10`–`0x18` | CNode
+| `0x20`        | Untyped
+| `0x30`–`0x31` | SchedContext
+| `0x40`–`0x4F` | TCB
+| `0x50`–`0x5F` | VSpace
+| `0x60`–`0x64` | IRQ
+| `0x70`–`0x77` | I/O Port
+| `0x90`–`0x97` | MemoryObject
+| `0x97`–`0x9A` | VSpace MO mapping
+|===
+
+Pick the next free number in your group's range.
+If your range is full, take a number outside the existing groups (somewhere in `0xA0`–`0xEF`) — these get used as new ranges open up.
+
+=== 2. Define the constant
+
+Add the constant to `lib/trona/uapi/consts/kernel.rs`, in the section for the right object type:
+
+[source,rust]
+----
+/// VSpace invoke labels (0x50-0x5F).
+// ... existing VSpace labels ...
+pub const VSPACE_MY_NEW_OP: u64 = 0x5F;
+----
+
+=== 3. Add the kernel handler
+
+In `kernite/src/syscall/mod.rs`, find `handle_invoke()` and add a match arm for the new label:
+
+[source,rust]
+----
+fn handle_invoke(cap: u64, label: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> TronaResult {
+    let cap_obj = lookup_cap(cap)?;
+    match (cap_obj.type, label) {
+        // ... existing arms ...
+        (CapType::VSpace, VSPACE_MY_NEW_OP) => {
+            handle_vspace_my_new_op(cap_obj, arg0, arg1, arg2, arg3)
+        }
+        _ => TronaResult::error(TRONA_INVALID_OPERATION),
+    }
+}
+----
+
+The handler signature follows the existing handlers in the `vspace` / `cnode` / `tcb` / etc. modules under `kernite/src/cap/` and `kernite/src/mm/`.
+
+=== 4. Add the substrate wrapper
+
+Add a typed wrapper to `lib/trona/substrate/invoke.rs`:
+
+[source,rust]
+----
+#[inline]
+pub fn vspace_my_new_op(vspace: Cap, arg0: u64, arg1: u64) -> i32 {
+    invoke(vspace, VSPACE_MY_NEW_OP, arg0, arg1, 0, 0).error as i32
+}
+----
+
+If the operation returns more than just an error code, return a tuple:
+
+[source,rust]
+----
+#[inline]
+pub fn vspace_my_new_op(vspace: Cap, arg0: u64) -> (i32, u64) {
+    let r = invoke(vspace, VSPACE_MY_NEW_OP, arg0, 0, 0, 0);
+    (r.error as i32, r.value)
+}
+----
+
+=== 5. Add a C ABI export (optional)
+
+If C code needs to call the new operation, add a wrapper to `substrate/lib.rs`:
+
+[source,rust]
+----
+#[unsafe(no_mangle)]
+pub extern "C" fn trona_vspace_my_new_op(vspace: Cap, arg0: u64, arg1: u64) -> i32 {
+    invoke::vspace_my_new_op(vspace, arg0, arg1)
+}
+----
+
+=== 6. Update the spec
+
+Add the new label to `docs/spec/syscalls.md` (the spec file covers both syscalls and invoke labels).
+The xref:../abi/invoke-labels.adoc[Invoke Labels] page will pick up the new constant on the next docs build.
+
+=== 7. Build and verify
+
+Same as for syscalls — distclean, setup, build, run.
+Write a test in `test_runner` that calls the new wrapper.
+
+== Common pitfalls
+
+. **Forgetting to keep `kernite/src/syscall/mod.rs` and `lib/trona/uapi/consts/kernel.rs` in sync.** The two files have parallel constant definitions that meson does not enforce. If they disagree, kernite and substrate will have different ideas about which number means what, and the failure mode is "syscall returns successful nonsense".
+. **Adding a label that overlaps with an existing range.** The dispatch is `(CapType, label)` — two different cap types can share a label number, but adding the same label twice for the same cap type silently overwrites the older arm. Always check the existing range table.
+. **Returning an undocumented error code.** The error codes in `uapi/consts/kernel.rs` are exhaustively listed in xref:../abi/error-codes.adoc[Error Codes]. If you need a new error code, add it; do not return a bare `TRONA_INVALID_OPERATION` for an error that has a more specific meaning.
+. **Skipping the spec update.** `docs/spec/syscalls.md` is the prose spec that engineers reach for when they need to know how a syscall behaves. The Antora pages are auto-generated reference; they cannot replace the prose.
+. **Forgetting `just distclean`.** Adding a constant to `uapi/consts/kernel.rs` may not force a kernite recompile because of how meson dependency tracking works. When in doubt, distclean and rebuild.
+
+== What this guide does NOT cover
+
+- **New protocol labels** (server-side IPC labels in `uapi/protocol/<server>.rs`) — these only require the protocol file change plus a server-side handler. No kernel work, no substrate wrapper. The server-side documentation will eventually live alongside each server in the userland Antora component.
+- **New roles** for the cap table — these require adding a `ROLE_*` constant, regenerating `cap_table_roles.h` (automatic), updating the spawner side in init/procmgr, and adding a getter in `substrate/caps.rs`.
+- **New auxv tags** — these require touching the spawner, the rtld, and `substrate/cap_table.rs`. Substantially more involved than the syscall/invoke flow.
+- **New error codes** — single-line addition to `uapi/consts/kernel.rs` plus updating the table on xref:../abi/error-codes.adoc[Error Codes]. Trivial.
+
+For any of these, file an issue first to get the design discussion out of the way before writing the patch.
+
+== Related pages
+
+* xref:../abi/syscall-abi.adoc[Syscall ABI] — the existing 28 syscalls.
+* xref:../abi/invoke-labels.adoc[Invoke Labels] — the existing invoke labels grouped by object type.
+* xref:../substrate/syscalls.adoc[Syscall Wrappers] — the substrate file you will be editing.
+* xref:../substrate/invoke.adoc[Capability Invocation] — the other substrate file you may be editing.
+* xref:guides/reading-trona.adoc[Reading the trona Tree] — orientation guide for finding things.

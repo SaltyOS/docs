@@ -1,0 +1,163 @@
+= Error Codes
+:description: The TronaResult error space, kernel-base codes and server-extended codes, and the POSIX errno mapping principle
+
+Every syscall and capability invocation in SaltyOS returns a `TronaResult`:
+
+[source,rust]
+----
+#[repr(C)]
+pub struct TronaResult {
+    pub error: u64,   // 0 = TRONA_OK, non-zero = error code
+    pub value: u64,   // result on success; undefined on error
+}
+----
+
+The `error` field carries one of the `TRONA_*` constants documented on this page.
+`TRONA_OK = 0` is universal; any other value is an error, and the `value` field is not meaningful.
+
+This page lists every error code defined in `lib/trona/uapi/consts/kernel.rs` (kernel-base errors) and `lib/trona/uapi/consts/server.rs` (extended errors used by servers and the network stack).
+The POSIX errno values that basalt's C ABI layer maps these to are covered by xref:basalt::internals/trona-boundary.adoc[basalt: The trona boundary].
+
+== Kernel base errors (`consts/kernel.rs`)
+
+These codes are raised by `kernite` itself and by core substrate primitives.
+The low range (`0`–`15`) is dense; a sparse "second band" starts at `0x10` for file-system and memory-mapping errors and ends at `0x80` for the asynchronous-pending placeholder.
+
+=== Low range — general-purpose errors
+
+[cols="1,2,4"]
+|===
+| Code | Constant | Meaning
+
+| `0`  | `TRONA_OK`                 | Success. `value` is meaningful.
+| `1`  | `TRONA_INVALID_CAPABILITY` | The target capability slot is empty, out-of-range, or the wrong type for this operation.
+| `2`  | `TRONA_INVALID_OPERATION`  | The invoke label or IPC protocol label does not correspond to a valid operation for this object.
+| `3`  | `TRONA_INSUFFICIENT_RIGHTS`| The capability does not carry the rights bits required for this operation.
+| `4`  | `TRONA_INVALID_ARGUMENT`   | One of the scalar arguments is outside the acceptable range or has an invalid encoding.
+| `5`  | `TRONA_OUT_OF_MEMORY`      | A kernel or server allocation failed (frame alloc, slab, or CNode slot).
+| `6`  | `TRONA_NOT_FOUND`          | The requested object (name, PID, fd, slot, …) does not exist.
+| `7`  | `TRONA_BUSY`               | The target is in use and cannot be torn down or reconfigured right now.
+| `8`  | `TRONA_ALREADY_EXISTS`     | The requested name or slot is already occupied.
+| `9`  | `TRONA_WOULD_BLOCK`        | A non-blocking operation would have to wait for a resource. Returned by `SYS_NBSEND`, `posix_poll` with zero timeout, and non-blocking futex ops.
+| `10` | `TRONA_BAD_ADDRESS`        | A pointer argument is NULL, misaligned, or outside the caller's address space.
+| `11` | `TRONA_OUT_OF_RANGE`       | Numeric offset, size, or count exceeds the allowed range.
+| `12` | `TRONA_CANCELLED`          | The operation was cancelled — typically by `pthread_cancel` or a timeout.
+| `13` | `TRONA_RESTART`            | The syscall was interrupted and should be retried. This is the code `SYS_*_TIMED` variants return on timeout.
+| `14` | `TRONA_DEADLOCK`           | A recursive lock or forbidden self-lock was detected.
+| `15` | `TRONA_INTERRUPTED`        | The operation was interrupted by a signal delivered to the current thread.
+|===
+
+=== Second band — filesystem, mapping, and state errors
+
+[cols="1,2,4"]
+|===
+| Code | Constant | Meaning
+
+| `0x10` | `TRONA_IN_PROGRESS`   | A long-running operation has started but is not yet complete.
+| `0x11` | `TRONA_TOO_LARGE`     | The argument exceeds a size limit (path, filename, map size, …).
+| `0x12` | `TRONA_NOT_SUPPORTED` | The requested feature is valid but not implemented in this build.
+| `0x13` | `TRONA_READONLY`      | The target cannot be modified — read-only mount, read-only cap, or read-only page mapping.
+| `0x14` | `TRONA_NOT_DIRECTORY` | Path walk encountered a non-directory where a directory was expected.
+| `0x15` | `TRONA_IS_DIRECTORY`  | The target is a directory but a non-directory operation was requested.
+| `0x16` | `TRONA_LOOP`          | Symbolic link resolution exceeded the internal depth limit.
+| `0x17` | `TRONA_IO_ERROR`      | The underlying device or backing store returned an I/O error.
+| `0x18` | `TRONA_SLOT_OCCUPIED` | A `CNODE_COPY` / `CNODE_MOVE` / `CNODE_MINT` target slot already holds a cap.
+| `0x19` | `TRONA_ALREADY_MAPPED`| A `VSPACE_MAP` target vaddr is already mapped.
+| `0x1A` | `TRONA_ALREADY_BOUND` | The notification or endpoint is already bound to a TCB.
+| `0x80` | `TRONA_PENDING`       | A server has accepted the request and will deliver the result asynchronously. Not a failure — this is the sentinel that the split-blocking primitives (`NET_*_WAIT`) return so the client knows to wait on a completion notification.
+|===
+
+NOTE: `TRONA_IN_PROGRESS` (`0x10`) and `TRONA_TOO_LARGE` (`0x11`) happen to fall in the same numeric range as `TRONA_BAD_ADDRESS` (`10`) and `TRONA_OUT_OF_RANGE` (`11`) when printed in decimal vs hex.
+Always compare against the `TRONA_*` constants, not against raw numbers.
+
+== Extended network errors (`consts/server.rs`)
+
+These codes are used by `netsrv`, `dnssrv`, and any server that needs to report a network-specific failure.
+They live in the `21`–`32` range.
+
+[cols="1,2,4"]
+|===
+| Code | Constant | Meaning
+
+| `21` | `TRONA_CONN_REFUSED`       | `ECONNREFUSED` equivalent — connect failed because the peer actively refused.
+| `22` | `TRONA_TIMED_OUT`          | `ETIMEDOUT` — a network-level timeout expired.
+| `23` | `TRONA_DNS_NXDOMAIN`       | DNS NXDOMAIN — the name does not exist.
+| `24` | `TRONA_DNS_SERVER_FAIL`    | DNS SERVFAIL — the upstream DNS server failed to process the query.
+| `25` | `TRONA_PROTO_NOT_SUPPORTED`| `EPROTONOSUPPORT` — the requested socket type/protocol is not available.
+| `26` | `TRONA_HOST_UNREACHABLE`   | `EHOSTUNREACH`.
+| `27` | `TRONA_NET_UNREACHABLE`    | `ENETUNREACH`.
+| `28` | `TRONA_NO_BUFS`            | `ENOBUFS` — netsrv is out of internal buffer capacity.
+| `29` | `TRONA_CONN_RESET`         | `ECONNRESET` — peer reset the connection.
+| `30` | `TRONA_NOT_CONNECTED`      | `ENOTCONN` — operation requires a connected socket.
+| `31` | `TRONA_IS_CONNECTED`       | `EISCONN` — socket is already connected.
+| `32` | `TRONA_ADDR_IN_USE`        | `EADDRINUSE` — the local address is already bound.
+|===
+
+== Mapping to POSIX errno
+
+basalt's C ABI wrappers convert `TRONA_*` errors to POSIX `errno` values in the per-thread `errno` slot before returning `-1` (or the POSIX-typed error).
+The mapping is not mechanical: several `TRONA_*` codes collapse into a single `errno` value, and several `errno` values are raised only in `trona_posix` (not in substrate).
+
+[cols="2,3"]
+|===
+| TRONA code | POSIX errno (as mapped by basaltc)
+
+| `TRONA_OK`                  | (no errno)
+| `TRONA_INVALID_CAPABILITY`  | `EBADF`
+| `TRONA_INVALID_OPERATION`   | `EINVAL` or `ENOSYS` (operation vs whole syscall)
+| `TRONA_INSUFFICIENT_RIGHTS` | `EACCES`
+| `TRONA_INVALID_ARGUMENT`    | `EINVAL`
+| `TRONA_OUT_OF_MEMORY`       | `ENOMEM`
+| `TRONA_NOT_FOUND`           | `ENOENT`
+| `TRONA_BUSY`                | `EBUSY`
+| `TRONA_ALREADY_EXISTS`      | `EEXIST`
+| `TRONA_WOULD_BLOCK`         | `EAGAIN` (alias `EWOULDBLOCK`)
+| `TRONA_BAD_ADDRESS`         | `EFAULT`
+| `TRONA_OUT_OF_RANGE`        | `ERANGE`
+| `TRONA_CANCELLED`           | `ECANCELED`
+| `TRONA_RESTART`             | `EINTR` (also used for `_TIMED` timeout conversions)
+| `TRONA_DEADLOCK`            | `EDEADLK`
+| `TRONA_INTERRUPTED`         | `EINTR`
+| `TRONA_TOO_LARGE`           | `E2BIG` / `ENAMETOOLONG`
+| `TRONA_NOT_SUPPORTED`       | `ENOTSUP`
+| `TRONA_READONLY`            | `EROFS`
+| `TRONA_NOT_DIRECTORY`       | `ENOTDIR`
+| `TRONA_IS_DIRECTORY`        | `EISDIR`
+| `TRONA_LOOP`                | `ELOOP`
+| `TRONA_IO_ERROR`            | `EIO`
+| `TRONA_CONN_REFUSED`        | `ECONNREFUSED`
+| `TRONA_TIMED_OUT`           | `ETIMEDOUT`
+| `TRONA_DNS_NXDOMAIN`        | (resolved by `getaddrinfo` to `EAI_NONAME`; `errno` not set)
+| `TRONA_HOST_UNREACHABLE`    | `EHOSTUNREACH`
+| `TRONA_NET_UNREACHABLE`     | `ENETUNREACH`
+| `TRONA_NO_BUFS`             | `ENOBUFS`
+| `TRONA_CONN_RESET`          | `ECONNRESET`
+| `TRONA_NOT_CONNECTED`       | `ENOTCONN`
+| `TRONA_IS_CONNECTED`        | `EISCONN`
+| `TRONA_ADDR_IN_USE`         | `EADDRINUSE`
+| `TRONA_PENDING`             | (not an error — not mapped; clients wait for a completion notification)
+| `TRONA_PROTO_NOT_SUPPORTED` | `EPROTONOSUPPORT`
+|===
+
+The authoritative map is in basalt's `compat/freebsd/errno.rs` and the basaltc-side wrappers that invoke trona_posix.
+This table is a convenience reference; whenever it disagrees with the code, the code wins.
+
+== Design principle — one code per failure mode, not per function
+
+The trona error space is narrow by design.
+Rather than defining a unique error for every possible failure, trona collapses every failure into one of the ~40 codes above and documents per-operation semantics in the operation's own spec.
+The rationale is:
+
+- A narrow error space keeps the kernel's dispatch logic small.
+- Servers can forward errors through multiple layers without losing the original meaning.
+- Clients can make broad decisions (retryable? permission? not found?) without having to special-case every protocol label.
+
+When a server needs to report a failure that does not fit any existing code, the right move is usually to reuse the closest existing code and add a per-protocol subfield (e.g. a pre-defined `errno` returned in `value`), not to add a new global `TRONA_*` code.
+New global codes should only be added for failure modes that cross protocol boundaries — `TRONA_DNS_NXDOMAIN` is a good example because it is also handled by VFS when resolving mount paths.
+
+== Related pages
+
+* xref:abi/syscall-abi.adoc[Syscall ABI] — the `TronaResult` return contract every syscall uses.
+* xref:abi/invoke-labels.adoc[Invoke Labels] — capability invocations that return these codes.
+* xref:abi/protocol-labels.adoc[IPC Protocol Labels] — server protocols that return these codes.
+* xref:basalt::internals/trona-boundary.adoc[basalt: The trona boundary] — how C code converts these codes into POSIX `errno`.

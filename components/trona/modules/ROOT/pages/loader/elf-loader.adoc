@@ -1,0 +1,247 @@
+= ELF Loader
+:description: trona_loader/elf_loader.rs and elf_dynamic.rs — ELF64 loading with the scratch-map strategy
+
+`trona_loader::elf_loader` and `trona_loader::elf_dynamic` together implement everything needed to take a memory-mapped ELF64 file and turn it into a runnable image in another vspace.
+The two files total 1,187 lines and are consumed by `init`, `procmgr`, and the ELF rtld.
+
+[cols="1,1,3"]
+|===
+| File | Lines | Role
+
+| `loader/elf_loader.rs`  | 753 | Main ELF entry points: `elf_load`, `elf_count_load_pages`, `elf_compute_load_span`, plus the scratch-map strategy and the in-place RELATIVE relocation pass.
+| `loader/elf_dynamic.rs` | 434 | Helpers for inspecting `PT_INTERP` and the `.dynamic` section: `elf_has_interp`, `elf_get_interp`, `resolve_interp_to_cpio_path`, `elf_get_needed`.
+|===
+
+Both files are pure-Rust and `#![no_std]`.
+They link against `trona` (substrate) for IPC and capability invocation, and against `trona_posix` only for the `posix_mmap` call used by the scratch-map strategy.
+
+== The scratch-map strategy
+
+The fundamental problem the loader has to solve is: "I have a buffer of bytes that is the ELF file, and I want to install those bytes into pages mapped in another vspace, with the right protection bits."
+The naïve approach — let the destination process page-fault each page and pull the contents from somewhere — does not work because there is no userspace pager available during process startup.
+
+The strategy the loader uses is **scratch-map**:
+
+. Allocate a fresh frame from a parent untyped (via `untyped_retype`).
+. Map the frame into the **loader's own** vspace at a known scratch virtual address (`SCRATCH_VADDR = 0x0200_0000`).
+. Copy the ELF file bytes for that page into the scratch mapping.
+. Unmap the frame from the loader's vspace.
+. Map the same frame into the **destination** vspace at the target virtual address with the right protection bits.
+
+The key insight is that step 1 produces a frame capability that can be mapped into multiple vspaces simultaneously, so the loader does not need to round-trip data through any intermediate buffer beyond its own scratch mapping.
+The cost is one frame allocation, one map/unmap pair on the loader side, and one map on the destination side per page.
+
+The scratch address is fixed at `SCRATCH_VADDR = 0x0200_0000` because every loader caller (init, procmgr, rtld) reserves that single page in its own VA layout for this purpose.
+There is no concurrent loading — only one ELF can be in flight per loader thread at a time — so a single shared scratch slot is enough.
+
+== `ElfLoaderCtx` — the per-load context
+
+[source,rust]
+----
+pub struct ElfLoaderCtx {
+    pub untyped: Cap,         // source untyped to retype frames from
+    pub vspace: Cap,           // destination vspace
+    pub scratch_vaddr: u64,    // loader's scratch VA (= SCRATCH_VADDR)
+    pub frame_slot_cursor: u64, // next CNode slot to retype frames into
+    pub frame_slot_end: u64,    // one past the last available slot
+}
+----
+
+The cursor + end pair is the simplest possible slot allocator — frames are retyped one at a time until the cursor hits the end.
+Callers that need a smarter allocator (the rtld, for example) can supply a custom `alloc_frame_slot` callback through the loader's pluggable hook.
+
+== `elf_load` — the main entry point
+
+[source,rust]
+----
+pub unsafe fn elf_load(
+    data: *const u8,
+    data_len: usize,
+    load_base: u64,
+    ctx: &mut ElfLoaderCtx,
+    result: *mut ElfLoadResult,
+) -> i32;
+----
+
+The function returns one of the `ELF_*` error codes from `uapi/consts/kernel.rs`:
+
+[cols="1,2,3"]
+|===
+| Code | Constant | Meaning
+
+| 0  | `ELF_OK`            | Success
+| 1  | `ELF_NOT_ELF`       | Magic bytes wrong
+| 2  | `ELF_NOT_64BIT`     | Not ELFCLASS64
+| 3  | `ELF_NOT_LE`        | Not ELFDATA2LSB
+| 4  | `ELF_BAD_TYPE`      | Not ET_EXEC or ET_DYN
+| 5  | `ELF_BAD_ARCH`      | Wrong machine
+| 6  | `ELF_NO_LOAD`       | No PT_LOAD segments
+| 7  | `ELF_RELOC_FAILED`  | Relocation processing failed
+| 8  | `ELF_OUT_OF_MEMORY` | Frame allocation failed
+| 9  | `ELF_TOO_SMALL`     | Buffer too short
+| 11 | `ELF_MAP_FAILED`    | `vspace_map` returned an error
+|===
+
+On success, `*result` is filled with:
+
+[source,rust]
+----
+pub struct ElfLoadResult {
+    pub entry: u64,      // entry point (relocated for ET_DYN)
+    pub base: u64,       // load base
+    pub brk: u64,        // first byte after the highest mapped page
+    pub tls_offset: u64, // PT_TLS file offset
+    pub tls_filesz: u64, // PT_TLS file size
+    pub tls_memsz: u64,  // PT_TLS memory size
+    pub tls_align: u64,
+    // ... other PT_TLS metadata for static TLS layout
+}
+----
+
+The `brk` field tells the caller where the heap should start (after the highest data segment, page-aligned).
+The PT_TLS fields are what rtld feeds into the `__trona_tls_*` weak symbols documented in xref:../substrate/threads-and-workers.adoc[Threads, TLS, and Worker Pool].
+
+=== ET_EXEC vs ET_DYN
+
+The loader handles both:
+
+- **`ET_EXEC`** — fixed load address. The PT_LOAD `p_vaddr` fields are absolute. `load_base` is ignored. Used for statically-linked binaries that the linker laid out at a specific address.
+- **`ET_DYN`** — relocatable. The minimum `p_vaddr` from PT_LOAD is treated as zero, and `load_base` is the actual base where the image is placed. The delta `(load_base - min_vaddr)` is applied to entry, dyn section pointers, and to every R_RELATIVE relocation found in the image's RELA section.
+
+Most binaries shipped with SaltyOS are PIE (`ET_DYN`) because rtld randomization (via xref:../substrate/layout-and-caps.adoc[the layout planner]) needs them.
+
+=== PT_LOAD walking
+
+For each PT_LOAD program header, the loader iterates page-by-page from `p_vaddr` to `p_vaddr + p_memsz`:
+
+. Compute the offset into the source ELF data for this page (`p_offset + (page_vaddr - p_vaddr)`).
+. Allocate a fresh frame via `untyped_retype` into the next slot from the context cursor.
+. Map the frame into the loader's scratch slot.
+. If the offset is within `p_filesz`, copy that many bytes; zero-fill the rest of the page (handles `.bss`).
+. Unmap the scratch frame.
+. Map the frame into the destination vspace at `page_vaddr + delta` with protection bits derived from the segment's `p_flags` (`PF_R`, `PF_W`, `PF_X`).
+
+The relocation pass runs after every PT_LOAD has been mapped, walking the destination's RELA section through the loader's scratch map (so the loader can write directly to pages it does not own).
+
+== `elf_count_load_pages` and `elf_compute_load_span`
+
+Two helpers callers use to plan ahead:
+
+[source,rust]
+----
+pub unsafe fn elf_count_load_pages(data: *const u8, data_len: usize) -> usize;
+pub unsafe fn elf_compute_load_span(data: *const u8, data_len: usize) -> u64;
+----
+
+`elf_count_load_pages` walks the program headers and counts how many 4 KiB pages all the PT_LOAD segments would consume.
+The caller uses this to size its frame slot allocation before calling `elf_load`.
+
+`elf_compute_load_span` returns `max(p_vaddr + p_memsz) - min(p_vaddr)` — the contiguous virtual address range the image occupies.
+The xref:../substrate/layout-and-caps.adoc[VA layout planner] uses this to know how much space to reserve for the executable region in `VmLayoutPlan`.
+
+== Frame allocation hook
+
+By default, `elf_load` allocates frames by retyping the cursor slot in the loader context.
+Callers that want a different policy install a custom callback:
+
+[source,rust]
+----
+pub type FrameAllocFn = unsafe fn(ctx: *mut ()) -> Cap;
+
+pub unsafe fn elf_load_with_alloc(
+    data: *const u8,
+    data_len: usize,
+    load_base: u64,
+    ctx: &mut ElfLoaderCtx,
+    alloc_fn: Option<FrameAllocFn>,
+    alloc_state: *mut (),
+    result: *mut ElfLoadResult,
+) -> i32;
+----
+
+`init` uses this to allocate frames from a different untyped pool depending on whether the loaded image is the kernel-spawned init itself or a child being spawned by procmgr.
+
+The internal default allocator also has a `try_retype_frame_any_untyped(ctx, frame_slot)` helper that scans `[CAP_UNTYPED_START, CAP_UNTYPED_END)` for a usable untyped — used for fallback when the cursor approach fails.
+
+== `elf_dynamic.rs` — interpreter and DT_NEEDED
+
+The dynamic section helpers exist because the rtld needs to inspect a candidate executable's interpreter and dependencies before invoking the loader proper.
+
+=== `elf_has_interp` and `elf_get_interp`
+
+[source,rust]
+----
+pub unsafe fn elf_has_interp(data: *const u8, data_len: usize) -> bool;
+pub unsafe fn elf_get_interp(data: *const u8, data_len: usize) -> *const u8;
+----
+
+Walk the program headers; return `true` / a string pointer if a `PT_INTERP` segment exists.
+The string is the path to the interpreter — typically `/lib/ld-trona.so`.
+
+=== `resolve_interp_to_cpio_path`
+
+[source,rust]
+----
+pub unsafe fn resolve_interp_to_cpio_path(
+    interp: *const u8,
+    dst: *mut u8,
+) -> usize;
+----
+
+Convert a Unix-style absolute path like `/lib/ld-trona.so` into the CPIO archive entry name `lib/ld-trona.so` (no leading slash).
+Handles three input shapes:
+
+- `/lib/ld-trona.so` → `lib/ld-trona.so`
+- `lib/ld-trona.so` → unchanged
+- `ld-trona.so` (bare name) → `lib/ld-trona.so` (default `lib/` prefix)
+
+Returns the length written to `dst`, or 0 on failure.
+The maximum output length is small (the `lib/` prefix plus a filename).
+
+This is needed because procmgr looks up the interpreter binary in the initrd CPIO archive, which uses CPIO-relative names.
+
+=== `elf_get_needed`
+
+[source,rust]
+----
+pub struct NeededLibs {
+    pub count: u8,
+    pub names: [[u8; 24]; 12],  // up to 12 libraries, 24-byte names
+}
+
+pub unsafe fn elf_get_needed(data: *const u8, data_len: usize) -> NeededLibs;
+----
+
+Walk the `.dynamic` section's `DT_NEEDED` entries and copy the library names into a fixed-size struct.
+Returns up to 12 libraries with names up to 23 bytes each (the 24th byte is the NUL terminator).
+
+The 12-and-24 limits are deliberately small — SaltyOS dynamic binaries link against `libtrona.so` and `libc.so` (basaltc) and rarely much else.
+A binary that needs more or longer names triggers a load failure that the rtld reports up.
+
+=== `build_initrd_lib_path`
+
+[source,rust]
+----
+pub unsafe fn build_initrd_lib_path(soname: *const u8, dst: *mut u8) -> usize;
+----
+
+Helper that prepends `lib/` to a soname and writes it into a buffer.
+Used internally by `resolve_interp_to_cpio_path` and by callers that need to build CPIO paths for libraries discovered through `elf_get_needed`.
+
+== What `elf_loader` does NOT do
+
+A few things deliberately sit outside the loader:
+
+- **Symbol resolution.** The loader does not look at symbol tables. The rtld does that after the binary is loaded.
+- **PLT relocations.** Only `R_RELATIVE` relocations run inside the loader (because they are needed to make the binary's own pointer tables consistent before any other code runs). PLT and GOT relocations are deferred to rtld.
+- **Auxv vector construction.** The loader returns an `ElfLoadResult` with the entry point and metadata; the caller (procmgr) builds the auxv vector and writes it to the new process's stack.
+- **Permission checks.** The caller must verify it has permission to load this binary via `VFS_POSIX_STAT_FOR_EXEC` before invoking the loader.
+
+These factorings keep the loader narrow enough to be auditable and let it serve all three callers (init, procmgr, rtld) with the same code path.
+
+== Related pages
+
+* xref:loader/pe-and-cpio.adoc[PE Loader and CPIO Archive] — the sister modules in the same crate.
+* xref:../rtld/elf-rtld.adoc[ELF Dynamic Linker] — the biggest consumer of `elf_loader.rs` and `elf_dynamic.rs`.
+* xref:../substrate/layout-and-caps.adoc[VA Layout and Capability Table] — uses `elf_compute_load_span` to plan VA layout.
+* xref:../abi/invoke-labels.adoc[Invoke Labels] — the `untyped_retype` and `vspace_map` operations the loader uses.

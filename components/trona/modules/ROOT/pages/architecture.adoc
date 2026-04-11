@@ -1,0 +1,237 @@
+= Architecture
+:description: The crate structure of trona, the 18 substrate modules, and the dependency direction between substrate, uapi, posix, loader, rtld, and the Win32 pieces
+
+== The trona tree at a glance
+
+[cols="1,1,3"]
+|===
+| Directory | Lines | Role
+
+| `lib/trona/substrate/` | 8,875 | `trona` crate — kernel ABI, IPC, invoke, sync, TLS, slot alloc, layout, worker pool
+| `lib/trona/uapi/` | 2,475 | Shared kernel↔userland sources (no crate; included via `include!`)
+| `lib/trona/posix/` | 6,927 | `trona_posix` crate — POSIX-shaped Rust client + `fork.S` trampolines
+| `lib/trona/loader/` | 2,679 | `trona_loader` crate — ELF64 / PE32+ / CPIO newc loaders
+| `lib/trona/win32/` | 2,417 | `kernel32_pe.c` (built as PE/COFF) + Rust source that is present but not wired to any build target
+| `lib/trona/rtld/` | 4,209 | Two freestanding C dynamic linkers — `ld-trona.so` (ELF) and `ld-trona-pe.so` (PE)
+| `lib/trona/arch/` | 56 | `libtrona.ld` linker scripts per architecture
+|===
+
+Three of those directories produce Rust crates that get merged into `libtrona.so`; the rest produce independent binaries (`ld-trona.so`, `ld-trona-pe.so`, `kernel32.dll`) or are consumed verbatim via `include!`.
+
+== The three crates that make libtrona.so
+
+[source]
+----
+              ┌──────────────────────────────────┐
+              │        libtrona.so (PIC DSO)     │
+              │                                  │
+              │  libtrona.o        ← trona       │
+              │  libtrona_posix.o  ← trona_posix │
+              │  libtrona_loader.o ← trona_loader│
+              │  fork.o            ← fork.S      │
+              │  libcore.o         ← Rust core   │
+              │  libcompiler_builtins.o          │
+              └──────────────────────────────────┘
+                       ▲
+                       │   include! (verbatim)
+                       │
+              ┌──────────────────────────────────┐
+              │        lib/trona/uapi/           │
+              │   consts/  protocol/  types/     │
+              └──────────────────────────────────┘
+----
+
+The dependency direction inside `libtrona.so` is strict:
+
+[source]
+----
+uapi ──include!──> trona (substrate)
+                     ▲
+                     │ extern crate
+                     │
+                     ├── trona_posix
+                     │
+                     └── trona_loader
+----
+
+- `trona_posix` declares `extern crate trona;` and consumes substrate's IPC, invoke, and types modules.
+- `trona_loader` declares `extern crate trona;` and `extern crate trona_posix;` because parts of the loader (notably the scratch-map strategy) call `posix_mmap` via substrate IPC.
+- Nothing in substrate depends on `trona_posix` or `trona_loader`. Substrate is the leaf.
+
+== substrate — the 18 modules
+
+`substrate/lib.rs` declares exactly 18 `pub mod`:
+
+[cols="1,1,3"]
+|===
+| Module | Lines | Purpose
+
+| `syscall` | 196 | Inline-assembly syscall wrapper. Single polymorphic `syscall(num, a0..a5) → TronaResult` plus dedicated helpers for `futex_wait` / `futex_wake` / `sys_getrandom` / `sys_shutdown` / timed variants.
+| `ipc` | 483 | The nine IPC primitives (`send`, `recv`, `call`, `reply_recv`, `nbsend`, plus their `_any` and `_timed` variants), `TronaMsg` / `IpcContext` / `IpcBuffer`, seL4-style msginfo encoding, capability staging for cross-call transfer.
+| `invoke` | 689 | Typed capability invocation helpers grouped by object type (CNode, Untyped, TCB, VSpace, IRQ, IoPort, SchedContext, MemoryObject). Every helper calls `syscall(SYS_INVOKE, cap, label, ...)` under the hood.
+| `consts` | 17 | Pure re-export shim: `include!` from `uapi/consts/{kernel,posix,server}.rs`.
+| `protocol` | 40 | Pure re-export shim: `include!` from `uapi/protocol/{vfs,procmgr,mmsrv,namesrv,posix,win32,server,rsrcsrv}.rs`.
+| `types` | 16 | Pure re-export shim: `include!` from `uapi/types/{core,pe,posix}.rs`.
+| `serial` | 260 | Diagnostic serial output. `LineBuf` atomic accumulator, the `uinfo!` / `udebug!` / `uwarn!` / `uerror!` macros gated by `ulog_*` cfgs.
+| `slot_alloc` | 729 | Multi-segment bump allocator for CNode slots, with a global spinlock, `SlotResult` enum, and an async CSpace expansion protocol driven by a notification from procmgr.
+| `framebuffer` | 59 | One function — `read_framebuffer_info()` — reads the kernel boot info page at `BOOTINFO_VADDR` and returns a `FramebufferInfo` struct for the console driver.
+| `layout` | 456 | Child process VA and CSpace layout planner. Computes `VmLayoutPlan` (IPC buffer, ELF code, stack, initrd, mmap) and `TronaCspaceLayoutV1` (alloc / recv / expand slot ranges) based on a `CspaceLayoutProfile`.
+| `cap_table` | 312 | Startup capability table. Builder used by procmgr; reader used by rtld to walk the role → slot table from `AT_TRONA_CAP_TABLE` and populate the weak-symbol cap slots in substrate.
+| `caps` | 126 | Safe getters (`procmgr_ep()`, `vfs_ep()`, `mmsrv_ep()`, …) over the `__trona_cap_*` weak symbols that rtld fills in at startup.
+| `sync` | 1,150 | Futex-based synchronization primitives — `Mutex` (with normal / recursive / errorcheck flavors), `Condvar`, `RWLock`, `Barrier`, `Semaphore`, `Once`, `TypedMutex<T>`. Each acquire path does CAS → bounded spin → `futex_wait`.
+| `tls` | 788 | Thread-local storage and thread identity. `ThreadDesc` pool, per-thread `IpcContext`, `ThreadLocalBlock` layout, static TLS initialization hooks that rtld feeds via `__trona_tls_*` weak symbols.
+| `worker` | 1,094 | Worker thread pool and event loop used by every SaltyOS server — `run_workers()`, per-worker state, timeout hooks, current-worker accessor.
+| `pending` | 206 | `PendingRequest` table for asynchronous server work (request id, wait reason, saved reply cap, client badge), shared by the worker pool.
+| `casefold` | 84 | Character case folding entry points used by basaltc's locale layer.
+| `casefold_table` | 1,471 | Unicode case folding lookup table. Generated from `tools/data/CaseFolding-15.1.txt` by `tools/gen_casefold.py` — pure data, not manually edited.
+|===
+
+== Module groupings
+
+The 18 modules cluster into seven logical groups. The groups match the page layout of the xref:substrate/index.adoc[substrate Overview] and the rest of the substrate section.
+
+[cols="1,3"]
+|===
+| Group | Modules
+
+| Kernel entry (syscall + IPC + invoke) | `syscall`, `ipc`, `invoke`
+| UAPI shims | `consts`, `protocol`, `types`
+| Capability allocation and lookup | `slot_alloc`, `caps`, `cap_table`
+| Synchronization | `sync`
+| Threads, TLS, server event loop | `tls`, `worker`, `pending`
+| Layout and environment | `layout`, `framebuffer`
+| Diagnostics and data tables | `serial`, `casefold`, `casefold_table`
+|===
+
+Everything that is not a shim produces a clear artifact in the `__trona_*` C ABI surface exported by `substrate/lib.rs`, which is how C code (basaltc, rtld's own symbol exports, and freestanding init tasks) talks to substrate.
+
+== trona_posix — 13 files that delegate to substrate
+
+`trona_posix` is a flat crate — no subdirectories beyond `arch/` for the per-architecture `fork.S`.
+
+[cols="1,1,3"]
+|===
+| File | Lines | Purpose
+
+| `lib.rs` | 644 | Module declarations, global signal state (`__sig_handlers`, `__sig_blocked_mask`, `__sig_sa_mask`, `__sig_sa_flags`), C ABI exports, re-exports from `trona::consts` and `trona::types`.
+| `pthread.rs` | 965 | POSIX thread lifecycle — `pthread_create`, `pthread_join`, `pthread_exit`, `pthread_detach`, deferred cancellation, per-thread TLS allocation, PM_THREAD_* calls to procmgr.
+| `proc.rs` | 892 | Process management — `posix_fork` (via fork trampoline), `posix_execve`, `posix_waitpid`, `posix_exit`, uid / gid / pid accessors, `clock_gettime`, `nanosleep`.
+| `file.rs` | 753 | File I/O — `posix_open` / `posix_close` / `posix_read` / `posix_write` / `posix_stat` / `posix_fstat` / `posix_lseek` / `posix_chmod` / `posix_ftruncate`, with automatic bulk-SHM transfer for payloads larger than the IPC register window.
+| `socket.rs` | 731 | Sockets — `posix_socket`, `posix_bind`, `posix_listen`, `posix_accept`, `posix_connect`, `posix_send*` / `posix_recv*`, `posix_sendmsg` / `posix_recvmsg`, socket options, epoll surface.
+| `misc.rs` | 587 | Miscellaneous — `umask`, `uname`, `fcntl`, `isatty`, `ioctl`, `chdir`, `getcwd`, `tcgetattr` / `tcsetattr`, `shm_open` / `shm_unlink`.
+| `at.rs` | 441 | `*at()` family — `posix_openat`, `posix_fstatat`, `posix_unlinkat`, `posix_renameat`, `posix_symlinkat`, `posix_linkat`, `posix_faccessat`, `posix_fchmodat`.
+| `dns.rs` | 394 | DNS client — `dns_resolve`, `posix_getaddrinfo`, `posix_gethostbyname`, `dns_reverse_lookup`, `dns_cache_flush`. Talks to `dnssrv` through a cached endpoint resolved via `namesrv`.
+| `signals.rs` | 386 | POSIX signals — `posix_sigaction`, `posix_sigprocmask`, `posix_kill`, `posix_sigsuspend`, `posix_raise`, and the signal delivery glue (`posix_sigcheck` + `__signal_dispatcher`).
+| `poll.rs` | 207 | Multiplexing — `posix_poll`, `posix_select`, `posix_epoll_create`, `posix_epoll_ctl`, `posix_epoll_wait`.
+| `bulk.rs` | 206 | Internal-only bulk SHM transfer path used by `file.rs` and `socket.rs` when a payload exceeds the IPC register budget.
+| `mm.rs` | 190 | Memory management — `posix_brk`, `posix_sbrk`, `posix_mmap`, `posix_munmap`, `posix_mprotect`, `posix_msync`. Delegates to `mmsrv` for both anonymous and file-backed paths.
+| `pipe.rs` | 123 | Pipes and descriptor duplication — `posix_pipe`, `posix_pipe2`, `posix_dup`, `posix_dup2`, `posix_dup3`, `posix_mkfifo`.
+| `tls.rs` | 110 | POSIX-facing TLS accessors — `current_tls()`, `current_errno()`, `init_main_thread_tls()`, and a `tls_addr(module_id, offset)` entry for the General Dynamic TLS model.
+|===
+
+Plus `posix/arch/x86_64/fork.S` (154 lines) and `posix/arch/aarch64/fork.S` (129 lines) — the assembly fork trampolines covered in xref:internals/fork-and-linker-scripts.adoc[fork.S and Linker Scripts].
+
+== trona_loader — six files
+
+[cols="1,1,3"]
+|===
+| File | Lines | Purpose
+
+| `lib.rs` | 21 | Module declarations and `#![no_std]` / `extern crate trona;` / `extern crate trona_posix;` plumbing.
+| `elf_loader.rs` | 753 | ELF64 loader — scratch-map strategy, ET_EXEC and ET_DYN (PIE) support, in-place RELATIVE relocations, frame allocation by scanning untyped capabilities.
+| `elf_dynamic.rs` | 434 | Helpers to inspect PT_INTERP and DT_NEEDED, plus `resolve_interp_to_cpio_path` which turns a `/lib/ld-trona.so` interpreter string into a CPIO archive path.
+| `pe_loader.rs` | 1,067 | PE32+ loader — DOS / PE / optional header validation, section loading, `IMAGE_REL_BASED_DIR64` base relocations, import directory walk, callback-based IAT population.
+| `pe_types.rs` | 10 | Re-exports `DosHeader`, `CoffHeader`, `OptionalHeader64`, `SectionHeader`, `ImportDescriptor`, `BaseRelocation`, `PeLoadResult` from `trona::types::pe`.
+| `cpio.rs` | 394 | CPIO newc (magic `070701`) archive parser — `cpio_find_file`, `cpio_next`, `cpio_archive_size`. Used by rtld and by init to pull binaries out of the initrd.
+|===
+
+A second CPIO parser lives in kernite (`kernite/src/cpio.rs`).
+The two are intentionally separate: the kernel parser runs before memory management is initialized and cannot share code with userspace, while the loader parser runs in a normal userland context and uses `u64` / `usize` from `core`.
+
+== rtld — two freestanding C linkers
+
+`lib/trona/rtld/` contains two completely independent dynamic linkers.
+Neither one links against `libtrona.so` (they are what actually loads libtrona), so both are built freestanding — no libc, inline syscalls, and their own self-contained ELF or PE parsers.
+
+[cols="1,3"]
+|===
+| Subtree | Contents
+
+| `rtld/elf/`
+| Five C source files (`rtld_main.c`, `rtld_elf.c`, `rtld_symbol.c`, `rtld_reloc.c`, plus the 772-line `rtld_internal.h` that bundles ELF types, inline-syscall wrappers, the CPIO parser, and the `link_map` struct) and an arch subtree with `rtld.ld`, `rtld_reloc_types.h`, `rtld_syscall.h`, and the assembly PLT resolver `rtld_resolve.S`. Produces `ld-trona.so`.
+
+| `rtld/pe/`
+| `rtld_pe_main.c` (844 lines) and the shared `rtld_pe_internal.h`. Reuses the syscall macros from `rtld/elf/arch/*/rtld_syscall.h`. Produces `ld-trona-pe.so`. Used as the interpreter for PE binaries — it does **not** coexist with the ELF rtld in the same process.
+|===
+
+xref:rtld/elf-rtld.adoc[The ELF rtld page] walks through the full initialization sequence; xref:rtld/pe-rtld.adoc[the PE rtld page] does the same for the shorter PE path.
+
+== kernel32.dll and the trona_win32 Rust source
+
+The `lib/trona/win32/` directory contains two kinds of code that are easy to confuse:
+
+`kernel32_pe.c` (1,503 lines, C)::
+A real PE/COFF Windows DLL built by `clang --target=<arch>-w64-windows-gnu` and linked with `lld-link -dll -def:kernel32_pe.def`.
+It exports the Win32 API surface (`CreateFileA`, `ReadFile`, `WriteFile`, `GetStdHandle`, `WriteConsoleA` / `WriteConsoleW`, `ExitProcess`, `GetLastError`, …) that PE binaries import.
+This is the single artifact that PE binaries on SaltyOS actually link against at runtime.
+
+`lib.rs`, `console.rs`, `handle.rs`, `error.rs`, `process.rs`, `crt.rs`, `paths.rs`, `protocol.rs` (914 lines, Rust)::
+A Rust crate declared as `trona_win32` with a complete module tree and detailed doc comments.
+It is **not currently built** by any `meson.build` target — neither `lib/trona/meson.build` nor any userland `meson.build` compiles these files.
+The code is present as design intent for a future Rust-side Win32 layer and is documented on xref:win32/index.adoc[the trona_win32 overview page] under that framing.
+
+For the currently shipping PE pipeline, the only code that matters is `kernel32_pe.c` + `kernel32_pe.def`, which is documented in xref:win32/kernel32-stub.adoc[kernel32.dll PE Stub].
+
+== uapi — the kernel↔userland contract
+
+`lib/trona/uapi/` is **not a crate**.
+It is a tree of `.rs` files pulled into substrate verbatim by `substrate/consts.rs`, `substrate/protocol.rs`, and `substrate/types.rs` using the `include!` macro.
+
+[source]
+----
+uapi/
+├── README.md           ← stability notes
+├── meson.build         ← install-only, no compilation
+├── consts/
+│   ├── kernel.rs       ← syscall numbers, invoke labels, error codes, auxv tags, roles, object types
+│   ├── posix.rs        ← O_*, S_*, AF_*, POLL*, SIG*, etc.
+│   └── server.rs       ← server-side extended errors, spawn policy flags
+├── protocol/
+│   ├── vfs.rs          ← VFS server IPC labels
+│   ├── procmgr.rs      ← Process manager IPC labels
+│   ├── mmsrv.rs        ← Memory manager IPC labels
+│   ├── namesrv.rs      ← Name service IPC labels (currently minimal)
+│   ├── posix.rs        ← POSIX personality shared labels
+│   ├── win32.rs        ← Win32 personality labels
+│   ├── server.rs       ← Generic server / driver labels
+│   └── rsrcsrv.rs      ← Resource server labels
+└── types/
+    ├── core.rs         ← TronaResult, TronaMsg, IpcBuffer, cap layout descriptors, ELF types
+    ├── posix.rs        ← POSIX-facing #[repr(C)] types (PosixStat, SigAction, SockAddr, RLimit, …)
+    └── pe.rs           ← PE/COFF headers used by the loader and PE rtld
+----
+
+Because uapi is not compiled on its own, its headers never produce object files: every uapi definition that matters is baked into `libtrona.o` via the substrate `include!` shims.
+This means adding a syscall number only touches `uapi/consts/kernel.rs` and the kernite side — substrate picks it up on the next build automatically.
+
+The xref:abi/syscall-abi.adoc[Syscall ABI], xref:abi/invoke-labels.adoc[Invoke Labels], xref:abi/protocol-labels.adoc[IPC Protocol Labels], and xref:abi/error-codes.adoc[Error Codes] pages are the reader-facing references over this tree.
+
+== Architecture-specific pieces
+
+The substrate crate has no architecture subdirectories at all.
+Every arch-specific decision (register assignment for syscalls, size of the fork-trampoline save area, SIMD feature flags) is made by inline `cfg(target_arch = "x86_64")` / `cfg(target_arch = "aarch64")` blocks or by the build system passing different `--cfg` flags.
+
+The only files that are physically per-architecture are:
+
+- `lib/trona/posix/arch/x86_64/fork.S` (154 lines) and `lib/trona/posix/arch/aarch64/fork.S` (129 lines) — the fork trampoline, documented in xref:internals/fork-and-linker-scripts.adoc[fork.S and Linker Scripts].
+- `lib/trona/arch/x86_64/libtrona.ld` and `lib/trona/arch/aarch64/libtrona.ld` — the linker scripts used when producing `libtrona.so`.
+- `lib/trona/rtld/elf/arch/x86_64/` and `lib/trona/rtld/elf/arch/aarch64/` — the per-arch rtld helpers (`rtld.ld`, `rtld_reloc_types.h`, `rtld_syscall.h`, `rtld_resolve.S`).
+- `lib/trona/rtld/pe/arch/x86_64/` and `lib/trona/rtld/pe/arch/aarch64/` — the matching linker scripts for the PE rtld.
+
+Everything else is architecture-neutral Rust, branched inline via `cfg`.
+
+== Related pages
+
+* xref:build-system.adoc[Build System] — how the three crates, `fork.o`, the rtld binaries, and `kernel32.dll` all get produced.
+* xref:substrate/index.adoc[substrate Overview] — module-by-module walk through the 18 files in `substrate/`.
+* xref:guides/reading-trona.adoc[Reading the trona Tree] — a source-tree tour aimed at first-time contributors.

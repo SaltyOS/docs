@@ -1,0 +1,666 @@
+= IPC Protocol Labels
+:description: Reference for every IPC protocol label defined under lib/trona/uapi/protocol/, grouped by server
+
+Every `SYS_CALL` or `SYS_SEND` that targets a server endpoint carries a 40-bit **label** in the message info word.
+The label tells the server which operation is being requested.
+This page is the full reference for the labels defined under `lib/trona/uapi/protocol/`, organized by server.
+
+All eight files are included verbatim into substrate via `substrate/protocol.rs`, so every call site sees the same numeric constants at compile time:
+
+[source,rust]
+----
+pub mod vfs     { include!("../uapi/protocol/vfs.rs"); }
+pub mod procmgr { include!("../uapi/protocol/procmgr.rs"); }
+pub mod mmsrv   { include!("../uapi/protocol/mmsrv.rs"); }
+pub mod namesrv { include!("../uapi/protocol/namesrv.rs"); }
+pub mod posix   { include!("../uapi/protocol/posix.rs"); }
+pub mod win32   { include!("../uapi/protocol/win32.rs"); }
+pub mod server  { include!("../uapi/protocol/server.rs"); }
+pub mod rsrcsrv { include!("../uapi/protocol/rsrcsrv.rs"); }
+----
+
+This page only documents the label numbers and roles.
+For the wire format of individual operations, see the server-specific documentation — `docs/spec/` in the saltyos tree is the eventual landing place for that detail.
+
+== VFS server — `vfs.rs`
+
+The VFS server owns the file descriptor table and every file-like object: regular files, directories, sockets, pipes, SHM objects, and poll/epoll sets.
+
+=== Core file I/O
+
+[cols="1,3"]
+|===
+| Label | Operation
+
+| `1` `VFS_POSIX_OPEN`
+| Open a path, return a file descriptor.
+
+| `2` `VFS_READ`
+| Read from an fd into an inline IPC buffer region.
+
+| `3` `VFS_WRITE`
+| Write an inline buffer to an fd.
+
+| `4` `VFS_CLOSE`
+| Close an fd.
+
+| `5` `VFS_POSIX_STAT`
+| `stat(path)` — fill a `PosixStat` struct.
+
+| `6` `VFS_LSEEK`
+| Seek within an fd.
+
+| `7` `VFS_POSIX_FSTAT`
+| `fstat(fd)` — stat via fd.
+
+| `8` `VFS_POSIX_ACCESS`
+| Check access permissions on a path.
+
+| `9` `VFS_POSIX_UNLINK`
+| Remove a file or directory entry.
+
+| `10` `VFS_POSIX_RENAME`
+| Rename a path.
+
+| `11` `VFS_POSIX_MKDIR`
+| Create a directory.
+
+| `12` `VFS_POSIX_RMDIR`
+| Remove an empty directory.
+
+| `13` `VFS_POSIX_OPENDIR`
+| Open a directory for enumeration.
+
+| `14` `VFS_POSIX_READDIR`
+| Read the next directory entry.
+
+| `15` `VFS_POSIX_LSTAT`
+| `lstat(path)` — stat without following a terminal symlink.
+
+| `16` `VFS_POSIX_POLL`
+| Multiplex fd readiness.
+
+| `17` `VFS_POSIX_SHM_OPEN`
+| `shm_open(name)` — open or create a POSIX shared memory object.
+
+| `18` `VFS_POSIX_SHM_UNLINK`
+| `shm_unlink(name)`.
+
+| `19` `VFS_POSIX_FTRUNCATE`
+| Truncate an fd to a given size.
+|===
+
+=== Sockets
+
+[cols="1,3"]
+|===
+| Label | Operation
+
+| `20` `VFS_POSIX_SOCKET`       | `socket(domain, type, protocol)`.
+| `21` `VFS_POSIX_BIND`         | `bind(fd, sockaddr, addrlen)`.
+| `22` `VFS_POSIX_LISTEN`       | `listen(fd, backlog)`.
+| `23` `VFS_POSIX_ACCEPT`       | `accept(fd, &addr, &addrlen)`.
+| `24` `VFS_POSIX_CONNECT`      | `connect(fd, sockaddr, addrlen)`.
+| `25` `VFS_POSIX_SENDMSG`      | `sendmsg(fd, msghdr, flags)`.
+| `26` `VFS_POSIX_RECVMSG`      | `recvmsg(fd, msghdr, flags)`.
+| `27` `VFS_POSIX_SOCKPAIR`     | Create a socket pair.
+| `28` `VFS_POSIX_SHUTDOWN`     | Shut down one or both directions of a socket.
+| `66` `VFS_POSIX_GETSOCKNAME`  | Local address of a socket.
+| `67` `VFS_POSIX_GETPEERNAME`  | Remote address of a connected socket.
+| `68` `VFS_POSIX_SETSOCKOPT`   | Set a socket option.
+| `69` `VFS_POSIX_GETSOCKOPT`   | Get a socket option.
+|===
+
+=== Pipes, descriptors, and fd table
+
+[cols="1,3"]
+|===
+| Label | Operation
+
+| `29` `VFS_POSIX_PIPE`       | Create an anonymous pipe pair.
+| `30` `VFS_POSIX_DUP`        | `dup(oldfd)`.
+| `31` `VFS_POSIX_DUP2`       | `dup2(oldfd, newfd)`.
+| `32` `VFS_POSIX_CLONE_FDS`  | Clone a subset of the fd table into a child CNode.
+| `33` `VFS_POSIX_IOCTL`      | Generic `ioctl` passthrough.
+| `43` `VFS_POSIX_DUP3`       | `dup3(oldfd, newfd, flags)` with O_CLOEXEC.
+| `44` `VFS_POSIX_MKFIFO`     | Create a named pipe.
+|===
+
+Labels `34` and `35` were moved to `protocol/posix.rs` (as `VFS_POSIX_ISATTY` and `VFS_POSIX_FCNTL`) because they are POSIX personality-only operations — see `posix.rs` below.
+Labels `45` and `46` were removed when mmap ownership moved from VFS to mmsrv; the numbers are retired.
+
+=== Directory and path operations
+
+[cols="1,3"]
+|===
+| Label | Operation
+
+| `36` `VFS_POSIX_CHDIR`  | `chdir(path)`.
+| `37` `VFS_POSIX_GETCWD` | `getcwd()`.
+| `38` `VFS_POSIX_TCGETATTR` | `tcgetattr(fd)` — TTY attributes read.
+| `39` `VFS_POSIX_TCSETATTR` | `tcsetattr(fd, ...)` — TTY attributes write.
+|===
+
+=== `*at()` family
+
+[cols="1,3"]
+|===
+| Label | Operation
+
+| `47` `VFS_POSIX_OPENAT`    | `openat(dirfd, path, flags, mode)`.
+| `48` `VFS_POSIX_FSTATAT`   | `fstatat(dirfd, path, &stat, at_flags)`.
+| `49` `VFS_POSIX_UNLINKAT`  | `unlinkat(dirfd, path, at_flags)`.
+| `50` `VFS_POSIX_RENAMEAT`  | `renameat(olddirfd, oldpath, newdirfd, newpath)`.
+| `51` `VFS_POSIX_MKDIRAT`   | `mkdirat(dirfd, path, mode)`.
+| `52` `VFS_POSIX_FACCESSAT` | `faccessat(dirfd, path, mode, at_flags)`.
+| `53` `VFS_POSIX_FCHMODAT`  | `fchmodat(dirfd, path, mode, at_flags)`.
+| `54` `VFS_POSIX_FCHOWNAT`  | `fchownat(dirfd, path, uid, gid, at_flags)`.
+| `55` `VFS_POSIX_LINKAT`    | `linkat(olddirfd, oldpath, newdirfd, newpath, flags)`.
+| `56` `VFS_POSIX_SYMLINKAT` | `symlinkat(target, dirfd, linkpath)`.
+| `57` `VFS_POSIX_READLINKAT`| `readlinkat(dirfd, path, &buf, bufsiz)`.
+| `58` `VFS_POSIX_UTIMENSAT` | `utimensat(dirfd, path, times, flags)`.
+| `59` `VFS_POSIX_FCHMOD`    | `fchmod(fd, mode)`.
+| `60` `VFS_POSIX_FCHOWN`    | `fchown(fd, uid, gid)`.
+|===
+
+=== Epoll
+
+[cols="1,3"]
+|===
+| Label | Operation
+
+| `40` `VFS_POSIX_EPOLL_CREATE` | Create an epoll fd.
+| `41` `VFS_POSIX_EPOLL_CTL`    | Add / modify / delete an epoll entry.
+| `42` `VFS_POSIX_EPOLL_WAIT`   | Wait for epoll events.
+|===
+
+=== Bulk I/O, pagers, and administrative operations
+
+[cols="1,3"]
+|===
+| Label | Operation
+
+| `61` `VFS_CLIENT_EXIT`  | Client notifies VFS it is exiting so the fd table and poll sets can be reaped.
+| `62` `VFS_PREAD`        | Positional read.
+| `63` `VFS_PWRITE`       | Positional write.
+| `64` `VFS_BULK_SETUP`   | Prepare a shared-memory region for bulk I/O larger than the IPC register window.
+| `65` `VFS_BULK_READ`    | Bulk read into the shared region.
+| `72` `VFS_BULK_PWRITE`  | Bulk positional write.
+| `70` `VFS_BACKEND_PAGER_READ`      | Pager-side read: mmsrv asks VFS to fill a backing page.
+| `71` `VFS_BACKEND_PAGER_WRITE`     | Pager-side write-back.
+| `73` `VFS_BACKEND_RESOLVE_BACKING` | Resolve an fd into a backing file / mount / device descriptor for mmsrv to page against.
+| `75` `VFS_DUMP_PENDING` | Debug dump of pending VFS requests.
+|===
+
+=== Multi-user, xattr, mount, and system operations
+
+[cols="1,3"]
+|===
+| Label | Operation
+
+| `76` `VFS_POSIX_STAT_FOR_EXEC` | Stat + permission check used by `exec()` to validate the interpreter.
+| `77` `VFS_FSYNC`               | Flush file data to backing storage.
+| `78` `VFS_GETXATTR`            | Read an extended attribute.
+| `79` `VFS_SETXATTR`            | Write an extended attribute.
+| `80` `VFS_REMOVEXATTR`         | Remove an extended attribute.
+| `81` `VFS_LISTXATTR`           | List extended attribute names.
+| `82` `VFS_MOUNT`               | Mount a filesystem.
+| `83` `VFS_UMOUNT`              | Unmount a filesystem.
+| `84` `VFS_PIVOT_ROOT`          | `pivot_root(new_root, put_old)`.
+| `85` `VFS_CLIENT_REGISTER`     | Personality registration — carries subsystem ID.
+| `86` `VFS_SYSCTL`              | Generic sysctl read/write.
+| `87` `VFS_POSIX_CANON_PATH`    | Canonicalize a path for `exec()`.
+| `88` `VFS_WIN32_OPEN`          | Windows-shaped open carrying `dwDesiredAccess`, `dwShareMode`, `dwCreationDisposition`, `dwFlagsAndAttributes`. Used so VFS can perform proper share-mode arbitration without a lossy POSIX translation.
+| `89` `VFS_POSIX_UNSHARE`       | `unshare(flags)` — mount-namespace operations.
+|===
+
+The VFS label space is by far the largest in trona and the one that changes most often as new POSIX and Win32 features land.
+
+== Process manager — `procmgr.rs`
+
+procmgr owns process and thread lifecycle, signals, credentials, resource limits, and session/pgrp state.
+
+[cols="1,3"]
+|===
+| Label | Operation
+
+| `1`  `PM_SPAWN`     | Spawn a new process from an ELF image.
+| `2`  `PM_EXIT`      | Current process exits.
+| `3`  `PM_WAIT`      | `waitpid()` — wait for a child.
+| `4`  `PM_GETPID`    | Return the caller's PID.
+| `5`  `PM_FORK`      | Fork the current process (paired with `fork.S` trampoline).
+| `6`  `PM_EXEC`      | `execve()` — replace the current process image.
+| `7`  `PM_GETPPID`   | Return the parent PID.
+| `8`  `PM_KILL`      | Send a signal to a process.
+| `9`  `PM_SIGACTION` | Install a signal handler.
+| `10` `PM_GETUID`    | Real user ID.
+| `11` `PM_GETGID`    | Real group ID.
+| `12` `PM_SETPGID`   | Set process group ID.
+| `13` `PM_GETPGID`   | Get process group ID of a process.
+| `14` `PM_SETSID`    | Create a new session and become session leader.
+| `15` `PM_GETEUID`   | Effective user ID.
+| `16` `PM_GETEGID`   | Effective group ID.
+| `17` `PM_GETGROUPS` | Supplementary group list.
+| `21` `PM_REGISTER`  | Client registration — hands procmgr the client's badge.
+| `22` `PM_GETSID`    | Get session ID of a process.
+| `23` `PM_GETPGID_BADGE` | Get pgid of the badged caller itself.
+| `24` `PM_GETSID_BADGE`  | Get sid of the badged caller itself.
+| `25` `PM_KILL_PGID` | Send a signal to an entire process group.
+| `26` `PM_INJECT_CAP` | Give a capability to another running process (used by init during bootstrap).
+| `27` `PM_LIST_PIDS` | Enumerate live PIDs.
+| `28` `PM_GET_PROC_INFO` | Query per-process metadata (name, state, uid, …).
+| `29` `PM_RESUME`    | Resume a suspended process.
+| `30` `PM_UMASK`     | Read/write the umask.
+| `32` `PM_SETITIMER` | Set an interval timer.
+| `33` `PM_GETITIMER` | Read an interval timer.
+| `34` `PM_GET_EXE_PATH` | Look up the executable path of a process.
+| `35` `PM_DUMP_PENDING` | Debug dump of pending procmgr requests.
+| `36` `PM_GET_THREAD_CAPS` | Get the TCB / SC / vspace caps of a thread.
+|===
+
+=== Credentials
+
+[cols="1,3"]
+|===
+| Label | Operation
+
+| `37` `PM_SETUID`    | `setuid(uid)`.
+| `38` `PM_SETGID`    | `setgid(gid)`.
+| `39` `PM_SETEUID`   | `seteuid(euid)`.
+| `40` `PM_SETEGID`   | `setegid(egid)`.
+| `41` `PM_SETREUID`  | `setreuid(ruid, euid)`.
+| `42` `PM_SETREGID`  | `setregid(rgid, egid)`.
+| `43` `PM_SETGROUPS` | Set supplementary groups.
+| `44` `PM_GET_CREDS_BY_BADGE` | Look up credentials of a badged caller — used by VFS.
+| `45` `PM_GETRESUID` | `getresuid(&ruid, &euid, &suid)`.
+| `46` `PM_GETRESGID` | `getresgid(&rgid, &egid, &sgid)`.
+| `47` `PM_SETRESUID` | `setresuid(ruid, euid, suid)`.
+| `48` `PM_SETRESGID` | `setresgid(rgid, egid, sgid)`.
+|===
+
+=== Limits, TTY, and providers
+
+[cols="1,3"]
+|===
+| Label | Operation
+
+| `49` `PM_GETRLIMIT` | `getrlimit(resource)`.
+| `50` `PM_SETRLIMIT` | `setrlimit(resource, rlim)`.
+| `51` `PM_SET_SESSION_TTY`       | Attach a controlling TTY to the current session.
+| `52` `PM_CLEAR_SESSION_TTY`     | Detach the controlling TTY.
+| `53` `PM_SET_SESSION_TTY_PGRP`  | Change the foreground process group of the controlling TTY.
+| `54` `PM_REGISTER_PERSONALITY_PROVIDER` | Register a personality provider (e.g. posix_ttysrv).
+|===
+
+=== Thread lifecycle (personality-agnostic)
+
+[cols="1,3"]
+|===
+| Label | Operation
+
+| `55` `PM_THREAD_CREATE` | Create a new thread. Called by `pthread_create` and the future Win32 thread shim.
+| `56` `PM_THREAD_EXIT`   | Current thread exits.
+| `57` `PM_THREAD_JOIN`   | Wait for a thread to exit and collect its retval.
+| `58` `PM_THREAD_DETACH` | Mark a thread as detached.
+| `59` `PM_THREAD_LIST`   | Enumerate threads in a process.
+|===
+
+=== Boot-time init → procmgr handoff
+
+[cols="1,3"]
+|===
+| Label | Operation
+
+| `60` `PM_REGISTER_SERVICE_DEFS` | Init ships the parsed `.service` definitions to procmgr as a single frame cap. Procmgr maps, validates magic+version, copies entries into a static registry, unmaps, and replies `TRONA_OK`.
+| `61` `PM_REGISTER_PROVIDER`     | Init registers a pre-procmgr service provider endpoint with procmgr so later `Require=<name>` lookups can resolve it.
+|===
+
+== Memory manager — `mmsrv.rs`
+
+The memory manager owns heap break, mmap regions, SHM objects, COW pools, and page-fault backing resolution.
+Labels are allocated in the 0x80–0xA3 range, with a gap at 0x91 and several retired numbers.
+
+[cols="1,3"]
+|===
+| Label | Operation
+
+| `0x80` `MM_REGISTER`   | Client registration.
+| `0x81` `MM_DEREGISTER` | Client teardown.
+| `0x82` `MM_BRK`        | Set the heap break.
+| `0x83` `MM_SBRK`       | Increment the heap break.
+| `0x84` `MM_MMAP`       | Anonymous mmap.
+| `0x85` `MM_MUNMAP`     | Unmap.
+| `0x86` `MM_MPROTECT`   | Change page protection flags.
+| `0x87` `MM_MAP_BATCH`  | Map multiple regions atomically.
+| `0x88` `MM_MAP_WINDOW` | Allocate a reserved VA window.
+| `0x89` `MM_UNMAP_WINDOW` | Release a reserved VA window.
+| `0x8A` `MM_SHM_CREATE`  | Create a POSIX-style shared memory segment.
+| `0x8B` `MM_SHM_MAP`     | Map an existing SHM segment.
+| `0x8C` `MM_SHM_UNMAP`   | Unmap an SHM segment.
+| `0x8D` `MM_FORK_REGIONS`| Clone the caller's mapped regions into a child vspace (used by `posix_fork`).
+| `0x8E` `MM_SHM_DESTROY` | Destroy an SHM segment.
+| `0x8F` `MM_SHM_RESIZE`  | Resize an SHM segment.
+| `0x90` `MM_GET_CLIENT_STATS` | Query per-client memory usage.
+| `0x92` `MM_REGISTER_SHARED_REGION` | Register a region that will be shared with another client.
+| `0x93` `MM_MAP_OBJECT_REGION` | Map a MemoryObject-backed region.
+| `0x94` `MM_SYNC_FILE_BACKING` | Sync a file-backed mapping to VFS.
+| `0x95` `MM_FILE_MMAP`   | File-backed mmap. Delegates through `VFS_BACKEND_RESOLVE_BACKING` for fd → backing resolution.
+| `0x97` `MM_SYNC_MMAP_WRITE` | Force write-back of a dirty file-backed mapping.
+| `0x9A` `MM_PAGER_REQUEST` | Pager client → mmsrv: please resolve a fault at this vaddr.
+| `0x9B` `MM_PAGER_WRITE_REQUEST` | Pager client → mmsrv: writeback request.
+| `0x9C` `MM_DUMP_PENDING` | Debug dump of pending mmsrv requests.
+| `0x9D` `MM_REGISTER_PAGER_EP` | Register a pager endpoint — used by drivers that provide page-fault handling for their own regions.
+| `0x9E` `MM_ALLOC_PRIVATE_REGION`       | Allocate a private heap region.
+| `0x9F` `MM_ALLOC_PRIVATE_WINDOW`       | Allocate a private VA window.
+| `0xA0` `MM_ALLOC_INITRD_COPY`          | Copy a range out of the initrd into a fresh mmsrv-owned frame.
+| `0xA1` `MM_ALLOC_BOOTINFO_COPY`        | Copy a range out of the bootinfo page.
+| `0xA2` `MM_COPY_FROM_CLIENT_REGION`    | Copy from one client's region into another.
+| `0xA3` `MM_ALLOC_PRIVATE_COPY_FROM_CLIENT_REGION` | Allocate private memory initialized from a client region.
+|===
+
+Labels `0x91`, `0x96`, `0x98`, `0x99` are reserved or retired:
+
+- `0x91` is the numeric gap between client stats (`0x90`) and the shared-region labels (`0x92+`).
+- `0x96` is reserved — device mmap is handled as a subcase of `MM_FILE_MMAP`.
+- `0x98` / `0x99` were `MM_PROVISION_UNTYPED` and `MM_QUERY_CAPACITY` from the era when mmsrv owned its own untyped pool; the numbers are retired but not reused.
+
+== Name service — `namesrv.rs`
+
+namesrv is deliberately minimal: only two labels.
+
+[cols="1,3"]
+|===
+| Label | Operation
+
+| `1` `NS_REGISTER` | Register a name → endpoint mapping.
+| `2` `NS_LOOKUP`   | Look up an endpoint by name.
+|===
+
+The current name service is a flat dictionary used chiefly so that `dns_resolve` in trona_posix can find the `dnssrv` endpoint without having to hard-code a capability slot.
+More structured naming (directories, hierarchies) is planned but not yet landed.
+
+== POSIX personality — `posix.rs`
+
+POSIX-only operations that are not part of the generic VFS protocol.
+These labels live in a separate file to make it clear that non-POSIX subsystems must not depend on them.
+
+=== posix_ttysrv
+
+[cols="1,3"]
+|===
+| Label | Operation
+
+| `1` `POSIX_TTYSRV_GET_FG_PGRP`    | `tcgetpgrp()`.
+| `2` `POSIX_TTYSRV_SET_FG_PGRP`    | `tcsetpgrp()`.
+| `3` `POSIX_TTYSRV_SET_CTTY`       | Attach caller as the controlling TTY.
+| `4` `POSIX_TTYSRV_DROP_CTTY`      | Detach controlling TTY.
+| `10` `POSIX_TTYSRV_PTY_ALLOC`     | Allocate a new pty pair.
+| `11` `POSIX_TTYSRV_PTY_READ`      | Read from a pty slave.
+| `12` `POSIX_TTYSRV_PTY_WRITE`     | Write to a pty slave.
+| `13` `POSIX_TTYSRV_PTY_CLOSE`     | Close a pty endpoint.
+| `14` `POSIX_TTYSRV_PTY_TCGETATTR` | Pty tcgetattr.
+| `15` `POSIX_TTYSRV_PTY_TCSETATTR` | Pty tcsetattr.
+| `16` `POSIX_TTYSRV_PTY_IOCTL`     | Pty ioctl.
+| `17` `POSIX_TTYSRV_PTY_POLL`      | Pty poll.
+| `18` `POSIX_TTYSRV_INPUT_EVENT`   | Input event from the console driver.
+| `19` `POSIX_TTYSRV_PTY_COLLECT`   | Collect buffered data from a pty.
+| `20` `POSIX_TTYSRV_PTY_MASTER_WRITE` | Write from the pty master side.
+| `21` `POSIX_TTYSRV_CLIENT_EXIT`   | Client teardown notification.
+|===
+
+=== POSIX-only VFS labels
+
+Labels `34` and `35` are VFS operations that were carved out of the generic VFS label space because they are POSIX personality-only:
+
+[cols="1,3"]
+|===
+| Label | Operation
+
+| `34` `VFS_POSIX_ISATTY` | `isatty(fd)`.
+| `35` `VFS_POSIX_FCNTL`  | `fcntl(fd, cmd, arg)`.
+|===
+
+NOTE: The `POSIX_TTYSRV_*` constants in `posix.rs` duplicate the same names in `server.rs`.
+Both copies use the same numeric values.
+This redundancy is transitional and will be resolved when `protocol/server.rs` is reorganized.
+
+== Win32 personality — `win32.rs`
+
+Labels used between PE binaries (via `kernel32.dll` or the yet-to-be-built `trona_win32` Rust crate) and the `win32_csrss` server.
+
+[cols="1,3"]
+|===
+| Label | Operation
+
+| `0x100` `W32_RESOLVE_IMPORT`
+| PE rtld import resolution. Wire: `regs[0]=name_len`, `regs[1]=ordinal_hint`, `regs[2..]=name_bytes`. Reply: `regs[0]=kernel32_export_rva` (0 = not found).
+
+| `0x101` `W32_CONSOLE_WRITE`
+| Console write with inline data. Wire: `regs[0]=byte_count`, `regs[1..]=data`. Reply: `regs[0]=bytes_written`.
+
+| `0x102` `W32_CONSOLE_READ`
+| Console read. Wire: `regs[0]=max_bytes`. Reply: `regs[0]=actual_bytes`, `regs[1..]=data`.
+
+| `0x103` `W32_GET_CONSOLE_MODE`
+| Get mode flags for a console handle. Wire: `regs[0]=console_handle_type` (0=input, 1=output). Reply: `regs[0]=mode_flags`.
+
+| `0x104` `W32_SET_CONSOLE_MODE`
+| Set mode flags. Wire: `regs[0]=console_handle_type`, `regs[1]=mode_flags`.
+
+| `0x105` `W32_CLIENT_REGISTER`
+| PE process announces itself to csrss. Empty wire, `TRONA_OK` on success.
+
+| `0x106` `W32_CLIENT_EXIT`
+| PE process is exiting. Wire: `regs[0]=exit_code`. Reply: `TRONA_OK`.
+|===
+
+The `win32.rs` file also defines console mode flag constants that `W32_GET_CONSOLE_MODE` / `W32_SET_CONSOLE_MODE` exchange:
+
+[cols="1,2,3"]
+|===
+| Bit | Constant | Meaning
+
+| 0x0001 | `ENABLE_PROCESSED_INPUT`   | Input side — process Ctrl-C as `SIGINT`.
+| 0x0002 | `ENABLE_LINE_INPUT`        | Input side — cook input line-by-line.
+| 0x0004 | `ENABLE_ECHO_INPUT`        | Input side — echo typed characters.
+| 0x0001 | `ENABLE_PROCESSED_OUTPUT`  | Output side — interpret escape sequences.
+| 0x0002 | `ENABLE_WRAP_AT_EOL_OUTPUT`| Output side — wrap lines at end of line.
+|===
+
+Default modes are `DEFAULT_INPUT_MODE = PROCESSED_INPUT | LINE_INPUT | ECHO_INPUT` (`0x0007`) and `DEFAULT_OUTPUT_MODE = PROCESSED_OUTPUT | WRAP_AT_EOL_OUTPUT` (`0x0003`), matching the Windows defaults.
+
+NOTE: Of the seven Win32 labels, only `W32_RESOLVE_IMPORT` (via the PE rtld import resolver), `W32_CLIENT_REGISTER` (via the future crt startup), and `W32_CLIENT_EXIT` (via `ExitProcess`) are expected to be wired in the current PE pipeline.
+The four `W32_CONSOLE_*` labels are defined in the UAPI but are not used by any code built today — `kernel32.dll`'s `WriteConsoleA`/`ReadConsoleA` implementations go through VFS directly, and the trona_win32 Rust crate that would have called these labels is not built by any meson target.
+See xref:../win32/index.adoc[trona_win32 Overview] for the full story.
+
+== Server and driver — `server.rs`
+
+A catch-all file for labels used between servers and drivers that do not fit elsewhere.
+
+=== Console server
+
+[cols="1,3"]
+|===
+| Label | Operation
+
+| `1` `CONSOLE_WRITE`     | Write bytes to the console.
+| `2` `CONSOLE_READ`      | Read bytes from the console.
+| `3` `CONSOLE_TCGETATTR` | Console termios query.
+| `4` `CONSOLE_TCSETATTR` | Console termios update.
+|===
+
+=== posix_ttysrv (duplicate of `posix.rs`)
+
+The same 15 `POSIX_TTYSRV_*` labels from `protocol/posix.rs` are re-declared here with the same values (`1`–`4`, `10`–`21`).
+Call sites historically included this file before the split; the duplication is transitional.
+
+=== Display server
+
+[cols="1,3"]
+|===
+| Label | Operation
+
+| `1` `DISPLAY_GET_INFO`      | Query display metrics.
+| `2` `DISPLAY_PRESENT`       | Present a framebuffer update.
+| `6` `DISPLAY_FILL_RECT`     | Fill a rectangle.
+| `7` `DISPLAY_WRITE_TEXT`    | Write text at given coordinates.
+| `8` `DISPLAY_TERMINAL_WRITE`| Write to the terminal subregion.
+| `9` `DISPLAY_SETUP_RING`    | Set up a command ring buffer for async drawing.
+|===
+
+=== PCI enumeration server
+
+[cols="1,3"]
+|===
+| Label | Operation
+
+| `1` `PCI_FIND_DEVICE`    | Look up a PCI device by vendor:device.
+| `2` `PCI_GET_CAPS`       | Enumerate the device's capability list.
+| `3` `PCI_LIST`           | List every enumerated device.
+| `4` `PCI_READ_CONFIG32`  | Read a 32-bit config space register.
+| `5` `PCI_GET_BAR_CAP`    | Return a cap to a BAR range.
+| `6` `PCI_WRITE_CONFIG32` | Write a 32-bit config space register.
+|===
+
+=== Block device driver
+
+[cols="1,3"]
+|===
+| Label | Operation
+
+| `1` `BLK_READ`        | Read sectors.
+| `2` `BLK_WRITE`       | Write sectors.
+| `3` `BLK_GET_INFO`    | Device geometry query.
+| `4` `BLK_FLUSH`       | Flush caches.
+| `5` `BLK_GET_SHM_ID`  | Return the SHM descriptor used for bulk transfer.
+|===
+
+=== SaltyFS server
+
+[cols="1,3"]
+|===
+| Label | Operation
+
+| `1`  `SALTYFS_MOUNT`        | Mount a SaltyFS image.
+| `2`  `SALTYFS_LOOKUP`       | Lookup a name in a directory.
+| `3`  `SALTYFS_READ`         | Read a file.
+| `4`  `SALTYFS_READDIR`      | Enumerate a directory.
+| `5`  `SALTYFS_STAT`         | Stat a file.
+| `6`  `SALTYFS_GETINFO`      | Volume-level info.
+| `7`  `SALTYFS_READ_INLINE`  | Read a small file inline via IPC registers.
+| `8`  `SALTYFS_WRITE_INLINE` | Write inline.
+| `9`  `SALTYFS_CREATE`       | Create a file.
+| `10` `SALTYFS_MKDIR`        | Create a directory.
+| `11` `SALTYFS_UNLINK`       | Remove a file.
+| `12` `SALTYFS_RMDIR`        | Remove an empty directory.
+| `13` `SALTYFS_RENAME`       | Rename.
+| `14` `SALTYFS_TRUNCATE`     | Truncate a file.
+| `15` `SALTYFS_SHM_SETUP`    | Set up bulk transfer SHM.
+| `16` `SALTYFS_WRITE`        | Bulk write.
+| `17` `SALTYFS_SYMLINK`      | Create a symlink.
+| `18` `SALTYFS_READLINK`     | Read a symlink target.
+| `19` `SALTYFS_LINK`         | Hard link.
+| `20` `SALTYFS_GETPARENT`    | Get the parent inode.
+| `21` `SALTYFS_CHMOD`        | Change mode bits.
+| `22` `SALTYFS_CHOWN`        | Change owner.
+| `23` `SALTYFS_GETXATTR`     | Get extended attribute.
+| `24` `SALTYFS_SETXATTR`     | Set extended attribute.
+| `25` `SALTYFS_REMOVEXATTR`  | Remove xattr.
+| `26` `SALTYFS_LISTXATTR`    | List xattrs.
+|===
+
+=== Network stack (netsrv)
+
+[cols="1,3"]
+|===
+| Label | Operation
+
+| `0xA0` `NET_SOCKET`        | Create a socket.
+| `0xA1` `NET_CONNECT`       | Connect.
+| `0xA2` `NET_SEND`          | Send.
+| `0xA3` `NET_RECV`          | Receive.
+| `0xA4` `NET_CLOSE`         | Close.
+| `0xA5` `NET_BIND`          | Bind.
+| `0xA6` `NET_LISTEN`        | Listen.
+| `0xA7` `NET_ACCEPT`        | Accept.
+| `0xA8` `NET_SENDTO`        | Sendto.
+| `0xA9` `NET_RECVFROM`      | Recvfrom.
+| `0xAA` `NET_SHUTDOWN`      | Shutdown.
+| `0xAB` `NET_GETSOCKNAME`   | Get local address.
+| `0xAC` `NET_GETPEERNAME`   | Get peer address.
+| `0xAD` `NET_SETSOCKOPT`    | Set option.
+| `0xAE` `NET_GETSOCKOPT`    | Get option.
+| `0xAF` `NET_POLL_STATUS`   | Readiness query.
+| `0xB0` `NET_REGISTER_VFS`  | Register a VFS as a netsrv client.
+| `0xB1` `NET_COMPLETE`      | Completion notification for a deferred operation.
+| `0xB2` `NET_DNS_RESOLVE`   | DNS A/AAAA lookup.
+| `0xB3` `NET_DNS_RESOLVE_PTR` | DNS PTR lookup.
+| `0xB4` `NET_GET_CONFIG`    | Read network config.
+| `0xB5` `NET_GET_ARP_ENTRY` | Look up an ARP entry.
+| `0xB6` `NET_RECV_WAIT`     | Split blocking primitive for recv.
+| `0xB7` `NET_ACCEPT_WAIT`   | Split blocking primitive for accept.
+| `0xB8` `NET_RECVFROM_WAIT` | Split blocking primitive for recvfrom.
+| `0xB9` `NET_SEND_WAIT`     | Split blocking primitive for send.
+| `0xBA` `NET_SENDTO_WAIT`   | Split blocking primitive for sendto.
+|===
+
+=== DNS service
+
+[cols="1,3"]
+|===
+| Label | Operation
+
+| `1` `DNS_RESOLVE`         | Forward DNS lookup.
+| `2` `DNS_CACHE_FLUSH`     | Clear the local cache.
+| `3` `DNS_REVERSE_LOOKUP`  | Reverse lookup.
+|===
+
+=== Driver registration
+
+[cols="1,3"]
+|===
+| Label | Operation
+
+| `0xC0` `DRIVER_REGISTER` | Driver ↔ parent server registration.
+| `0xC1` `DRIVER_GET_INFO` | Query driver metadata.
+|===
+
+== Resource server — `rsrcsrv.rs`
+
+rsrcsrv is the runtime authority for kernel object allocation, quota accounting, and owner-based reclaim.
+Labels live in the 0xE0–0xE6 range.
+
+[cols="1,3"]
+|===
+| Label | Operation
+
+| `0xE0` `RES_ALLOC_OBJECT`
+| Allocate a single kernel object. Request: `MR0=owner_id`, `MR1=obj_type`, `MR2=size_bits`, `MR3=flags`. Reply carries the new cap in `caps[0]`, the handle in `MR0`, and status in `MR1`.
+
+| `0xE1` `RES_ALLOC_BATCH`
+| Allocate a heterogeneous batch in one IPC. Up to 8 entries inline via MRs; larger batches use the IPC buffer.
+
+| `0xE2` `RES_FREE_HANDLE`
+| Free a handle previously returned by `RES_ALLOC_OBJECT` / `RES_ALLOC_BATCH`. rsrcsrv revokes the back-reference cap (invalidating every derived cap) and decrements quota.
+
+| `0xE3` `RES_RECLAIM_OWNER`
+| Reclaim every handle owned by a given `owner_id`. Used on process exit.
+
+| `0xE4` `RES_QUERY_USAGE`
+| Query current quota usage — bytes in use and handle count.
+
+| `0xE5` `RES_SET_QUOTA`
+| Set or update quota limits. Setting both to 0 means unlimited. The high bit of `MR2` (`RES_QUOTA_FLAG_PROMOTE_PRIVILEGED` = `1 << 63`) is reserved for init to promote a target `owner_id` (typically procmgr) into the privileged caller set so it can allocate on behalf of other owners.
+
+| `0xE6` `RES_ADOPT_UNTYPED`
+| Hand an untyped capability to rsrcsrv's pool. Used by init during boot to transfer all root untypeds after spawning rsrcsrv.
+|===
+
+`RES_QUOTA_FLAG_PROMOTE_PRIVILEGED` is a flag used inside the `RES_SET_QUOTA` request, not a standalone label.
+
+== Related pages
+
+* xref:abi/syscall-abi.adoc[Syscall ABI] — the `SYS_CALL` / `SYS_SEND` syscalls that carry these labels.
+* xref:abi/invoke-labels.adoc[Invoke Labels] — kernel capability invocation labels (distinct from IPC protocol labels).
+* xref:abi/error-codes.adoc[Error Codes] — the error space returned in replies to these calls.
+* xref:../posix/index.adoc[trona_posix Overview] — the client-side code that builds most of these messages.

@@ -1,10 +1,133 @@
-= trona
+= Trona
+:description: The SaltyOS userspace system library — kernel ABI wrappers, IPC, capability invocation, POSIX delegation, binary loading, and dynamic linking
 
-This component is the placeholder for SaltyOS userspace ABI and runtime documentation.
+**Trona** is the system library that sits between the xref:kernite::index.adoc[kernite] microkernel and every userspace program in SaltyOS.
+It is what userspace actually calls when a C function from xref:basalt::index.adoc[basalt] (libc.so) or a Rust-native program needs to talk to the kernel, to another server, or to a capability object.
 
-Planned scope:
+Everything in xref:basalt::index.adoc[basaltc] (the C standard library) is a thin wrapper that converts a POSIX-shaped call into a `trona_posix::*` call, which in turn builds an IPC message and sends it through a capability to a server or to the kernel.
+Understanding trona is therefore the prerequisite for understanding how any userspace code actually reaches the kernel.
 
-* UAPI and ABI reference
-* syscall and invoke contracts
-* loader and runtime design
-* POSIX and compatibility layers
+== The five layers of trona
+
+The tree under `lib/trona/` is organized as **three built Rust crates** + **shared UAPI sources** + **two C dynamic linkers** + **a standalone C Win32 stub** + **arch-specific assembly and linker scripts**.
+
+[cols="1,2,3"]
+|===
+| Layer | Produces | Role
+
+| **substrate** (`trona` crate)
+| `libtrona.so` ⊂
+| Core kernel ABI. Syscall wrappers, IPC, typed capability invocation, slot allocator, futex-based sync primitives, TLS/thread infrastructure, VA and CSpace layout planners, startup capability table, worker pool, serial logging.
+
+| **uapi** (source tree, not a crate)
+| included via `include!`
+| Shared kernel↔userland contract: syscall numbers, invoke labels, IPC protocol labels, error codes, `#[repr(C)]` types, auxv tags, role constants. Pulled verbatim into substrate at compile time.
+
+| **trona_posix** crate
+| `libtrona.so` ⊂
+| POSIX-shaped Rust API. Every function delegates to a substrate IPC call targeting VFS, procmgr, mmsrv, dnssrv, or a kernel invoke. This is what basaltc's C ABI wrappers call.
+
+| **trona_loader** crate
+| `libtrona.so` ⊂
+| ELF64 / PE32+ / CPIO newc binary loading. Scratch-map page loading strategy, ET_EXEC / ET_DYN handling, DT_NEEDED extraction, PE import directory parsing. Used by init and procmgr when spawning children.
+
+| **rtld/elf** (C, freestanding)
+| `ld-trona.so` (standalone)
+| ELF runtime dynamic linker. Parses auxv, self-relocates, walks DT_NEEDED from the initrd CPIO, finalizes static TLS, exports TLS metadata and role-based capability slots into `libtrona.so` weak symbols, calls DT_INIT / DT_INIT_ARRAY, transfers control to the executable entry point.
+
+| **rtld/pe** (C, freestanding)
+| `ld-trona-pe.so` (standalone)
+| PE runtime dynamic linker. Validates the PE image, applies base relocations, resolves imports against a pre-mapped `kernel32.dll`, jumps to the PE entry point.
+
+| **win32** (C + Rust source)
+| `kernel32.dll` (standalone PE/COFF)
+| Win32 subsystem support. `kernel32_pe.c` is a real PE/COFF DLL built via `lld-link` and loaded by PE binaries. The sibling Rust files (`console.rs`, `handle.rs`, `process.rs`, …) are present as design-intent source but are not currently built by any meson target — see xref:win32/index.adoc[trona_win32 Overview].
+
+| **posix/arch** and **arch**
+| `fork.o`, linker scripts
+| Architecture-specific assembly (`fork.S` for x86_64 SSE2 / aarch64 NEON-Q0-Q31 preservation across the fork boundary) and `libtrona.ld` linker scripts. `fork.o` is statically linked into `libtrona.so`.
+|===
+
+== What is bundled into libtrona.so
+
+`libtrona.so` is the single shared object loaded by every dynamic SaltyOS process (after `ld-trona.so` finishes rtld bootstrapping).
+It is produced by the top-level `lib/trona/meson.build` by linking **six object files** with the architecture-specific linker script `arch/<arch>/libtrona.ld`:
+
+[source]
+----
+libtrona.so =
+    libtrona.o              ← trona substrate crate
+  + libtrona_posix.o        ← trona_posix crate
+  + libtrona_loader.o       ← trona_loader crate
+  + fork.o                  ← posix/arch/<arch>/fork.S
+  + libcore.o               ← Rust core library
+  + libcompiler_builtins.o  ← Rust compiler intrinsics
+----
+
+Everything else is built separately and has its own output:
+
+[cols="2,3"]
+|===
+| Artifact | Source
+
+| `ld-trona.so`
+| `lib/trona/rtld/elf/` — five freestanding C files plus an arch-specific `rtld_resolve.S` PLT resolver
+
+| `ld-trona-pe.so`
+| `lib/trona/rtld/pe/` — `rtld_pe_main.c` plus shared internal header
+
+| `kernel32.dll`
+| `lib/trona/win32/kernel32_pe.c` + `kernel32_pe.def` built via `clang --target=<arch>-w64-windows-gnu` and linked by `lld-link`. The produced PE/COFF is loaded by PE binaries at runtime.
+|===
+
+This separation matters: `ld-trona.so` must run **before** `libtrona.so` is available (it is the component that loads `libtrona.so`), so rtld is freestanding — no libc, no libtrona, only inline syscalls and its own self-contained ELF parser.
+
+== basalt and trona
+
+basalt (libc) does not talk to the kernel directly.
+Every non-trivial C standard library function in basaltc is a thin `#[unsafe(no_mangle)] pub extern "C"` wrapper that delegates to `trona_posix::*`.
+`trona_posix::*` in turn uses `trona::ipc::*` (from substrate) to build a `TronaMsg`, targets the appropriate well-known capability from `trona::caps::*`, and makes a `call` or `send` syscall.
+
+The layering looks like this:
+
+[source]
+----
+ ┌────────────────────────────────┐
+ │  Application                   │
+ ├────────────────────────────────┤
+ │  basaltc (libc.so)             │  ← POSIX C ABI surface
+ │    basalt::stdio::fprintf      │
+ │    basalt::unistd::write       │
+ ├────────────────────────────────┤
+ │  trona_posix                   │  ← Rust POSIX client
+ │    posix_write → VFS_WRITE     │
+ ├────────────────────────────────┤
+ │  trona substrate               │  ← Kernel ABI + IPC
+ │    ipc::call_ctx               │
+ │    syscall::syscall(SYS_CALL)  │
+ ├────────────────────────────────┤
+ │  kernite                       │  ← Microkernel
+ └────────────────────────────────┘
+----
+
+xref:basalt::internals/trona-boundary.adoc[basalt's trona-boundary page] documents this handoff from the basalt side.
+This component (trona) documents the same boundary from the other side: what happens once `trona_posix` is called, and how the substrate talks to the kernel.
+
+== Where to start reading
+
+If you are new to trona, the recommended reading order is:
+
+. xref:architecture.adoc[Architecture] — crate map, module list, and dependency direction
+. xref:substrate/index.adoc[substrate Overview] — the 18 modules that make up the core runtime
+. xref:substrate/ipc.adoc[IPC] — the message format every server call in SaltyOS uses
+. xref:substrate/invoke.adoc[Capability Invocation] — how userspace drives the kernel through capabilities
+. xref:abi/syscall-abi.adoc[Syscall ABI] — the register-level kernel contract
+. xref:rtld/elf-rtld.adoc[ELF Dynamic Linker] — what actually runs before `main`
+
+From there, xref:guides/reading-trona.adoc[Reading the trona Tree] shows how to navigate the source tree, and xref:guides/adding-a-kernel-op.adoc[Adding a Syscall or Invoke] walks through the full contribution flow for a new kernel operation.
+
+== Related pages
+
+* xref:kernite::index.adoc[kernite] — the microkernel itself. Everything in trona substrate is a wrapper over something kernite implements.
+* xref:basalt::index.adoc[basalt] — the C standard library that sits on top of `trona_posix`.
+* xref:basalt::internals/trona-boundary.adoc[basalt: The trona boundary] — the same handoff viewed from libc.

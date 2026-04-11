@@ -1,0 +1,236 @@
+= Invoke Labels
+:description: The typed capability invocation labels defined in uapi/consts/kernel.rs, grouped by kernel object type, with their substrate wrapper functions
+
+Every typed operation on a kernel object in SaltyOS goes through a single syscall — `SYS_INVOKE` (#9) — dispatched on a 64-bit **invoke label**.
+The label encodes which operation is being requested on which kind of capability.
+This page enumerates every invoke label defined in `lib/trona/uapi/consts/kernel.rs` and pairs it with the safe Rust wrapper that `substrate/invoke.rs` exposes.
+
+Anything listed here is what the kernel's `handle_invoke()` in `kernite/src/syscall/mod.rs` switches on.
+Adding a new invoke label means adding a constant here, a match arm in the kernel, and a wrapper function in `substrate/invoke.rs` — see xref:../guides/adding-a-kernel-op.adoc[Adding a Syscall or Invoke] for the end-to-end procedure.
+
+== The invoke call shape
+
+`invoke::invoke()` is the base entry point:
+
+[source,rust]
+----
+pub fn invoke(cap: Cap, label: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> TronaResult
+----
+
+Every typed wrapper is a shim that picks a constant `label` and routes four scalar arguments into this function.
+Results longer than two words (for example, the memory-map walk result) are returned in the per-thread IPC buffer and unpacked by helper functions such as `vspace_walk_result_header()` and `vspace_walk_result_entry()`.
+
+Under the hood, `invoke()` simply calls `syscall(SYS_INVOKE, cap, label, arg0, arg1, arg2, arg3)`, so the kernel side sees a uniform seven-register call no matter which object type is being poked.
+
+== CNode (0x10–0x18)
+
+Operations on capability nodes — copying, moving, and revoking caps inside a CNode.
+
+[cols="1,2,3"]
+|===
+| Label | Constant | Substrate wrapper
+
+| `0x10` | `CNODE_COPY`        | `cnode_copy(src_cnode, src_slot, dest_cnode, dest_slot, rights)` and `cnode_copy_depth(...)` variant
+| `0x11` | `CNODE_MINT`        | `cnode_mint(src_cnode, src_slot, dest_cnode, dest_slot, badge)` — copy with a badge attached
+| `0x12` | `CNODE_MOVE`        | `cnode_move(dest_cnode, dest_slot, src_cnode, src_slot)` — transfer the cap, leaving source empty
+| `0x13` | `CNODE_MUTATE`      | `cnode_mutate(dest_cnode, dest_slot, src_cnode, src_slot, badge)` — move + rebadge in one step
+| `0x14` | `CNODE_DELETE`      | `cnode_delete(cnode, slot)` and `cnode_delete_depth(...)`
+| `0x15` | `CNODE_REVOKE`      | `cnode_revoke(cnode, slot)` and `cnode_revoke_depth(...)` — revoke all descendants of the cap
+| `0x16` | `CNODE_SAVE_CALLER` | `cnode_save_caller(cnode, slot)` — persist the caller's reply cap after a `SYS_CALL`
+| `0x17` | `CNODE_SET_GUARD`   | `cnode_set_guard(cnode, guard, guard_bits)`
+| `0x18` | `CNODE_GET_INFO`    | `cnode_get_info(cnode)` — result returned via `TronaResult`
+|===
+
+Nine labels, twelve Rust wrappers (some operations have a `_depth` variant for explicit CNode resolution depth).
+
+== Untyped (0x20)
+
+Untyped memory is the source of every kernel object in SaltyOS — carving it via retype is how all kernel objects come into existence.
+
+[cols="1,2,3"]
+|===
+| Label | Constant | Substrate wrapper
+
+| `0x20` | `UNTYPED_RETYPE` | `untyped_retype(untyped, new_type, size_bits, dest_slot)` and `untyped_retype_depth(...)` variant
+|===
+
+The `new_type` argument is one of the `OBJ_*` constants listed under xref:#object-types[Object types for retype] below.
+Untyped memory is the only kernel resource whose `_retype` operation creates new capability objects — everything else already-exists by the time userspace can invoke it.
+
+== SchedContext (0x30–0x31)
+
+Scheduling contexts hold the budget and period for EDF-scheduled threads.
+
+[cols="1,2,3"]
+|===
+| Label | Constant | Substrate wrapper
+
+| `0x30` | `SC_CONFIGURE` | `sc_configure(sc, budget_us, period_us)`
+| `0x31` | `SC_BIND`      | `sc_bind(sc, tcb)` — attach this scheduling context to a TCB
+|===
+
+== TCB (0x40–0x4F)
+
+Thread Control Block operations — configuring a new thread, resuming/suspending it, binding notifications.
+
+[cols="1,2,3"]
+|===
+| Label | Constant | Substrate wrapper
+
+| `0x40` | `TCB_CONFIGURE`                  | `tcb_configure(tcb, rip, rsp, ipc_buf)`
+| `0x41` | `TCB_RESUME`                     | `tcb_resume(tcb)`
+| `0x42` | `TCB_SUSPEND`                    | `tcb_suspend(tcb)` and `tcb_suspend_retry(tcb, max_retries)`
+| `0x43` | `TCB_SET_SPACE`                  | `tcb_set_space(tcb, cspace, vspace)` and `tcb_set_space_with_depth(...)`
+| `0x46` | `TCB_WRITE_REGISTERS`            | `tcb_write_registers(tcb, flags, rip, rsp)`
+| `0x48` | `TCB_SET_IPC_BUFFER`             | `tcb_set_ipc_buffer(tcb, addr)`
+| `0x49` | `TCB_BIND_NOTIFICATION`          | `tcb_bind_notification(tcb, ntfn)`
+| `0x4B` | `TCB_SET_FAULT_HANDLER`          | `tcb_set_fault_handler(tcb, fault_ep)`
+| `0x4C` | `TCB_COPY_FPU`                   | `tcb_copy_fpu(dest_tcb, src_tcb)`
+| `0x4D` | `TCB_SET_TLS_BASE`               | `tcb_set_tls_base(tcb, tls_base)`
+| `0x4E` | `TCB_SET_NOTIFICATION_DISPATCHER`| `tcb_set_notification_dispatcher(tcb, dispatcher)`
+| `0x4F` | `TCB_GET_SPACE_INFO`             | `tcb_get_space_info(tcb) -> Option<u8>` — result passed via IPC buffer
+|===
+
+Labels `0x44`, `0x45`, `0x47`, `0x4A` are reserved and not currently assigned.
+
+== VSpace (0x50–0x5F) plus MO mapping (0x97–0x9A)
+
+VSpace operations map pages, demand-page regions, and fork ranges between address spaces.
+The MO-mapping subset (labels `0x97`–`0x9A`) is numerically adjacent to the MemoryObject labels below but semantically belongs to VSpace since the target object is a VSpace capability.
+
+[cols="1,2,3"]
+|===
+| Label | Constant | Substrate wrapper
+
+| `0x50` | `VSPACE_MAP`                | `vspace_map(vspace, frame, vaddr, flags)`
+| `0x51` | `VSPACE_UNMAP`              | `vspace_unmap(vspace, vaddr)`
+| `0x52` | `VSPACE_MAP_PT`             | `vspace_map_pt(vspace, frame, vaddr, level)` — install an intermediate page table
+| `0x53` | `VSPACE_WALK`               | `vspace_walk(vspace, start_vaddr, max_entries)` — result via IPC buffer; parsed by `vspace_walk_result_header()` / `vspace_walk_result_entry()`
+| `0x54` | `VSPACE_COPY_PAGE`          | `vspace_copy_page(src_vspace, src_vaddr, dst_frame)`
+| `0x55` | `VSPACE_MAP_DEVICE`         | `vspace_map_device(vspace, paddr, vaddr, flags)`
+| `0x56` | `VSPACE_CLONE_COW_PAGE`     | `vspace_clone_cow_page(src_vspace, src_vaddr, dst_vspace, dst_vaddr)`
+| `0x57` | `VSPACE_MAP_DEVICE_RANGE`   | `vspace_map_device_range(vspace, paddr_base, vaddr_base, count, flags)`
+| `0x58` | `VSPACE_PROTECT`            | `vspace_protect(vspace, vaddr, flags)`
+| `0x59` | `VSPACE_MAP_DEMAND`         | `vspace_map_demand(vspace, vaddr, flags)` — lazy anonymous zero-on-fault
+| `0x5A` | `VSPACE_MAP_DEMAND_RANGE`   | `vspace_map_demand_range(vspace, ...)`
+| `0x5B` | `VSPACE_COW_RESOLVE`        | `vspace_cow_resolve(vspace, vaddr, new_frame, flags)` — install a private copy on a COW fault
+| `0x5C` | `VSPACE_SET_COW_POOL`       | `vspace_set_cow_pool(vspace, pool_frame, src_cnode, count)` — pre-seed frames for resolve
+| `0x5D` | `VSPACE_SET_COW_NOTIF`      | `vspace_set_cow_notif(vspace, ring_frame, notif)`
+| `0x5E` | `VSPACE_REPLENISH_COW_POOL` | `vspace_replenish_cow_pool(vspace, src_cnode, start_slot, count)`
+| `0x5F` | `VSPACE_PROTECT_RANGE`      | `vspace_protect_range(vspace, vaddr, count, flags)`
+| `0x97` | `VSPACE_MAP_MO`             | `vspace_map_mo(vspace, mo, vaddr, flags)` and `vspace_map_mo_with_count(...)` — map a MemoryObject into a vspace
+| `0x98` | `VSPACE_UNMAP_MO`           | `vspace_unmap_mo(vspace, vaddr, count)`
+| `0x99` | `VSPACE_SHARE_RO_PAGE`      | `vspace_share_ro_page(src_vspace, src_vaddr, dst_vspace, dst_vaddr)` — share a page read-only across processes
+| `0x9A` | `VSPACE_FORK_RANGE`         | `vspace_fork_range(src_vspace, src_base, dst_vspace, dst_base, count)`
+|===
+
+The overlap between MO labels (0x90–0x97) and VSpace MO-mapping labels (0x97–0x9A) is intentional: `0x97` (`MO_HAS_PAGE` / `VSPACE_MAP_MO`) is dispatched based on the capability type, not the label alone.
+The kernel looks up the invoked cap's type first and picks the correct handler table.
+
+== IRQ (0x60–0x64)
+
+IRQ control creates IRQ handler capabilities; IRQ handlers acknowledge interrupts and wire them to notifications.
+
+[cols="1,2,3"]
+|===
+| Label | Constant | Substrate wrapper
+
+| `0x60` | `IRQ_CONTROL_GET`              | `irq_control_get(irq_ctrl, irq_num, dest_cnode, dest_slot)`
+| `0x61` | `IRQ_HANDLER_ACK`              | `irq_handler_ack(irq_handler)`
+| `0x62` | `IRQ_HANDLER_SET_NOTIFICATION` | `irq_handler_set_notification(irq_handler, ntfn)`
+| `0x63` | `IRQ_HANDLER_CLEAR`            | `irq_handler_clear(irq_handler)`
+| `0x64` | `DEVICE_UNTYPED_CREATE`        | `device_untyped_create(parent, phys_addr, size)` — carve a device-backed untyped from a parent untyped
+|===
+
+`DEVICE_UNTYPED_CREATE` lives in the IRQ block numerically but operates on untyped memory — it is how drivers acquire direct-mapped untyped ranges for MMIO regions.
+
+== I/O Port (0x70–0x77)
+
+x86-style I/O port access.
+On aarch64 the IoPort capability is still honored but the underlying handler emits no instructions — port caps on ARM64 systems resolve to an empty operation surface.
+
+[cols="1,2,3"]
+|===
+| Label | Constant | Substrate wrapper
+
+| `0x70` | `IOPORT_IN8`       | `ioport_in8(ioport, offset) -> u8`
+| `0x71` | `IOPORT_OUT8`      | `ioport_out8(ioport, offset, value)`
+| `0x72` | `IOPORT_IN16`      | `ioport_in16(ioport, offset) -> u16`
+| `0x73` | `IOPORT_OUT16`     | `ioport_out16(ioport, offset, value)`
+| `0x74` | `IOPORT_IN32`      | `ioport_in32(ioport, offset) -> u32`
+| `0x75` | `IOPORT_OUT32`     | `ioport_out32(ioport, offset, value)`
+| `0x76` | `IOPORT_CONFIGURE` | `ioport_configure(ioport, base_port, num_ports)`
+| `0x77` | `IOPORT_CREATE`    | `ioport_create(ioport_ctrl, base_port, num_ports, dest_cnode, dest_slot)`
+|===
+
+== MemoryObject (0x90–0x97)
+
+MemoryObject operations — the Fuchsia-inspired abstraction for anonymous backed memory that supports commit / decommit / clone / resize plus side-band read/write from the controlling process.
+
+[cols="1,2,3"]
+|===
+| Label | Constant | Substrate wrapper
+
+| `0x90` | `MO_COMMIT`   | `mo_commit(mo, offset, count, ut_cap) -> (error, committed_count)` — reserve and back pages
+| `0x91` | `MO_DECOMMIT` | `mo_decommit(mo, offset, count)` — release pages back to untyped
+| `0x92` | `MO_GET_SIZE` | `mo_get_size(mo) -> (error, page_count)`
+| `0x93` | `MO_CLONE`    | `mo_clone(mo, child_mo_slot, flags)`
+| `0x94` | `MO_RESIZE`   | `mo_resize(mo, new_page_count)`
+| `0x95` | `MO_READ`     | `mo_read(mo, offset, count) -> (error, bytes_read)` — data returned via IPC buffer
+| `0x96` | `MO_WRITE`    | `mo_write(mo, offset, count) -> (error, bytes_written)`
+| `0x97` | `MO_HAS_PAGE` | `mo_has_page(mo, page_index) -> (error, bool)`
+|===
+
+As noted above, label `0x97` is shared between `MO_HAS_PAGE` (when the target capability is a MemoryObject) and `VSPACE_MAP_MO` (when the target is a VSpace).
+Label dispatch is always object-type first.
+
+[#object-types]
+== Object types for retype
+
+`UNTYPED_RETYPE` needs to know what kind of object to carve out of the source untyped.
+The `new_type` argument is one of:
+
+[cols="1,2,3"]
+|===
+| Code | Constant | Object
+
+| 1  | `OBJ_UNTYPED`         | Child untyped memory (for sub-allocating)
+| 2  | `OBJ_ENDPOINT`        | Synchronous IPC endpoint
+| 3  | `OBJ_NOTIFICATION`    | Asynchronous notification object
+| 4  | `OBJ_TCB`             | Thread control block
+| 5  | `OBJ_CNODE`           | Capability node
+| 6  | `OBJ_VSPACE`          | Virtual address space root (top-level page table)
+| 7  | `OBJ_FRAME`           | A physical frame backing a user-space page
+| 8  | `OBJ_IRQ_HANDLER`     | IRQ handler capability
+| 9  | `OBJ_IO_PORT`         | I/O port range capability
+| 10 | `OBJ_SCHED_CONTEXT`   | Scheduling context (budget + period)
+| 11 | `OBJ_MEMORY_OBJECT`   | MemoryObject
+|===
+
+== Page mapping flags
+
+`VSPACE_MAP`, `VSPACE_PROTECT`, `VSPACE_MAP_DEMAND`, and their range variants all take a `flags: u64` whose bits are:
+
+[cols="1,2,3"]
+|===
+| Bit | Constant | Effect
+
+| 0 | `VSPACE_FLAG_WRITABLE`      | Page is writable (PTE W bit)
+| 1 | `VSPACE_FLAG_USER`          | Userspace-accessible (PTE U bit)
+| 2 | `VSPACE_FLAG_EXECUTABLE`    | Instruction fetches allowed (clear PTE NX)
+| 3 | `VSPACE_FLAG_CACHE_DISABLE` | Uncached mapping — used for MMIO
+| 4 | `VSPACE_FLAG_WRITE_THROUGH` | Write-through caching
+| 5 | `VSPACE_FLAG_COW`           | Copy-on-write — triggers `VSPACE_COW_RESOLVE` on store
+|===
+
+== Total count
+
+Across all object types, the invoke.rs module exposes **75 public wrapper functions** around **approximately 60 distinct invoke labels** (some labels, notably `VSPACE_MAP` and `CNODE_COPY`, have both an "implicit depth" and a `_depth` explicit variant sharing the same label).
+Label numbering is deliberately sparse so that future additions within an object-type group do not require renumbering.
+
+== Related pages
+
+* xref:abi/syscall-abi.adoc[Syscall ABI] — `SYS_INVOKE` is one of the 28 syscalls.
+* xref:../substrate/invoke.adoc[Capability Invocation] — the substrate module that implements every wrapper listed here.
+* xref:abi/error-codes.adoc[Error Codes] — the error space every invoke can return.
+* xref:kernite::concepts/capabilities.adoc[kernite: Capabilities] — the kernel side of the capability system.

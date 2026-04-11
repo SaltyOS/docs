@@ -1,0 +1,323 @@
+= Capability Invocation
+:description: The 75 typed capability invocation wrappers in substrate/invoke.rs, grouped by kernel object type
+
+`substrate/invoke.rs` is the substrate module that turns every kernel operation into a typed Rust function call.
+The file is 689 lines and exposes exactly 75 `pub fn` entries — one per `(capability type, operation)` pair plus a handful of parsers for operations that return data via the IPC buffer.
+
+Every wrapper in this file is a thin shim over the base `invoke()` function, which itself is just:
+
+[source,rust]
+----
+pub fn invoke(cap: Cap, label: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> TronaResult {
+    syscall(SYS_INVOKE, cap, label, arg0, arg1, arg2, arg3)
+}
+----
+
+The `SYS_INVOKE` syscall (#9) receives the capability in the first argument, the invoke label in the second, and up to four scalar arguments.
+Results flow back through the `TronaResult` struct — `error` for the status code and `value` for a single-word return.
+Operations that need to return more than one word write them into the per-thread IPC buffer and the caller parses them with dedicated helpers.
+
+For the actual label numbers, see xref:../abi/invoke-labels.adoc[Invoke Labels].
+This page is about the 75 Rust wrappers that pair with those labels.
+
+== The base entry point
+
+All 74 typed wrappers call `invoke()` directly, usually like this:
+
+[source,rust]
+----
+#[inline]
+pub fn tcb_resume(tcb: Cap) -> i32 {
+    invoke(tcb, TCB_RESUME, 0, 0, 0, 0).error as i32
+}
+----
+
+The `#[inline]` hint and the fact that `invoke()` and `syscall()` are also inlined means the compiler usually collapses the whole chain into a single syscall instruction at every call site — there is no actual function call overhead.
+
+Wrappers that need to return a result use the `TronaResult` explicitly:
+
+[source,rust]
+----
+#[inline]
+pub fn mo_get_size(mo: Cap) -> (i32, u64) {
+    let r = invoke(mo, MO_GET_SIZE, 0, 0, 0, 0);
+    (r.error as i32, r.value)
+}
+----
+
+Wrappers that cannot fail (`ioport_in8`, `ioport_out8`, …) return bare values because the kernel guarantees the operation either succeeds or traps:
+
+[source,rust]
+----
+#[inline]
+pub fn ioport_in8(ioport: Cap, offset: u64) -> u8 {
+    invoke(ioport, IOPORT_IN8, offset, 0, 0, 0).value as u8
+}
+----
+
+== Untyped (2 wrappers)
+
+Carving kernel objects out of untyped memory.
+
+[cols="2,3"]
+|===
+| Wrapper | Purpose
+
+| `untyped_retype(untyped, new_type, size_bits, dest_slot)`
+| Retype `untyped` into a new object of type `new_type` at `dest_slot` in the caller's root CNode. Uses `SYS_SET_INVOKE_DEPTHS` implicitly with the default (caller's current CSpace depth).
+
+| `untyped_retype_depth(untyped, new_type, size_bits, dest_slot, dest_depth)`
+| Same as above but with an explicit destination CNode resolution depth, for callers that place new objects into a nested CNode.
+|===
+
+The `new_type` argument is one of the `OBJ_*` constants (`OBJ_ENDPOINT`, `OBJ_NOTIFICATION`, `OBJ_TCB`, `OBJ_CNODE`, `OBJ_VSPACE`, `OBJ_FRAME`, `OBJ_IRQ_HANDLER`, `OBJ_IO_PORT`, `OBJ_SCHED_CONTEXT`, `OBJ_MEMORY_OBJECT`).
+See xref:../abi/invoke-labels.adoc[Invoke Labels] for the complete list.
+
+== TCB (14 wrappers)
+
+Thread Control Block operations — configure a new TCB, resume/suspend it, bind it to a notification, write its registers.
+
+[cols="2,3"]
+|===
+| Wrapper | Purpose
+
+| `tcb_configure(tcb, rip, rsp, ipc_buf)`
+| Set entry point, stack pointer, and IPC buffer address in a single call. Used immediately after `untyped_retype` to `OBJ_TCB`.
+| `tcb_resume(tcb)`
+| Place the TCB on a ready queue.
+| `tcb_suspend(tcb)`
+| Remove from the ready queue. Returns immediately.
+| `tcb_suspend_retry(tcb, max_retries)`
+| Like `tcb_suspend` but retries up to `max_retries` times if the target is in a transient non-suspendable state (e.g. inside a kernel critical section).
+| `tcb_set_space(tcb, cspace, vspace)`
+| Bind a CSpace and VSpace root to a TCB.
+| `tcb_set_space_with_depth(tcb, cspace, vspace, depth)`
+| Same with explicit CSpace root depth.
+| `tcb_set_fault_handler(tcb, fault_ep)`
+| Install an endpoint that receives fault messages when this TCB traps.
+| `tcb_set_ipc_buffer(tcb, addr)`
+| Change the TCB's IPC buffer virtual address.
+| `tcb_write_registers(tcb, flags, rip, rsp)`
+| Patch registers on a suspended TCB. Used by `exec()` to transfer control to the new program.
+| `tcb_bind_notification(tcb, ntfn)`
+| Attach a notification object to the TCB — signals on the notification wake the TCB if it is in `RecvBlocked` state.
+| `tcb_copy_fpu(dest_tcb, src_tcb)`
+| Copy the source TCB's FPU state into the destination. Used by `fork()` so the child starts with the parent's SSE/NEON registers.
+| `tcb_set_tls_base(tcb, tls_base)`
+| Set the thread pointer (FS base on x86_64, `tpidr_el0` on aarch64).
+| `tcb_set_notification_dispatcher(tcb, dispatcher)`
+| Register a userspace dispatcher function that the kernel will jump to when a notification arrives while the TCB is in a non-blocking state.
+| `tcb_get_space_info(tcb) -> Option<u8>`
+| Read back the TCB's CSpace root depth. Uses the IPC buffer for the result.
+|===
+
+== SchedContext (2 wrappers)
+
+Scheduling contexts encode EDF budget and period.
+
+[cols="2,3"]
+|===
+| Wrapper | Purpose
+
+| `sc_configure(sc, budget_us, period_us)`
+| Set the budget and period in microseconds.
+
+| `sc_bind(sc, tcb)`
+| Attach this scheduling context to a TCB.
+|===
+
+== VSpace (23 wrappers)
+
+Page mapping, COW, MemoryObject binding, and page-table walks.
+This is the largest object-type group because vspace operations cover so many shapes — map/unmap/protect for single pages and ranges, demand and COW variants, device mappings, and MemoryObject mappings.
+
+[cols="2,3"]
+|===
+| Wrapper | Purpose
+
+| `vspace_map(vspace, frame, vaddr, flags)`
+| Map a single frame into the vspace at the given vaddr.
+| `vspace_unmap(vspace, vaddr)`
+| Unmap a single page.
+| `vspace_protect(vspace, vaddr, flags)`
+| Change page protection flags on a single page.
+| `vspace_protect_range(vspace, vaddr, count, flags) -> (i32, u64)`
+| Change protections across a range of `count` pages. Returns the number actually updated in case of partial success.
+| `vspace_map_pt(vspace, frame, vaddr, level)`
+| Install an intermediate page table at the given level for the target vaddr range.
+| `vspace_walk(vspace, start_vaddr, max_entries)`
+| Walk the page table starting at `start_vaddr` and write up to `max_entries` tuples into the per-thread IPC buffer starting at word offset 42.
+| `vspace_walk_result_header()`
+| Parse the header (count, root_vaddr) from the IPC buffer after a `vspace_walk`.
+| `vspace_walk_result_entry(index)`
+| Parse an entry (`vaddr`, `paddr`, `flags`) by index from the IPC buffer.
+| `vspace_copy_page(src_vspace, src_vaddr, dst_frame)`
+| Copy the contents of a mapped page into a fresh frame.
+| `vspace_map_device(vspace, paddr, vaddr, flags)`
+| Map a physical device page at a given vaddr — used by drivers to access MMIO.
+| `vspace_map_device_range(vspace, paddr_base, vaddr_base, count, flags)`
+| Range variant.
+| `vspace_clone_cow_page(src_vspace, src_vaddr, dst_vspace, dst_vaddr)`
+| Create a COW-shared mapping of a page in another vspace.
+| `vspace_share_ro_page(src_vspace, src_vaddr, dst_vspace, dst_vaddr)`
+| Share a page read-only across two vspaces.
+| `vspace_map_demand(vspace, vaddr, flags)`
+| Install a demand-paged anonymous mapping — zero-on-fault.
+| `vspace_map_demand_range(vspace, vaddr, count, flags)`
+| Range variant.
+| `vspace_cow_resolve(vspace, vaddr, new_frame, flags)`
+| Resolve a COW fault by installing a private frame at the faulting vaddr.
+| `vspace_set_cow_pool(vspace, pool_frame, src_cnode, count)`
+| Pre-stage a pool of frames for COW resolution so that fault handling does not have to call `untyped_retype`.
+| `vspace_set_cow_notif(vspace, ring_frame, notif)`
+| Configure the notification to signal when the COW pool needs replenishment.
+| `vspace_replenish_cow_pool(vspace, src_cnode, start_slot, count)`
+| Top the pool back up.
+| `vspace_fork_range(src_vspace, src_base, dst_vspace, dst_base, count)`
+| Fork a range of pages from source to destination vspace — the core of `posix_fork`.
+| `vspace_map_mo(vspace, mo, vaddr, flags)`
+| Map a MemoryObject into a vspace at `vaddr`.
+| `vspace_map_mo_with_count(vspace, mo, vaddr, count, flags)`
+| Map a specific number of pages from the MemoryObject.
+| `vspace_unmap_mo(vspace, vaddr, count)`
+| Unmap an MO-backed range.
+|===
+
+== CNode (12 wrappers)
+
+Capability movement within and between CNodes.
+
+[cols="2,3"]
+|===
+| Wrapper | Purpose
+
+| `cnode_copy(src_cnode, src_slot, dest_cnode, dest_slot, rights)`
+| Copy a capability, narrowing the rights to the caller-specified subset.
+| `cnode_copy_depth(...)` | Explicit-depth variant for nested CSpaces.
+| `cnode_mint(src_cnode, src_slot, dest_cnode, dest_slot, badge)`
+| Copy with a badge attached. The badge is visible to the receiver of any message sent through the minted cap.
+| `cnode_move(dest_cnode, dest_slot, src_cnode, src_slot)`
+| Transfer the cap without leaving a copy behind.
+| `cnode_mutate(dest_cnode, dest_slot, src_cnode, src_slot, badge)`
+| Move plus rebadge.
+| `cnode_save_caller(cnode, slot)`
+| Persist the caller's reply capability (from a `SYS_CALL`) into a persistent slot so it can be used to reply later.
+| `cnode_delete(cnode, slot)`
+| Delete the cap in a slot.
+| `cnode_delete_depth(cnode, slot, depth)` | Explicit-depth variant.
+| `cnode_revoke(cnode, slot)`
+| Revoke every descendant of the cap in a slot — used when tearing down a resource that was shared via `cnode_mint` or `cnode_copy`.
+| `cnode_revoke_depth(cnode, slot, depth)` | Explicit-depth variant.
+| `cnode_set_guard(cnode, guard, guard_bits)`
+| Install a guard pattern on a CNode slot for hierarchical CSpace lookup.
+| `cnode_get_info(cnode) -> TronaResult`
+| Read back the CNode's size, guard, etc. The info is carried in the `TronaResult` fields.
+|===
+
+== IRQ and Device (5 wrappers)
+
+IRQ control creates IRQ handler caps; IRQ handlers ack interrupts and route them to notifications.
+`device_untyped_create` shares this numeric block because it also creates new caps.
+
+[cols="2,3"]
+|===
+| Wrapper | Purpose
+
+| `irq_handler_ack(irq_handler)`
+| Acknowledge the pending interrupt so the kernel can deliver the next one.
+| `irq_handler_set_notification(irq_handler, ntfn)`
+| Bind the IRQ to a notification. When the kernel takes the interrupt, it signals the notification, which in turn wakes the waiting driver thread.
+| `irq_handler_clear(irq_handler)`
+| Unbind the notification.
+| `irq_control_get(irq_ctrl, irq_num, dest_cnode, dest_slot)`
+| Carve a new IRQ handler cap from the IRQ control cap.
+| `device_untyped_create(parent, phys_addr, size)`
+| Create a device-backed untyped cap from a parent untyped — used by drivers that need a contiguous MMIO range.
+|===
+
+== I/O Port (8 wrappers)
+
+x86 I/O port access.
+On aarch64 the underlying IoPort cap is still accepted but the operations compile to no-ops, so the wrappers are architecture-neutral.
+
+[cols="2,3"]
+|===
+| Wrapper | Purpose
+
+| `ioport_in8(ioport, offset) -> u8`   | Read a byte.
+| `ioport_out8(ioport, offset, value)` | Write a byte.
+| `ioport_in16(ioport, offset) -> u16` | Read a word.
+| `ioport_out16(ioport, offset, value)`| Write a word.
+| `ioport_in32(ioport, offset) -> u32` | Read a dword.
+| `ioport_out32(ioport, offset, value)`| Write a dword.
+| `ioport_configure(ioport, base_port, num_ports)` | Configure the base port and range for an IoPort cap.
+| `ioport_create(ioport_ctrl, base_port, num_ports, dest_cnode, dest_slot)` | Carve a new IoPort cap from an IoPort control cap.
+|===
+
+== MemoryObject (8 wrappers)
+
+MemoryObject is the Fuchsia-inspired abstraction for a variable-size object backed by physical pages that the owning process can commit, decommit, clone, resize, and side-band read/write.
+
+[cols="2,3"]
+|===
+| Wrapper | Purpose
+
+| `mo_commit(mo, offset, count, ut_cap) -> (i32, u64)`
+| Reserve and back `count` pages starting at `offset`. Returns the number actually committed in the value field.
+
+| `mo_decommit(mo, offset, count)`
+| Release pages back to untyped memory.
+
+| `mo_get_size(mo) -> (i32, u64)`
+| Read the current size in pages.
+
+| `mo_clone(mo, child_mo_slot, flags)`
+| Make a new MemoryObject that is a COW-shared copy of the source.
+
+| `mo_resize(mo, new_page_count)`
+| Grow or shrink the MemoryObject.
+
+| `mo_read(mo, offset, count) -> (i32, u64)`
+| Side-band read `count` bytes starting at `offset`. The data flows back through the IPC buffer.
+
+| `mo_write(mo, offset, count) -> (i32, u64)`
+| Side-band write `count` bytes. The data is placed in the IPC buffer before the call.
+
+| `mo_has_page(mo, page_index) -> (i32, bool)`
+| Probe whether a given page index is currently committed. Used by pagers to avoid blocking on pages the MemoryObject already has resident.
+|===
+
+== Wrappers that return through the IPC buffer
+
+Three operations need to return more data than fits in a single `TronaResult.value` word.
+They write their result into the per-thread IPC buffer's `reserved` area, and substrate exposes small parser helpers that read it back:
+
+[cols="2,3"]
+|===
+| Operation | Parser(s)
+
+| `vspace_walk` | `vspace_walk_result_header() -> Option<(u64, u64)>` (count, root_vaddr) and `vspace_walk_result_entry(index) -> Option<(u64, u64, u64)>` (vaddr, paddr, flags). Entries are written starting at IPC buffer word offset 42.
+| `tcb_get_space_info` | Returns `Option<u8>` after parsing a single byte from the IPC buffer.
+| `cnode_get_info` | Returns a `TronaResult` whose `value` field holds packed CNode metadata (size, guard, etc.). Callers decode it with bit shifts.
+|===
+
+These parsers exist because the alternative — returning a `struct` by value from `invoke()` — would require the caller to pass a destination pointer into the kernel, which the IPC buffer already is.
+Doing it via the buffer keeps the `invoke()` / `syscall()` API uniform.
+
+== Wrappers that do not exist
+
+A few operations have labels but no dedicated wrapper in `invoke.rs`:
+
+- No explicit wrappers for the arch-specific register read operations that `TCB_WRITE_REGISTERS` reads back — the kernel exposes the write direction only.
+- No bulk variants of `ioport_in*` / `ioport_out*` — callers loop.
+- No `SC_DESTROY` or `MO_DESTROY` — kernel objects are revoked via `cnode_revoke`, not explicitly destroyed.
+
+When a caller needs an operation for which no wrapper exists, the escape hatch is to call `invoke()` directly with the raw label and arguments, exactly as the wrappers themselves do.
+There is no penalty for this other than losing the type-safety of the dedicated wrapper.
+
+== Related pages
+
+* xref:../abi/invoke-labels.adoc[Invoke Labels] — the full catalog of label constants each wrapper passes to `invoke()`.
+* xref:substrate/syscalls.adoc[Syscall Wrappers] — the `syscall()` function that `invoke()` calls into.
+* xref:../abi/error-codes.adoc[Error Codes] — the error codes every wrapper can return.
+* xref:substrate/slot-allocator.adoc[Slot Allocator] — how callers acquire the destination slots that most of these wrappers need.

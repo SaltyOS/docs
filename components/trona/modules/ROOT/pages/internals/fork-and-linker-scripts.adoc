@@ -1,0 +1,233 @@
+= fork.S and Linker Scripts
+:description: The arch-specific fork trampolines and the linker scripts that lay out libtrona.so and the rtld binaries
+
+This page covers the lowest-level pieces of trona — the assembly fork trampolines under `lib/trona/posix/arch/<arch>/fork.S` and the linker scripts under `lib/trona/arch/<arch>/libtrona.ld` and `lib/trona/rtld/{elf,pe}/arch/<arch>/`.
+
+These files do not implement any policy.
+What they do is set the stage so that higher-level Rust and C code can run: `fork.S` makes the fork system call work without losing register state, and the linker scripts make sure the resulting binaries have the section layout that the rtlds expect.
+
+== `fork.S` — why it has to be in assembly
+
+`posix_fork` cannot be implemented in pure Rust for two reasons:
+
+. **Caller-saved registers must be preserved across the call.** When a Rust function calls `posix_fork`, the compiler can put any value into a caller-saved register and assume the value is gone after the call. After fork, both the parent and the child must continue with that value intact, otherwise local variables in the calling function would be corrupted.
+. **The child must resume at a specific entry point with a specific stack layout.** Procmgr needs to know exactly where to set the child's `RIP` and `RSP` so that when the child wakes up, it picks up where the parent left off. The simplest way to express this is: save everything to the stack, tell procmgr "start the child at this address with this RSP", and let the child pop the saved state.
+
+Both of these are easier to express in assembly than to coax out of `rustc`'s codegen with the right combination of `#[inline(never)]` and `core::arch::asm!` directives.
+The fork trampolines are short — under 200 lines per architecture — and easy to audit.
+
+== `posix/arch/x86_64/fork.S` (154 lines)
+
+The x86_64 trampoline has two paths: a basic path and a SIMD-aware path enabled by `-DSALTY_X86_SIMD=1`.
+The build system always sets the flag on x86_64 because SSE2 is part of the AMD64 baseline.
+
+=== Basic flow
+
+The trampoline saves callee-saved GPRs, calls into `_posix_fork_impl`, and then either returns to the parent or jumps to `fork_child_entry`:
+
+[source,asm]
+----
+posix_fork:
+    pushq   %rbp
+    pushq   %rbx
+    pushq   %r12
+    pushq   %r13
+    pushq   %r14
+    pushq   %r15
+
+    /* SALTY_X86_SIMD=1 path: also save XMM0-XMM15 (256 bytes) */
+    subq    $256, %rsp
+    movdqu  %xmm0,   0(%rsp)
+    movdqu  %xmm1,  16(%rsp)
+    /* ... through xmm15 ... */
+
+    /* Keep SysV stack alignment (16-byte) across the call */
+    subq    $8, %rsp
+
+    leaq    264(%rsp), %rdi       /* arg0 = saved RSP after pushes */
+    leaq    fork_child_entry(%rip), %rsi  /* arg1 = child entry */
+    call    _posix_fork_impl@PLT
+    addq    $8, %rsp
+----
+
+`_posix_fork_impl` is a Rust function in `posix/proc.rs` that does the actual `PM_FORK` IPC.
+Its arguments are the saved RSP (so procmgr knows where the child's stack should resume) and the address of `fork_child_entry` (so procmgr knows where to set the child's RIP).
+
+=== Parent path
+
+After `_posix_fork_impl` returns to the parent, the parent restores the XMM registers (if SALTY_X86_SIMD), pops the GPRs, and returns the child PID:
+
+[source,asm]
+----
+    /* parent restores XMM */
+    movdqu    0(%rsp), %xmm0
+    /* ... */
+    movdqu  240(%rsp), %xmm15
+    addq    $256, %rsp
+
+    popq    %r15
+    popq    %r14
+    /* ... */
+    popq    %rbp
+    ret    /* %eax = child PID */
+----
+
+This is the normal C return — the calling function gets the PID in `%eax`.
+
+=== Child path — `fork_child_entry`
+
+The child wakes up at `fork_child_entry` with `RSP` pointing at the saved register area on the stack.
+Before restoring registers, the child must call `_trona_post_fork_child` (a Rust function in substrate) to reinitialize per-process state — IPC context, slot allocator, pending request tables, all of which need fresh content in the child.
+
+The complication is that the SIMD save area lives **below** the current RSP (at `[RSP-256, RSP)`).
+A normal `call` instruction would push a return address into that area and corrupt the saved XMM state.
+
+The trampoline solves this by switching to a temporary 4 KiB BSS stack just for the duration of the `_trona_post_fork_child` call:
+
+[source,asm]
+----
+fork_child_entry:
+#ifdef SALTY_X86_SIMD
+    movq    %rsp, %rax
+    leaq    _trona_fork_child_stack_top(%rip), %rsp
+    subq    $8, %rsp
+    pushq   %rax                                /* save real RSP */
+    call    _trona_post_fork_child@PLT
+    popq    %rsp                                /* restore real RSP */
+
+    /* Now restore XMM regs from the saved block below RSP */
+    movdqu  -256(%rsp), %xmm0
+    /* ... */
+    movdqu   -16(%rsp), %xmm15
+#else
+    subq    $8, %rsp
+    call    _trona_post_fork_child@PLT
+    addq    $8, %rsp
+#endif
+
+    popq    %r15
+    popq    %r14
+    /* ... */
+    popq    %rbp
+    xorl    %eax, %eax        /* return 0 to indicate child */
+    ret
+----
+
+The temporary 4 KiB stack is allocated in BSS at the bottom of the file:
+
+[source,asm]
+----
+.section .bss._trona_fork_child_stack,"aw",@nobits
+.align 16
+_trona_fork_child_stack:
+    .space  4096
+_trona_fork_child_stack_top:
+----
+
+Since fork is single-threaded by definition (only the calling thread survives in the child) and `_trona_post_fork_child` runs to completion before any other thread is created, this single 4 KiB BSS stack is safe — there is no concurrent caller to step on it.
+
+After `_trona_post_fork_child` returns, the child restores XMM and GPR state from the original stack and returns `0` to the caller.
+
+== `posix/arch/aarch64/fork.S` (129 lines)
+
+The aarch64 trampoline has the same shape but the register-save block is bigger because aarch64 has 12 callee-saved GPRs (`x19`–`x30`) and a 32-register NEON file (`Q0`–`Q31` = 512 bytes).
+On aarch64 the SIMD save is unconditional — there is no "without NEON" build because NEON is mandatory in ARMv8-A.
+
+The total save area is 6 GPR pairs (96 bytes via `stp`) plus 32 × 16 bytes of NEON (512 bytes), so each fork pays roughly 600 bytes of stack across the operation.
+
+The trampoline does not need the BSS-stack trick from the x86_64 SIMD path because aarch64 calls do not push a return address onto the stack (the link register `x30` is used instead), so calling `_trona_post_fork_child` does not corrupt the saved register area.
+
+== `_trona_post_fork_child` — the Rust hook
+
+After the child has its registers saved, control reaches `_trona_post_fork_child` from substrate.
+This is the function that resets every per-process global the child inherited from the parent:
+
+- The thread descriptor pool — every thread except the calling one becomes invalid in the child, so the pool is reset to a single live entry for the forking thread.
+- The slot allocator — the parent's expansion state and bitmap are copied verbatim because the CSpace itself was forked, but the spinlock is reset to unlocked.
+- The pending request table — every pending entry is dropped because the child has no in-flight server requests.
+- The IPC context for the forking thread — the IPC buffer pointer is updated to the child's IPC buffer vaddr (which procmgr maps as part of `PM_FORK`).
+- Any cached server endpoints in user-space (e.g. the dnssrv endpoint cache) are invalidated and will be re-resolved on next use.
+
+After `_trona_post_fork_child` returns, the trampoline restores registers and returns `0`, and the child continues executing as if it were the calling code immediately after `posix_fork`.
+
+== Linker scripts
+
+There are three sets of linker scripts in the trona tree:
+
+[cols="1,3"]
+|===
+| Path | Output
+
+| `lib/trona/arch/x86_64/libtrona.ld`, `aarch64/libtrona.ld` | `libtrona.so`
+| `lib/trona/rtld/elf/arch/<arch>/rtld.ld`                   | `ld-trona.so`
+| `lib/trona/rtld/pe/arch/<arch>/rtld_pe.ld`                 | `ld-trona-pe.so`
+|===
+
+All three follow the same template — they declare the layout of an ET_DYN ELF, page-align text/rodata/data, place metadata sections in known orders, and discard the cruft sections.
+
+=== `libtrona.ld` — the libtrona.so layout
+
+[source]
+----
+OUTPUT_FORMAT("elf64-x86-64")
+SECTIONS {
+    . = SIZEOF_HEADERS;
+    .gnu.hash : { *(.gnu.hash) }
+    .dynsym   : { *(.dynsym) }
+    .dynstr   : { *(.dynstr) }
+    .rela.dyn : { *(.rela.dyn) *(.rela.plt) }
+    .text     : ALIGN(0x1000) { *(.text .text.*) }
+    .rodata   : ALIGN(0x1000) { *(.rodata .rodata.*) }
+    .data     : ALIGN(0x1000) { *(.data .data.*) }
+    .init_array : {
+        KEEP(*(SORT_BY_INIT_PRIORITY(.init_array.*)))
+        KEEP(*(.init_array))
+    }
+    .fini_array : {
+        KEEP(*(SORT_BY_INIT_PRIORITY(.fini_array.*)))
+        KEEP(*(.fini_array))
+    }
+    .got      : { *(.got) }
+    .dynamic  : { *(.dynamic) }
+    .got.plt  : { *(.got.plt) }
+    .bss      : ALIGN(0x1000) { *(.bss .bss.* COMMON) }
+    /DISCARD/ : { *(.comment) *(.note.*) *(.eh_frame*) }
+}
+----
+
+Three things to notice:
+
+. **`SIZEOF_HEADERS` start.** The first section starts immediately after the ELF program headers. This packs metadata into the first page so the rtld can read DT_GNU_HASH / DT_SYMTAB / DT_DYNAMIC immediately after mapping the first page of the file — no need to map further pages just to start parsing.
+. **4 KiB section alignment.** `.text`, `.rodata`, `.data`, and `.bss` are all `ALIGN(0x1000)`. This lets the loader give each section the right page protections without splitting pages: `.text` is RX, `.rodata` is RO, `.data` is RW, `.bss` is RW (plus zero-fill).
+. **`SORT_BY_INIT_PRIORITY` for init_array.** C++-style global constructors with priorities are sorted by priority before being added to `.init_array`. This is what the rtld walks when running init functions during startup.
+
+The `/DISCARD/` line drops three categories of sections that would otherwise bloat the binary without adding any runtime value:
+
+- `.comment` — compiler version strings.
+- `.note.*` — GNU build IDs and similar.
+- `.eh_frame*` — DWARF unwinding tables (substrate compiles with `-C panic=abort`, so unwinding never happens).
+
+The aarch64 `libtrona.ld` is identical except for `OUTPUT_FORMAT("elf64-littleaarch64")`.
+
+=== rtld linker scripts
+
+The `ld-trona.so` linker script (`lib/trona/rtld/elf/arch/<arch>/rtld.ld`) and the PE rtld linker script (`lib/trona/rtld/pe/arch/<arch>/rtld_pe.ld`) follow the same template as `libtrona.ld` — same metadata-first layout, same 4 KiB alignment, same `/DISCARD/` rules.
+
+The rtld scripts have one extra constraint: the rtld is itself loaded by the kernel (via PT_INTERP) before any userspace allocator exists.
+This means rtld must be a **static PIE** — ET_DYN, no dynamic dependencies, all relocations are R_RELATIVE.
+The linker script does not enforce this; it is enforced by the rtld build flags (`-Wl,-Bsymbolic`, `-nostdlib`, `-nostartfiles`).
+What the linker script does is make sure the resulting binary's section layout works for a binary that has no `.dynamic` section pointing to other libraries.
+
+== Why none of this is in arch/
+
+Notice that `lib/trona/arch/<arch>/` only contains the `libtrona.ld` linker script — not the `fork.S` trampolines.
+The fork trampolines live under `lib/trona/posix/arch/<arch>/fork.S` because they are conceptually part of the trona_posix crate (POSIX `fork` semantics) even though they are written in assembly.
+
+The split makes sense: `arch/` is for files that are physically part of `libtrona.so`'s build but do not belong to any specific Rust crate (linker scripts, in this case).
+`posix/arch/` is for files that are part of the trona_posix crate's surface but happen to need per-architecture implementations.
+
+== Related pages
+
+* xref:../posix/process-and-signals.adoc[Process and Signals] — the `posix_fork` and `_posix_fork_impl` Rust callers of these trampolines.
+* xref:../substrate/threads-and-workers.adoc[Threads, TLS, and Worker Pool] — `_trona_post_fork_child` lives here.
+* xref:../build-system.adoc[Build System] — the `fork.S` and `libtrona.so` build steps.

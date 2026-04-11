@@ -1,0 +1,249 @@
+= Threads, TLS, and Worker Pool
+:description: The substrate ThreadDesc pool, ThreadLocalBlock layout, static TLS initialization, and the run_workers event loop that every SaltyOS server uses
+
+Three closely-related substrate modules make up the threading infrastructure:
+
+[cols="1,1,3"]
+|===
+| Module | Lines | Role
+
+| `substrate/tls.rs`     | 788   | The thread descriptor pool, `ThreadLocalBlock` layout, TP-register management, static TLS initialization, and thread identity.
+| `substrate/worker.rs`  | 1,094 | A personality-neutral worker pool and the `run_workers()` event loop every SaltyOS server uses.
+| `substrate/pending.rs` | 206   | The `PendingRequest` table shared by worker pools that need to track in-flight async operations.
+|===
+
+Together they are what makes multi-threaded servers possible.
+This page walks through them in that order.
+
+== `ThreadDesc` — the pool
+
+Every substrate-managed thread is represented by a `ThreadDesc` struct in a fixed-size per-process pool:
+
+[source,rust]
+----
+pub const MAX_THREADS: usize = 64;
+----
+
+The maximum is shared with the pthread layer — `pthread_create` cannot create more than 64 live threads per process because the pool would overflow.
+The pool is statically allocated inside `substrate/tls.rs`, so no heap is required.
+
+Each `ThreadDesc` carries:
+
+[cols="1,3"]
+|===
+| Field | Purpose
+
+| `state` | Atomic state (`TD_FREE`, `TD_LIVE`, `TD_EXITED`, `TD_REAPING`). Reaped threads transition through `TD_REAPING` so that the reaping thread can make a final check before releasing the slot.
+| `generation` | Incremented every time the slot is reused. The `pthread_t` handle encodes `(pool_index, generation)` so stale handles from reaped threads can be detected.
+| `tls_block` | Pointer to this thread's `ThreadLocalBlock`, where per-thread mutable state lives.
+| `ipc_context` | A `IpcContext` struct (IPC buffer pointer + staged-cap counter) used by every IPC call this thread makes.
+| `tcb_cap` | Capability slot for the kernel TCB that backs this thread.
+| `stack_base`, `stack_size` | The stack region allocated for this thread, used at thread exit to `munmap` it.
+| `owner` | A `ThreadOwner` tag: `Posix`, `Worker`, `Win32`, or `BareRuntime`. Determines how thread exit is handled.
+| `personality_data` | An opaque `*mut u8` that each personality layer (POSIX pthread, Win32 thread) fills with its own per-thread extension data.
+|===
+
+The `owner` tag lets substrate dispatch thread exit differently depending on who created the thread.
+POSIX threads go through `pthread_exit`; worker threads go through `WorkerLoopControl::Exit`; Win32 threads go through the future `trona_win32` exit path; bare-runtime threads just die.
+
+The `personality_data` pointer is how POSIX threads add their own extended state — `PosixThreadExt` (detached flag, procmgr tid, cleanup handler stack, cancellation state) lives at that pointer, allocated from the stack of the thread-creating call.
+
+== `ThreadLocalBlock` — the per-thread static state
+
+Each thread has one `ThreadLocalBlock`, allocated at thread creation time and accessed through the thread pointer (FS base on x86_64, `tpidr_el0` on aarch64).
+The block layout is fixed and known to the compiler so that `#[thread_local]` variables land at predictable offsets.
+
+Key fields:
+
+[cols="1,3"]
+|===
+| Field | Meaning
+
+| `self_ptr` | A pointer that equals `&self` — this is how the thread pointer is dereferenced by ISA conventions that require a base-plus-offset access.
+| `errno` | Per-thread `i32` that basaltc reads through `trona_posix::tls::current_errno()`.
+| `ipc_context` | Per-thread `IpcContext`. Overrides the global `__trona_ipc_ctx` once this thread is alive.
+| `thread_desc_index` | Index into the `ThreadDesc` pool for `tls::current_thread_desc()` lookups.
+| `signal_mask` | Current blocked-signal mask used by `trona_posix::signals`.
+| `cancel_state` | Deferred / asynchronous / disabled — used by `pthread_setcancelstate` / `pthread_setcanceltype`.
+| `cancel_pending` | Set by `pthread_cancel`; checked by substrate sync primitives via the cancellation hook.
+| `tls_static_block` | Pointer to the static TLS block (`.tdata` + `.tbss`) for this thread.
+|===
+
+Total size is small — around 256 bytes — so every thread pays a modest fixed allocation for TLS.
+
+== Static TLS initialization
+
+ELF static TLS is handled entirely outside substrate: rtld parses `PT_TLS` segments during image load, computes the static TLS layout, and writes the result into the `__trona_tls_*` weak symbols documented in xref:index.adoc[substrate Overview].
+Substrate's TLS module then reads those symbols at thread creation time.
+
+The sequence is:
+
+. At rtld time, `ld-trona.so` computes the per-module TLS offsets (x86_64 uses negative offsets from TP; aarch64 uses positive offsets plus a 16-byte TP header) and writes `__trona_tls_template`, `__trona_tls_filesz`, `__trona_tls_memsz`, `__trona_tls_align`, `__trona_tls_module_count`, and `__trona_tls_modules[]`.
+. At thread creation time, `substrate/tls.rs` allocates a new stack + TLS block and calls `initialize_static_tls_for_tp(tp)`. This function copies `[__trona_tls_template, __trona_tls_template + __trona_tls_filesz)` into the thread's static TLS area, zero-fills `[filesz, memsz)`, and writes the thread pointer.
+. On thread entry (`tcb_resume` with the new TLS base), the kernel loads the thread pointer into the appropriate register and starts executing at the user-specified entry point.
+
+On aarch64 there is an extra wrinkle: the first 16 bytes below TP hold a TLS header (`{tls_base, reserved}`) that the `_tlsdesc_static_resolver` PLT resolver walks during dynamic TLS access.
+Substrate sets up those 16 bytes as part of `initialize_static_tls_for_tp`; the x86_64 path does not have this header.
+
+== Thread identity
+
+The current thread can be looked up through three accessors:
+
+[source,rust]
+----
+pub fn current_ipc_ctx() -> *mut IpcContext;
+pub unsafe fn current_thread_desc() -> *mut ThreadDesc;
+pub fn current_thread_index() -> u64;
+----
+
+`current_ipc_ctx()` is the most frequently called — every IPC primitive in xref:substrate/ipc.adoc[IPC] starts with it.
+It walks the thread pointer → `ThreadLocalBlock` → `ipc_context`, falling back to the global `__trona_ipc_ctx` if TLS has not yet been initialized (during very early CRT startup).
+
+`current_thread_index()` returns the zero-based index in the thread pool and is the cheapest way to identify the current thread.
+`pthread_self()` uses it to build the `(pool_index, generation)` `pthread_t` handle.
+
+`current_thread_desc()` is `unsafe` because the caller must guarantee the TLS block has been set up — calling it before `initialize_static_tls_for_tp` returns a null pointer.
+
+== `allocate_thread()` and fork handling
+
+Creating a new thread is a two-step process from the substrate side:
+
+. **Reserve a pool slot.** `allocate_thread(owner)` scans the `ThreadDesc` pool for a `TD_FREE` slot and CAS-transitions it to `TD_LIVE`. If the pool is full, it returns `None` and the caller propagates the failure.
+. **Initialize the slot.** The caller fills in `stack_base`, `stack_size`, `tcb_cap`, `ipc_context.ipc_buffer`, and `personality_data`, then calls the personality-specific entry path (e.g. `PM_THREAD_CREATE` for POSIX threads).
+
+Thread exit runs in reverse: the personality layer marks the slot `TD_EXITED`, the reaping thread transitions `TD_EXITED → TD_REAPING → TD_FREE` (bumping `generation` in the process), and the stack is unmapped through `posix_munmap`.
+
+There is also a `post_fork_child` hook that the x86_64 and aarch64 `fork.S` trampolines call immediately after a successful fork.
+Its job is to reinitialize the child's thread pool (every thread except the forking one is dead in the child) and reset per-process counters — the forking thread stays alive but needs a fresh `ThreadDesc` index in the new process.
+See xref:../internals/fork-and-linker-scripts.adoc[fork.S and Linker Scripts] for how the trampoline reaches this hook.
+
+== Worker pool — `substrate/worker.rs`
+
+Every SaltyOS server — VFS, procmgr, mmsrv, namesrv, dnssrv, SaltyFS, the network stack — runs on top of the same `run_workers()` event loop from `substrate/worker.rs`.
+The loop is personality-neutral: it knows about `TronaMsg`, endpoints, and notifications, and nothing about POSIX or Win32.
+
+=== WorkerConfig
+
+A server declares its worker pool through a `WorkerConfig` struct:
+
+[source,rust]
+----
+pub struct WorkerConfig {
+    pub worker_count: u32,         // including worker #0
+    pub endpoints: *const Cap,     // endpoints every worker receives on
+    pub endpoint_count: usize,     // length of the endpoints array
+    pub untyped: Cap,              // source untyped for TCB / stack frame allocation
+    pub self_tcb: Cap,             // the main thread's TCB (becomes worker #0)
+    pub self_sc: Cap,              // the main thread's sched context
+    pub stack_pages: u64,          // pages per worker stack
+    pub pool_budget_us: u64,       // optional shared sched budget
+    pub pool_period_us: u64,       // optional shared sched period
+    pub cspace_depth: u8,
+}
+----
+
+Setting `worker_count = 4` with two endpoints and sixteen-page stacks is typical for a medium-traffic server.
+`worker_count = 1` is valid — it turns `run_workers` into a plain single-threaded event loop on the calling thread.
+
+=== The handler signature
+
+Every worker calls back into a single user-provided handler:
+
+[source,rust]
+----
+type WorkerHandler = fn(
+    in_msg: *const TronaMsg,
+    badge: u64,
+    source: u64,
+    reply: *mut TronaMsg,
+) -> WorkerLoopControl;
+----
+
+`WorkerLoopControl` is a three-valued enum:
+
+- `Reply` — send the contents of `reply` back to the caller, then wait for the next request.
+- `NoReply` — skip the reply; jump straight to the next receive. Used when the handler decides to defer the response (for example, adding the request to the `PendingRequest` table for later completion).
+- `Exit` — the worker is done. Worker #0 must never return `Exit` — if it does, substrate falls into an infinite yield loop because the main thread has no stack to unwind to.
+
+The handler is the only server-specific code; everything else — thread startup, endpoint receive, reply-recv transitions, exit bookkeeping — lives in substrate.
+
+=== Run loop structure
+
+`run_workers()` does three things:
+
+. Spawn worker threads 1 through `worker_count - 1`. Each gets its own stack from a freshly-retyped frame, a new TCB, and enters the shared event loop.
+. Convert the calling thread into worker #0 and enter the same event loop.
+. Never return. Worker #0 does not have a "done" state; when the server shuts down, the process as a whole exits.
+
+Inside the loop, each worker does:
+
+[source]
+----
+loop {
+    // First iteration: plain receive. After that: reply_recv.
+    if first_iteration {
+        recv_any_ctx(ctx, endpoints, count, &msg, &badge, &source);
+    } else {
+        reply_recv_any_ctx(ctx, endpoints, count, &reply, &msg, &badge, &source);
+    }
+
+    let control = handler(&msg, badge, source, &mut reply);
+
+    match control {
+        Reply => {
+            // Loop back — reply_recv will send `reply` and block for next.
+        }
+        NoReply => {
+            // Set reply = empty, loop back — the "reply" will be a no-op.
+        }
+        Exit => {
+            if worker_id == 0 { yield_forever(); }
+            else { reap_self(); }
+        }
+    }
+}
+----
+
+Notice that `recv_any_ctx` is only used for the first iteration — subsequent iterations go through `reply_recv_any_ctx`, which is the fastpath-eligible primitive.
+This is a measurable win for server throughput: a worker that is busy handling requests never pays the slowpath for `recv`.
+
+=== FIFO dispatch
+
+The kernel handles dispatch across multiple workers by waking the FIFO-first waiter on each endpoint.
+When a request arrives on an endpoint, the kernel picks the oldest waiter currently blocked in `reply_recv_any` on that endpoint and hands the request to that worker.
+This gives fair throughput across workers without any userspace scheduling logic.
+
+== Pending request table — `substrate/pending.rs`
+
+Long-running server operations cannot hold a worker hostage.
+If a VFS read has to wait on disk I/O for 10ms, tying up a worker for that whole time would cause head-of-line blocking for every other request on that endpoint.
+The solution is the `PendingRequest` table.
+
+A server that accepts a request but cannot respond immediately:
+
+. Stores a `PendingRequest { request_id, wait_reason, reply_cap, client_badge, … }` in the `pending.rs` table.
+. Saves the client's reply capability via `cnode_save_caller` so it can reply later even after handling other requests.
+. Returns `WorkerLoopControl::NoReply` from the worker handler.
+. When the underlying resource becomes ready, the server looks up the pending record by `request_id`, builds a reply, invokes the saved reply cap, and removes the record.
+
+`pending.rs` is just 206 lines — it is a small fixed-size table with a spinlock around it, plus helpers for allocation, lookup, and removal.
+The table is small (tens of entries per server) because real workloads rarely have more than a few tens of concurrent in-flight async operations.
+
+The key contract is that `PendingRequest.client_badge` matches the original caller badge, so the server can double-check on reply that it is responding to the right client — catching the race where a client exits and its reply cap becomes stale.
+
+== Why this all lives in substrate
+
+All three modules sit at the substrate layer rather than in trona_posix or in individual servers because:
+
+- **Worker pools precede POSIX.** Several servers (init, namesrv, early rsrcsrv) run before the POSIX personality is wired up. They still need a worker loop.
+- **TLS precedes everything.** `current_ipc_ctx()` is on the hot path of every syscall, so it has to live in the lowest layer.
+- **Fork needs a neutral hook.** The fork trampoline is assembly in `posix/arch/` but the post-fork reset runs in Rust — and substrate is the lowest layer that Rust code from `fork.S` can call into.
+
+By putting the infrastructure in substrate, trona_posix's pthread layer, the future `trona_win32` thread shim, and every bare Rust server all get the same building blocks without each reinventing the thread pool.
+
+== Related pages
+
+* xref:substrate/sync-primitives.adoc[Synchronization Primitives] — the `Mutex`/`RWLock`/`Condvar` used inside this thread infrastructure and consumed by its users.
+* xref:substrate/ipc.adoc[IPC] — the `recv_any_ctx` / `reply_recv_any_ctx` primitives the worker loop calls.
+* xref:../posix/pthread.adoc[POSIX Threads] — the trona_posix layer that wraps the `ThreadDesc` pool with pthread semantics.
+* xref:../internals/fork-and-linker-scripts.adoc[fork.S and Linker Scripts] — the arch-specific entry into `post_fork_child`.

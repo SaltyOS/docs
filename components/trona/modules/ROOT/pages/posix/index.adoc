@@ -1,0 +1,151 @@
+= trona_posix Overview
+:description: The POSIX-shaped Rust client crate that delegates every operation to a substrate IPC call
+
+`trona_posix` is the crate that turns POSIX-shaped Rust calls into substrate IPC messages.
+Every `posix_*` function in it is a thin translator: read the arguments, build a `TronaMsg`, pick the right server endpoint from xref:../substrate/layout-and-caps.adoc[`substrate::caps`], call `trona::ipc::call_ctx`, and unpack the reply.
+
+The crate is 6,927 lines across 17 files.
+It is the crate basaltc's C ABI wrappers call into — when a C program does `write(fd, buf, len)`, the chain is:
+
+[source]
+----
+basaltc::unistd::write
+  → trona_posix::file::posix_write
+    → trona::ipc::call_ctx  (label = VFS_WRITE)
+      → trona::syscall::syscall(SYS_CALL, ...)
+        → kernel IPC fastpath
+          → vfs server handles the request
+----
+
+There is no meaningful work in trona_posix beyond argument marshalling and error translation.
+The actual POSIX semantics — how a read from a pipe blocks, how `O_NONBLOCK` affects a socket, how `mmap(fd)` resolves the backing store — live either in the consumed server (VFS, mmsrv, …) or in the kernel.
+trona_posix is the wire protocol.
+
+== Module map
+
+The crate is flat: there are no subdirectories other than `arch/` for per-architecture `fork.S`.
+
+[cols="1,1,3,2"]
+|===
+| Module | Lines | Role | Page
+
+| `pthread`  | 965 | POSIX thread lifecycle — `pthread_create`, `pthread_join`, `pthread_exit`, `pthread_detach`, deferred cancellation, cleanup handler stack. Everything is delegated to procmgr via `PM_THREAD_*` IPC labels. | xref:posix/pthread.adoc[POSIX Threads]
+| `proc`     | 892 | Process management and time — `posix_fork`, `posix_execve`, `posix_waitpid`, `posix_exit`, uid/gid accessors, `posix_clock_gettime`, `posix_nanosleep`. | xref:posix/process-and-signals.adoc[Process and Signals]
+| `file`     | 753 | File I/O — `posix_open`, `posix_read`, `posix_write`, `posix_stat`, `posix_fstat`, `posix_lseek`, `posix_chmod`, `posix_ftruncate`, with automatic bulk-SHM transfer for large payloads. | xref:posix/file-and-at.adoc[File I/O and *at() Family]
+| `socket`   | 731 | Sockets — full BSD/POSIX surface (`socket`, `bind`, `listen`, `accept`, `connect`, `send*`, `recv*`, `sendmsg`, `recvmsg`, socket options, epoll glue). | xref:posix/sockets-and-dns.adoc[Sockets and DNS]
+| `lib.rs`   | 644 | Module declarations, global signal state, error-code translation helpers, C ABI exports, re-exports from `trona::consts` and `trona::types`. | this page
+| `misc`     | 587 | Everything that does not fit elsewhere — `umask`, `uname`, `fcntl`, `isatty`, `ioctl`, `chdir`, `getcwd`, `tcgetattr`, `tcsetattr`, `shm_open`, `shm_unlink`. | scattered
+| `at`       | 441 | The `*at()` family — `openat`, `fstatat`, `unlinkat`, `renameat`, `linkat`, `symlinkat`, `faccessat`, `fchmodat`, with `AT_SYMLINK_NOFOLLOW` handling. | xref:posix/file-and-at.adoc[File I/O and *at() Family]
+| `dns`      | 394 | DNS client — `dns_resolve`, `posix_getaddrinfo`, `posix_gethostbyname`, `dns_reverse_lookup`. Talks to dnssrv through a lazily-resolved endpoint. | xref:posix/sockets-and-dns.adoc[Sockets and DNS]
+| `signals`  | 386 | POSIX signal delivery — `posix_sigaction`, `posix_sigprocmask`, `posix_sigsuspend`, `posix_kill`, `posix_raise`, the `posix_sigcheck` cooperative poll, and the kernel-injected `__signal_dispatcher` frame layout. | xref:posix/process-and-signals.adoc[Process and Signals]
+| `poll`     | 207 | Multiplexing — `posix_poll`, `posix_select`, `posix_epoll_create` / `_ctl` / `_wait`, with `PollFd` and `EpollEvent` types. | xref:posix/poll-pipe-bulk.adoc[Poll, Pipe, and Bulk I/O]
+| `bulk`     | 206 | Internal-only SHM-based bulk transfer path for payloads larger than the IPC register window. Called by `file.rs` and `socket.rs` when they need to move more than a few hundred bytes. | xref:posix/poll-pipe-bulk.adoc[Poll, Pipe, and Bulk I/O]
+| `mm`       | 190 | `posix_brk`, `posix_sbrk`, `posix_mmap` (anonymous and file-backed), `posix_munmap`, `posix_mprotect`, `posix_msync`. | xref:posix/mm.adoc[POSIX Memory Management]
+| `pipe`     | 123 | `posix_pipe`, `posix_pipe2`, `posix_dup`, `posix_dup2`, `posix_dup3`, `posix_mkfifo`. | xref:posix/poll-pipe-bulk.adoc[Poll, Pipe, and Bulk I/O]
+| `tls`      | 110 | Per-thread accessors — `current_tls()`, `current_errno()`, `init_main_thread_tls()`, `tls_addr(module_id, offset)` for dynamic TLS. | xref:posix/pthread.adoc[POSIX Threads]
+| `consts`   | 8   | Trivial shim. Exists for symmetry with the other substrate-style modules. | —
+| `protocol` | 3   | Trivial shim. | —
+| `types`    | 4   | Trivial shim. | —
+|===
+
+Plus `arch/x86_64/fork.S` (154 lines) and `arch/aarch64/fork.S` (129 lines) — the fork trampolines covered in xref:../internals/fork-and-linker-scripts.adoc[fork.S and Linker Scripts].
+
+== Server delegation map
+
+Every `posix_*` function eventually targets one of six endpoints in the substrate cap table.
+The delegation pattern is fixed:
+
+[cols="1,2,3"]
+|===
+| Module | Primary target | Typical labels
+
+| `file`     | `caps::vfs_ep()`     | `VFS_POSIX_OPEN`, `VFS_READ`, `VFS_WRITE`, `VFS_POSIX_STAT`, `VFS_LSEEK`, `VFS_POSIX_FSTAT`, `VFS_POSIX_UNLINK`, `VFS_POSIX_FTRUNCATE`, `VFS_FSYNC`
+| `at`       | `caps::vfs_ep()`     | `VFS_POSIX_OPENAT`, `VFS_POSIX_FSTATAT`, `VFS_POSIX_UNLINKAT`, `VFS_POSIX_RENAMEAT`, `VFS_POSIX_LINKAT`, `VFS_POSIX_SYMLINKAT`, `VFS_POSIX_FACCESSAT`, `VFS_POSIX_FCHMODAT`
+| `socket`   | `caps::vfs_ep()`     | `VFS_POSIX_SOCKET`, `VFS_POSIX_BIND`, `VFS_POSIX_LISTEN`, `VFS_POSIX_ACCEPT`, `VFS_POSIX_CONNECT`, `VFS_POSIX_SENDMSG`, `VFS_POSIX_RECVMSG`, `VFS_POSIX_EPOLL_*`, `VFS_POSIX_GETSOCKNAME`, `VFS_POSIX_GETPEERNAME`, `VFS_POSIX_SETSOCKOPT`, `VFS_POSIX_GETSOCKOPT`
+| `pipe`     | `caps::vfs_ep()`     | `VFS_POSIX_PIPE`, `VFS_POSIX_DUP`, `VFS_POSIX_DUP2`, `VFS_POSIX_DUP3`, `VFS_POSIX_MKFIFO`
+| `poll`     | `caps::vfs_ep()`     | `VFS_POSIX_POLL`, `VFS_POSIX_EPOLL_*`
+| `misc`     | `caps::vfs_ep()`, `caps::procmgr_ep()` | `VFS_POSIX_IOCTL`, `VFS_POSIX_CHDIR`, `VFS_POSIX_GETCWD`, `VFS_POSIX_TCGETATTR`, `VFS_POSIX_TCSETATTR`, `VFS_POSIX_ISATTY`, `VFS_POSIX_FCNTL`, `VFS_POSIX_SHM_OPEN`, `VFS_POSIX_SHM_UNLINK`, plus `PM_UMASK`, `PM_SETITIMER`, `PM_GETITIMER`
+| `proc`     | `caps::procmgr_ep()` | `PM_EXIT`, `PM_WAIT`, `PM_GETPID`, `PM_FORK`, `PM_EXEC`, `PM_KILL`, `PM_GETUID`, `PM_GETGID`, `PM_SETPGID`, `PM_GETPGID`, `PM_SETSID`, `PM_GETSID`, `PM_GETGROUPS`, credentials (`PM_SET*UID`, `PM_SET*GID`, `PM_SETRES*`, `PM_GETRES*`), `PM_GETRLIMIT`, `PM_SETRLIMIT`
+| `pthread`  | `caps::procmgr_ep()` | `PM_THREAD_CREATE`, `PM_THREAD_EXIT`, `PM_THREAD_JOIN`, `PM_THREAD_DETACH`, `PM_THREAD_LIST`
+| `mm`       | `caps::mmsrv_ep()`   | `MM_BRK`, `MM_SBRK`, `MM_MMAP`, `MM_FILE_MMAP`, `MM_MUNMAP`, `MM_MPROTECT`, `MM_SYNC_FILE_BACKING`
+| `dns`      | lazily resolved via `caps::namesrv_ep()` → `dnssrv` endpoint | `DNS_RESOLVE`, `DNS_CACHE_FLUSH`, `DNS_REVERSE_LOOKUP`
+| `signals`  | `caps::signal_ntfn()` (notification, not endpoint) | `PM_SIGACTION`, `PM_KILL`, plus futex-based dispatcher on the signal notification
+|===
+
+xref:../abi/protocol-labels.adoc[IPC Protocol Labels] is the authoritative source for the full label catalog.
+
+== The `trona_err_to_posix` translator
+
+Every `posix_*` function that returns an `i32` uses the internal `trona_err_to_posix` helper in `posix/lib.rs` to convert a substrate `TRONA_*` error into a negative POSIX errno value:
+
+[source,rust]
+----
+pub(crate) fn trona_err_to_posix(label: u64) -> i32 {
+    match label {
+        TRONA_OK => 0,
+        TRONA_NOT_FOUND => -2,                // ENOENT
+        TRONA_ALREADY_EXISTS => -17,           // EEXIST
+        TRONA_SLOT_OCCUPIED => -17,            // EEXIST
+        TRONA_ALREADY_MAPPED => -17,           // EEXIST
+        TRONA_INVALID_ARGUMENT => -22,         // EINVAL
+        TRONA_OUT_OF_MEMORY => -12,            // ENOMEM
+        TRONA_BUSY => -16,                     // EBUSY
+        TRONA_ALREADY_BOUND => -16,            // EBUSY
+        TRONA_WOULD_BLOCK => -11,              // EAGAIN
+        TRONA_IN_PROGRESS => -115,             // EINPROGRESS
+        TRONA_BAD_ADDRESS => -14,              // EFAULT
+        TRONA_INSUFFICIENT_RIGHTS => -13,      // EACCES
+        // ...
+    }
+}
+----
+
+The return is negative so basaltc can distinguish errors from success by sign without carrying a separate flag word.
+Callers in basaltc flip the sign, store the positive value in thread-local `errno`, and return `-1` to the C caller.
+
+Notice that multiple `TRONA_*` codes can collapse into the same POSIX errno: `TRONA_ALREADY_EXISTS`, `TRONA_SLOT_OCCUPIED`, and `TRONA_ALREADY_MAPPED` all become `EEXIST`, because POSIX does not distinguish between "a file already exists with this name" and "a capability slot was already occupied by a prior step".
+The substrate-side distinction is preserved only at the trona layer, which is sometimes useful for debugging but is opaque to POSIX code.
+
+== Global signal state
+
+`posix/lib.rs` also owns the global signal state shared between `signals.rs` and the C ABI exports:
+
+[source,rust]
+----
+pub static mut __sig_handlers: [AtomicU64; NSIG];
+pub static mut __sig_blocked_mask: AtomicU64;
+pub static mut __sig_sa_mask: [AtomicU64; NSIG];
+pub static mut __sig_sa_flags: [AtomicU32; NSIG];
+pub static mut __sig_last_restart: AtomicBool;
+----
+
+- `__sig_handlers[i]` is the user-provided handler function pointer, or `SIG_DFL = 0` / `SIG_IGN = 1`.
+- `__sig_blocked_mask` is the bitmask of currently blocked signals.
+- `__sig_sa_mask[i]` is the extra mask a handler runs under (the sa_mask from `sigaction`).
+- `__sig_sa_flags[i]` is the `SA_*` flags for signal `i`.
+- `__sig_last_restart` records whether the most recently delivered signal had `SA_RESTART` set.
+
+These live in the crate root because both `signals.rs` (the installer and internal dispatcher) and the C ABI exports in `lib.rs` (the direct entry points basaltc calls) need to read and write them.
+See xref:posix/process-and-signals.adoc[Process and Signals] for how these are used.
+
+== Why there is no sync module here
+
+It is worth calling out that `trona_posix` has no `sync.rs`.
+Every pthread mutex, rwlock, condvar, and once in basaltc is ultimately a `trona::sync::*` primitive from substrate.
+The pthread layer in `pthread.rs` adds the POSIX semantics on top (recursive / errorcheck flavors, `sa_mask` for cancellation handlers, etc.) but the underlying lock is substrate's.
+
+This is the opposite of how glibc is structured, where libpthread owns its own lock implementation.
+In SaltyOS, sync primitives have to work before `trona_posix` is loaded (the slot allocator needs a spinlock during rtld startup), so they live in substrate; `trona_posix::pthread` is a wrapper layer, not an implementation layer.
+
+See xref:../substrate/sync-primitives.adoc[Synchronization Primitives] for the details.
+
+== Related pages
+
+* xref:posix/file-and-at.adoc[File I/O and *at() Family] — the `file` and `at` modules.
+* xref:posix/process-and-signals.adoc[Process and Signals] — the `proc` and `signals` modules.
+* xref:posix/sockets-and-dns.adoc[Sockets and DNS] — the `socket` and `dns` modules.
+* xref:posix/poll-pipe-bulk.adoc[Poll, Pipe, and Bulk I/O] — the `poll`, `pipe`, and `bulk` modules.
+* xref:posix/mm.adoc[POSIX Memory Management] — the `mm` module.
+* xref:posix/pthread.adoc[POSIX Threads] — the `pthread` and `tls` modules.
+* xref:../substrate/ipc.adoc[IPC] — the substrate primitive every `posix_*` call flows through.
+* xref:basalt::internals/trona-boundary.adoc[basalt: The trona boundary] — the view from the C side.

@@ -1,0 +1,268 @@
+= PE Loader and CPIO Archive
+:description: trona_loader/pe_loader.rs PE32+ loading and trona_loader/cpio.rs newc CPIO parser
+
+The other half of `trona_loader` covers two distinct but related topics:
+
+[cols="1,1,3"]
+|===
+| File | Lines | Role
+
+| `loader/pe_loader.rs` | 1,067 | PE32+ (Windows 64-bit) executable loader. Same scratch-map strategy as the ELF loader, plus base relocations and import directory parsing.
+| `loader/pe_types.rs`  | 10    | Re-exports PE/COFF type definitions from `trona::types::pe`.
+| `loader/cpio.rs`      | 394   | CPIO newc (magic `070701`) archive parser used by `init` and the rtld to read binaries out of the initrd.
+|===
+
+The PE loader is the larger of the two — at 1,067 lines it is actually 50% larger than `elf_loader.rs` because PE has more shapes than ELF (separate optional header, base relocation tables, import directory walking).
+The CPIO parser is a small standalone utility that has no overlap with the loader logic.
+
+== `pe_loader.rs` — PE32+ executable loading
+
+The PE loader follows the same scratch-map strategy as the ELF loader: allocate a frame, map it locally, copy bytes in, unmap, then map into the destination vspace.
+What's different is the file structure it has to walk and the relocation model.
+
+=== `pe_validate` — header walking
+
+[source,rust]
+----
+pub unsafe fn pe_validate(
+    data: *const u8,
+    data_len: usize,
+    info: *mut PeInfo,
+) -> i32;
+----
+
+Validation walks the headers in order:
+
+. **DOS header** at offset 0. Check `e_magic == PE_DOS_MAGIC` (`0x5A4D` = `MZ`). Read `e_lfanew` to find the PE header.
+. **PE signature** at `e_lfanew`. Check it equals `PE_SIGNATURE` (`0x00004550` = `PE\0\0`).
+. **COFF header** immediately after. Check the machine type matches the current architecture (`PE_MACHINE_AMD64 = 0x8664` on x86_64, `PE_MACHINE_ARM64 = 0xAA64` on aarch64) and that `IMAGE_FILE_EXECUTABLE_IMAGE` is set in characteristics.
+. **Optional header** after the COFF header. Check `magic == PE_OPT_MAGIC_PE32PLUS` (`0x020B`). Read the entry point, image base, section alignment, file alignment, and size.
+
+Validation returns one of:
+
+[cols="1,2,3"]
+|===
+| Code | Constant | Meaning
+
+| 0  | `PE_OK`            | Valid PE32+ executable.
+| 20 | `PE_NOT_PE`        | Failed magic / signature check.
+| 21 | `PE_NOT_64BIT`     | Optional header is 32-bit, not PE32+.
+| 22 | `PE_BAD_ARCH`      | Wrong machine type.
+| 23 | `PE_NO_SECTIONS`   | No section headers.
+| 24 | `PE_RELOC_FAILED`  | Base relocation processing failed.
+| 25 | `PE_OUT_OF_MEMORY` | Frame allocation failed.
+| 26 | `PE_TOO_SMALL`     | Buffer too short.
+| 27 | `PE_MAP_FAILED`    | `vspace_map` returned an error.
+| 28 | `PE_BAD_IMPORT`    | Import directory parsing failed.
+|===
+
+These codes intentionally start at 20 to avoid colliding with the ELF error codes (0..11).
+
+=== `pe_load`
+
+[source,rust]
+----
+pub unsafe fn pe_load(
+    data: *const u8,
+    data_len: usize,
+    load_base: u64,
+    ctx: &mut ElfLoaderCtx,    // shared with ELF
+    result: *mut PeLoadResult,
+) -> i32;
+----
+
+Note that the PE loader reuses `ElfLoaderCtx` from the ELF loader — the slot allocator, scratch slot, and untyped source are identical.
+This keeps init/procmgr from having to maintain two parallel allocator states.
+
+The flow:
+
+. Validate the PE header (as above).
+. Walk the section table. For each section, allocate frames, scratch-map them, copy bytes from the file, and remap into the destination vspace at `(image_base + section.virtual_address)` with permissions derived from the section characteristics (`IMAGE_SCN_MEM_READ`, `IMAGE_SCN_MEM_WRITE`, `IMAGE_SCN_MEM_EXECUTE`).
+. If `load_base != image_base`, run the base relocation pass.
+. Return the relocated entry point and the load base in `*result`.
+
+=== Base relocations — `IMAGE_REL_BASED_DIR64`
+
+PE base relocations are needed when the image is loaded at an address other than its preferred `image_base`.
+They live in the `IMAGE_DIRECTORY_ENTRY_BASERELOC` (index 5) data directory and are organized as a series of **blocks**, each block covering one 4 KiB page:
+
+[source]
+----
++----------------------------+
+| BaseRelocation header      |
+|   virtual_address (4 B)    |  ← page base address (image-relative)
+|   size_of_block (4 B)      |  ← total block size including header
++----------------------------+
+| Entry 0  (2 bytes)         |  ← high 4 bits = type, low 12 bits = offset
+| Entry 1  (2 bytes)         |
+| ...                        |
++----------------------------+
+----
+
+The PE loader supports exactly one relocation type:
+
+- **`IMAGE_REL_BASED_DIR64`** (`type = 10`) — add the delta to the 8-byte little-endian value at `virtual_address + offset`.
+
+The other type that appears in real PE files is `IMAGE_REL_BASED_ABSOLUTE` (type 0), which is a no-op padding entry to keep blocks 4-byte aligned.
+The loader silently skips them.
+
+Other PE relocation types (`HIGHLOW`, `HIGH`, `LOW`, `DIR16`) only appear in 32-bit images and are not supported.
+
+=== Import directory parsing
+
+[source,rust]
+----
+pub struct PeImports {
+    pub count: u8,
+    pub names: [[u8; 32]; 16],   // up to 16 DLLs, 32-byte names
+}
+
+pub unsafe fn pe_get_imports(data: *const u8, data_len: usize, info: *const PeInfo) -> PeImports;
+----
+
+`pe_get_imports` walks the `IMAGE_DIRECTORY_ENTRY_IMPORT` (index 1) data directory and copies up to 16 imported DLL names into a fixed-size buffer.
+The 16-and-32 limits are similar to the ELF loader's `NeededLibs` structure — SaltyOS PE binaries currently link against `kernel32.dll` and rarely much else.
+
+The actual binding of imports — populating the Import Address Table with resolved function pointers — happens in the PE rtld (`ld-trona-pe.so`), not in the loader.
+The loader's job is just to identify what DLLs are needed; the rtld then sends `W32_RESOLVE_IMPORT` IPCs to win32_csrss to get the addresses.
+
+=== `pe_resolve_imports` — callback-based IAT population
+
+For callers that want to resolve imports themselves rather than going through the rtld, the loader exposes:
+
+[source,rust]
+----
+pub type ImportResolver = unsafe fn(
+    state: *mut (),
+    dll_name: *const u8,
+    func_name: *const u8,
+    func_ordinal: u32,
+) -> u64;
+
+pub unsafe fn pe_resolve_imports(
+    data: *const u8,
+    data_len: usize,
+    info: *const PeInfo,
+    resolver: ImportResolver,
+    state: *mut (),
+) -> i32;
+----
+
+The resolver callback is called once per imported function with the DLL name, function name (or ordinal hint), and is expected to return the resolved virtual address.
+The loader writes that address into the import address table.
+
+This is the path that init uses for the PE binaries it spawns directly without going through procmgr — it provides a static resolver that returns hard-coded addresses for the small set of `kernel32.dll` functions early-boot PE binaries need.
+Production PE spawning goes through procmgr → rtld with the dynamic `W32_RESOLVE_IMPORT` path.
+
+=== `pe_count_load_pages` and `pe_compute_load_span`
+
+[source,rust]
+----
+pub unsafe fn pe_count_load_pages(data: *const u8, data_len: usize) -> usize;
+pub unsafe fn pe_compute_load_span(data: *const u8, data_len: usize) -> u64;
+----
+
+Same role as their ELF counterparts: page count for slot reservation, total VA span for layout planning.
+These walk the section table rather than program headers but produce the same shape of result.
+
+== `pe_types.rs` — type re-exports
+
+`pe_types.rs` is 10 lines of `pub use trona::types::pe::{...};` declarations:
+
+[source,rust]
+----
+pub use trona::types::pe::{
+    DosHeader,
+    CoffHeader,
+    OptionalHeader64,
+    SectionHeader,
+    DataDirectory,
+    ImportDescriptor,
+    BaseRelocation,
+    PeLoadResult,
+    PeInfo,
+};
+----
+
+The actual definitions live in `lib/trona/uapi/types/pe.rs` so that they can be shared between the loader, the PE rtld, and any future PE-aware userland code.
+Re-exporting through `pe_types.rs` is just a convenience for callers that import everything from `trona_loader`.
+
+== `cpio.rs` — newc archive parser
+
+CPIO is the format SaltyOS uses for the initrd because it is the simplest archive format that supports the metadata POSIX needs (mode, owner, mtime, hard links).
+trona_loader includes its own parser because the loader runs before any filesystem is mounted, so it cannot use the VFS to read the archive — it has to walk the bytes directly.
+
+=== Format
+
+The newc CPIO format (magic `070701`) consists of a sequence of 110-byte ASCII headers, each followed by the file name (NUL-padded to 4-byte alignment), then the file data (also NUL-padded), then the next header.
+The archive ends with a sentinel entry whose name is exactly the 10-byte string `TRAILER!!!`.
+
+The 110-byte header is all ASCII hex digits — every numeric field is 8 hex characters representing a 32-bit value:
+
+[source]
+----
+struct CpioHeader {
+    magic[6];        // "070701"
+    ino[8];          // inode
+    mode[8];         // file mode
+    uid[8];          // owner uid
+    gid[8];          // owner gid
+    nlink[8];        // hard link count
+    mtime[8];        // modification time
+    filesize[8];     // file size in bytes
+    devmajor[8];
+    devminor[8];
+    rdevmajor[8];
+    rdevminor[8];
+    namesize[8];     // path length including NUL
+    check[8];        // CRC (zero for newc)
+}
+----
+
+trona_loader does not validate the inode, owner, or timestamp fields — it only cares about `mode`, `filesize`, and `namesize`.
+
+=== Public API
+
+[cols="2,3"]
+|===
+| Function | Role
+
+| `cpio_find_file(archive, archive_len, name, name_len, entry)`
+| Search the archive for an entry whose name matches `name`. Returns 1 on success and fills `*entry` with `{ data_offset, data_len, mode }`. Returns 0 if not found.
+
+| `cpio_next(archive, archive_len, offset, entry)`
+| Sequential iteration. Caller starts with `offset = 0`; the function fills `*entry` with the next entry's info and returns the offset of the entry **after** that one. Returns 0 when the iteration reaches `TRAILER!!!`.
+
+| `cpio_next_ext(archive, archive_len, offset, entry_ext)`
+| Same as `cpio_next` but the extended entry includes mode, uid, gid, and mtime. Used by code that needs to apply permissions.
+
+| `cpio_archive_size(archive, archive_len)`
+| Return the total archive size including the trailer. Used by the spawner to know how much memory to reserve for the initrd mapping.
+|===
+
+All four functions are `no_std` and pure — they take only raw byte pointers and write into caller-supplied output structs.
+There is no internal allocation.
+
+=== Two CPIO parsers in the tree
+
+`kernite/src/cpio.rs` (the kernel's CPIO parser) and `lib/trona/loader/cpio.rs` (this one) are intentionally separate.
+The kernel parser runs in kernel mode against a temporary mapping of the initrd before the page allocator is initialized; it cannot share code with userspace because of the address-space and `core` library constraints.
+The loader parser runs in normal userland and uses `usize` and `u64` from `core` freely.
+
+The two parsers are kept in sync by hand whenever the format changes — which never happens, because newc is a stable format from the early 1990s.
+
+=== Who uses cpio.rs
+
+- **`init`** — reads `.service` files and binary names out of the initrd at boot.
+- **`ld-trona.so`** (the ELF rtld, via `rtld_internal.h` which has its own copy) — actually the rtld has its **own** CPIO parser because it runs before libtrona is loaded; the rtld cannot link against `trona_loader::cpio` for the same reason it cannot link against substrate.
+- **`procmgr`** — when spawning binaries that live in the initrd rather than on disk.
+
+The rtld's parser, the loader's parser, and the kernel's parser are three separate copies of the same algorithm.
+This duplication is unfortunate but unavoidable: each one runs in a context where the others are not yet available.
+
+== Related pages
+
+* xref:loader/elf-loader.adoc[ELF Loader] — the sibling module in the same crate.
+* xref:../rtld/pe-rtld.adoc[PE Dynamic Linker] — the consumer of `pe_loader.rs` for live PE binaries.
+* xref:../win32/kernel32-stub.adoc[kernel32.dll PE Stub] — the PE binary that PE loader's import resolution targets.
+* xref:../abi/invoke-labels.adoc[Invoke Labels] — the kernel operations both loaders use.

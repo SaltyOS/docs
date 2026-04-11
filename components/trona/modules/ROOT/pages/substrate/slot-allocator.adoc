@@ -1,0 +1,200 @@
+= Slot Allocator
+:description: The multi-segment bump allocator for CNode slots, its spinlock-protected state, and the async CSpace expansion protocol it uses when it runs out
+
+Almost every kernel object in SaltyOS userspace ends up living in a CNode slot somewhere.
+Spawning a TCB, mapping a new frame, retyping a fresh endpoint, staging a cap for IPC transfer — all of it requires an empty destination slot.
+`substrate/slot_alloc.rs` is the module that hands out those slots.
+
+It is 729 lines, protected by a single global spinlock, and has one unusual trick: when it runs out of slots, it asks procmgr to grow the calling process's CNode and then probes for the new range on the caller's thread without blocking inside the allocator.
+
+== Where slots come from
+
+At spawn time, the spawner (init or procmgr) carves out a contiguous range of CNode slots in the new child's root CNode and passes the layout through the `AT_TRONA_CSPACE_LAYOUT` auxv tag.
+The tag points at a `TronaCspaceLayoutV1` struct:
+
+[source,rust]
+----
+#[repr(C)]
+pub struct TronaCspaceLayoutV1 {
+    pub version: u64,
+    pub flags: u64,
+    pub cnode_bits: u64,
+    pub frame_slot_base: u64,
+    pub alloc_base: u64,      // first slot available to the allocator
+    pub alloc_limit: u64,     // one-past-last slot
+    pub recv_base: u64,       // cap-receive slot range
+    pub recv_limit: u64,
+    pub expand_base: u64,     // reserved for CSpace expansion sub-CNodes
+    pub expand_limit: u64,
+}
+----
+
+The allocator reads `[alloc_base, alloc_limit)` out of this struct and seeds its initial segment with that range.
+Everything else — the receive range, the expansion range, and the well-known cap slots below `alloc_base` — is off-limits to the allocator.
+
+== The segment data structure
+
+Internally, the allocator is a chained array of **segments**.
+Each segment is a contiguous slot range with a bitmap that tracks which slots are free:
+
+[source,rust]
+----
+const MAX_SEGMENTS: usize = 16;
+const MAX_SEGMENT_SLOTS: usize = 4096;
+const SEGMENT_BITMAP_WORDS: usize = MAX_SEGMENT_SLOTS / 64;  // = 64
+
+#[derive(Clone, Copy)]
+struct Segment {
+    base: Cap,                              // first slot in this segment
+    count: u64,                             // number of slots
+    alloc_hint: u64,                        // next bit to probe
+    used: u64,                              // currently allocated count
+    bits: [u64; SEGMENT_BITMAP_WORDS],      // 64 words = 4,096 bits
+}
+----
+
+The constants matter:
+
+- **16 segments max.** After 16 segments are populated, the allocator refuses further expansions.
+- **4,096 slots max per segment.** Larger segments would require a wider bitmap; 64 × u64 = 4,096 is a clean page-sized word count.
+- **`alloc_hint`** is a probe cursor: allocations start the linear bitmap scan from here rather than from the start of the segment, which makes sequential allocation O(1) amortized.
+
+The segment layout is allocated at static-lifetime inside `slot_alloc.rs` — there is no heap involved, which is critical because this module runs before any allocator is available.
+
+== Public API
+
+The allocator exposes five functions:
+
+[source,rust]
+----
+pub unsafe fn slot_alloc_init(base: Cap, count: u64, cspace_ntfn: u64);
+pub fn slot_alloc_is_initialized() -> bool;
+pub fn slot_alloc_base() -> Cap;
+pub fn slot_alloc_count() -> u64;
+pub fn slot_alloc_try_alloc() -> SlotResult;
+pub fn slot_alloc_free(cap: Cap);
+----
+
+Plus a blocking wrapper that retries on `WouldBlock`:
+
+[source,rust]
+----
+pub fn slot_alloc_alloc_blocking() -> Cap;
+----
+
+`SlotResult` is a three-valued enum:
+
+[source,rust]
+----
+pub enum SlotResult {
+    Ok(Cap),      // success
+    WouldBlock,   // expansion in progress, retry later
+    Exhausted,    // all segments exhausted and expansion failed permanently
+}
+----
+
+The distinction between `WouldBlock` and `Exhausted` matters because callers can retry after `WouldBlock` (the expansion is making progress) but must give up on `Exhausted` (no more slots will ever be available).
+
+== Initialization
+
+`slot_alloc_init` is called exactly once per process during startup — either by the CRT (static-linked binaries like basaltc's test programs) or by rtld (dynamic-linked binaries):
+
+[source,rust]
+----
+unsafe {
+    slot_alloc_init(
+        layout.alloc_base,    // from AT_TRONA_CSPACE_LAYOUT
+        layout.alloc_limit - layout.alloc_base,
+        cspace_ntfn,          // from AT_TRONA_CSPACE_NTFN
+    );
+}
+----
+
+The function splits the initial range into as many 4,096-slot segments as needed (capped at 16) and writes them into the segment table.
+After this, the allocator is live and `slot_alloc_try_alloc()` will return real slots.
+
+== Allocation path
+
+The fast path is a bitmap scan within the active segment:
+
+. Acquire the global spinlock.
+. Start at `segment.alloc_hint` and scan the bitmap for a clear bit.
+. If found, set the bit, bump `used`, update `alloc_hint`, release the lock, and return `Ok(Cap(base + bit_index))`.
+. If the bitmap is full, advance to the next segment.
+. If there are no more segments, trigger the expansion protocol (see below), release the lock, and return `WouldBlock`.
+
+The hot path is just "acquire lock, find a clear bit, set it, return" — under 100 machine instructions on both architectures.
+The spinlock is implemented as a compare-exchange on an atomic u32 with a bounded backoff spin loop.
+
+Freeing is symmetric — acquire the lock, locate the segment containing the freed slot, clear the bit, decrement `used`, release.
+
+== The CSpace expansion protocol
+
+When the allocator exhausts every segment and the segment table is not yet full (under 16 segments), it asks procmgr for a new segment rather than returning `Exhausted`.
+The expansion protocol has three states:
+
+[source,rust]
+----
+enum ExpandState {
+    Idle,        // no expansion in progress
+    Requested,   // signal sent to procmgr; probing for sub-CNode
+    Failed,      // permanent failure (segment table full or max expansions reached)
+}
+----
+
+The protocol flow is:
+
+. **Idle → Requested.**
+   The allocator computes the deterministic slot position where the next sub-CNode will appear (`CSPACE_EXPAND_BASE` + `segment_count`), signals `__trona_cspace_ntfn` to wake procmgr, and enters `Requested`.
+. **Procmgr (out-of-band).**
+   On receiving the notification, procmgr retypes a new untyped into a sub-CNode and places it in the caller's CSpace at the predicted slot. This is what turns the allocator's probing into a deterministic target.
+. **Requested → Idle.**
+   Every time `slot_alloc_try_alloc()` is called while in `Requested`, the allocator probes the deterministic slot. If a CNode cap has appeared there, it adds a new segment pointing at that sub-CNode, transitions to `Idle`, and resumes normal allocation.
+. **Requested → Failed.**
+   If the segment table is full (16 segments reached) or the probe has been failing for too long, the allocator transitions to `Failed`. Subsequent allocations return `Exhausted` unconditionally.
+
+The key design point is that the allocator never blocks inside itself.
+If an expansion is in progress, it returns `WouldBlock` immediately and the caller gets to decide whether to retry, yield, or give up.
+`slot_alloc_alloc_blocking()` exists as a simple retry loop on top of `slot_alloc_try_alloc()` for callers that just want a slot and do not care about responsiveness.
+
+This matters because the allocator runs inside every IPC call that transfers a capability — if it blocked on expansion, every IPC on every thread would stall waiting for procmgr to service a signal, which would cause catastrophic contention.
+
+== Thread safety
+
+The allocator's global state is protected by a single atomic u32 spinlock.
+Every public function acquires the lock at entry and releases it before returning.
+The lock is a CAS-with-backoff spinlock — not a futex — because:
+
+- The critical section is short (bitmap scan + a few bit operations).
+- Acquisition is rare (only when allocating a slot, not on every IPC).
+- The allocator must work before futex-based sync primitives are initialized (during rtld startup).
+
+Because the lock is a spinlock and not re-entrant, no allocator function may call another allocator function from inside a critical section.
+The expansion path handles this by completing all its work on the `slot_alloc_try_alloc` caller's thread — it never spins waiting for procmgr inside the lock.
+
+== Reserved ranges
+
+Two slot ranges are off-limits to the allocator by convention:
+
+- `[0, alloc_base)` — well-known slots below `alloc_base`. These include `CAP_SELF_TCB = 0`, `CAP_SELF_VSPACE = 1`, `CAP_SELF_CSPACE = 2`, and the role-based slots for procmgr / vfs / mmsrv / etc. Populated by rtld from the cap table.
+- `[recv_base, recv_limit)` — cap-receive slots for IPC. The IPC layer writes one of these into `ipc_buffer.receive_cnode/index/depth` before receives, and the kernel places incoming caps there. The allocator never touches these.
+- `[expand_base, expand_limit)` — reserved for CSpace expansion sub-CNodes. The allocator's expansion protocol places new sub-CNodes here.
+
+The allocator cannot tell which slots in its own `[alloc_base, alloc_limit)` range are currently holding valid caps versus empty — it only tracks "has-this-slot-ever-been-given-out" via the bitmap.
+Callers that leak slots without freeing them will eventually exhaust the allocator and force an expansion, but they will not corrupt its state.
+
+== Who calls the allocator
+
+The biggest consumer is `substrate/invoke.rs` via the wrappers that need a destination slot — `untyped_retype`, `cnode_copy`, `cnode_mint`, `irq_control_get`, `ioport_create`, `mo_clone`, and so on.
+Every one of those calls receives a destination slot from `slot_alloc_alloc_blocking()` unless the caller has a specific slot in mind.
+
+The second-biggest consumer is the IPC receive path.
+Before any receive that could bring in caps, the receiver allocates a small batch of slots from the allocator, writes them as the receive window, and tolerates the fact that most of them will not actually be consumed.
+
+`trona_posix` and basaltc are the leaf consumers — they call through to substrate for every operation that needs a slot.
+
+== Related pages
+
+* xref:substrate/layout-and-caps.adoc[VA Layout and Capability Table] — where `TronaCspaceLayoutV1` and the well-known cap slots below `alloc_base` come from.
+* xref:substrate/invoke.adoc[Capability Invocation] — the biggest consumer of the allocator.
+* xref:substrate/ipc.adoc[IPC] — the receive-slot configuration that uses the `recv_base`/`recv_limit` range.

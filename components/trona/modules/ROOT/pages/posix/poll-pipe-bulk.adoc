@@ -1,0 +1,180 @@
+= Poll, Pipe, and Bulk I/O
+:description: posix/poll.rs multiplexing primitives, posix/pipe.rs pipe and dup operations, and the internal bulk SHM transfer path
+
+Three small modules in trona_posix work together to handle the cases where the simple "build a TronaMsg and call ipc::call_ctx" path is not enough:
+
+- `posix/poll.rs` (207 lines) — multiplexing across multiple fds.
+- `posix/pipe.rs` (123 lines) — pipe creation and fd-table operations.
+- `posix/bulk.rs` (206 lines) — internal-only SHM-based transfer for payloads larger than the IPC register window.
+
+== Multiplexing — `poll.rs`
+
+`poll.rs` exposes three POSIX-shaped multiplexing surfaces, all of which target the VFS endpoint with poll-related labels.
+
+=== posix_poll
+
+[source,rust]
+----
+pub unsafe fn posix_poll(fds: *mut PollFd, nfds: u64, timeout_ms: i32) -> i32;
+
+#[repr(C)]
+pub struct PollFd {
+    pub fd: i32,
+    pub events: i16,
+    pub revents: i16,
+}
+----
+
+`posix_poll` packs up to 8 `PollFd` entries into the IPC register window and sends `VFS_POSIX_POLL` (16) to VFS.
+The 8-entry limit comes from the IPC register budget — each PollFd is 8 bytes (an i32 fd plus two i16 event fields), and the message has space for ~8 entries plus the count.
+
+If the caller passes more than 8 fds, trona_posix splits the call into multiple chunks under the hood, but this is rare in practice — most polling code does its own splitting.
+
+The `timeout_ms` argument follows POSIX:
+
+- `> 0` — wait up to that many milliseconds.
+- `0`   — non-blocking, return immediately.
+- `< 0` — wait forever.
+
+VFS converts the milliseconds to nanoseconds and uses `SYS_RECV_TIMED` internally if a timeout was supplied.
+
+=== posix_select
+
+[source,rust]
+----
+pub unsafe fn posix_select(
+    nfds: i32,
+    readfds: *mut FdSet,
+    writefds: *mut FdSet,
+    exceptfds: *mut FdSet,
+    timeout: *mut Timeval,
+) -> i32;
+----
+
+`select` is implemented entirely on top of `posix_poll`.
+trona_posix walks each fd_set bitmask, builds an array of `PollFd` entries with the corresponding `POLLIN`/`POLLOUT`/`POLLPRI` flag, calls `posix_poll`, and then walks the returned `revents` to update the original fd_sets.
+
+The fd_set type is the standard POSIX bitmask, supporting up to `FD_SETSIZE` fds (currently 64 on SaltyOS — a single u64 per set).
+Calling `select` with more than 64 fds is undefined.
+
+The `timeout` argument is a `Timeval`; trona_posix converts it to milliseconds for the underlying `posix_poll`.
+
+=== epoll
+
+[cols="1,2"]
+|===
+| Function | VFS label
+
+| `posix_epoll_create() -> i32` | `VFS_POSIX_EPOLL_CREATE` (40)
+| `posix_epoll_ctl(epfd, op, fd, event)` | `VFS_POSIX_EPOLL_CTL` (41)
+| `posix_epoll_wait(epfd, events, maxevents, timeout)` | `VFS_POSIX_EPOLL_WAIT` (42)
+|===
+
+The `EpollEvent` type matches Linux:
+
+[source,rust]
+----
+#[repr(C, packed)]
+pub struct EpollEvent {
+    pub events: u32,
+    pub data: u64,
+}
+----
+
+`epoll_ctl` operations are `EPOLL_CTL_ADD = 1`, `EPOLL_CTL_DEL = 2`, `EPOLL_CTL_MOD = 3`.
+The full epoll state — registered fds, edge-vs-level mode, current ready set — lives in VFS, not trona_posix.
+
+== Pipes and descriptors — `pipe.rs`
+
+`pipe.rs` is the smallest substantive POSIX module — 123 lines for six functions.
+
+[cols="1,2"]
+|===
+| Function | VFS label
+
+| `posix_pipe(fds)`              | `VFS_POSIX_PIPE` (29). Returns a connected pair of fds in the array.
+| `posix_pipe2(fds, flags)`      | `VFS_POSIX_PIPE` (29) with extra flag bits — `O_CLOEXEC`, `O_NONBLOCK`. Same wire format; the flags ride in `regs[0]`.
+| `posix_dup(oldfd)`             | `VFS_POSIX_DUP` (30). Returns the lowest unused fd cloned from `oldfd`.
+| `posix_dup2(oldfd, newfd)`     | `VFS_POSIX_DUP2` (31). Closes `newfd` if open, then aliases it to `oldfd`.
+| `posix_dup3(oldfd, newfd, flags)` | `VFS_POSIX_DUP3` (43). Same as `dup2` but with flags (`O_CLOEXEC`).
+| `posix_mkfifo(path, mode)`     | `VFS_POSIX_MKFIFO` (44). Creates a named pipe at the given path.
+|===
+
+All six functions are pure marshalling — VFS handles the fd table, the buffer ring, and any blocking semantics.
+
+A pipe in SaltyOS is just a special VFS object (effectively an in-memory ring buffer), so the same `read` / `write` / `close` / `poll` operations work on it as on any file or socket.
+trona_posix does not have any pipe-specific I/O paths — `posix_read(pipe_fd, buf, len)` goes through the same `VFS_READ` label as a regular file read.
+
+== Bulk I/O — `bulk.rs`
+
+`bulk.rs` is **internal-only** (`pub(crate) mod bulk;` in `lib.rs`).
+It provides the SHM-based bulk transfer path that `file.rs` and `socket.rs` use when a payload is too large to fit in the IPC register window.
+
+=== Why a separate path
+
+The IPC register window is small — about 16 message registers, or ~128 bytes of inline payload after subtracting the operation's header fields.
+For reads or writes larger than that, copying data byte-by-byte through IPC registers would be punishingly slow.
+
+The alternative is to set up a shared memory region between the client and the VFS server, copy the payload into that region in one shot, and then send a single small IPC carrying just "the data is at offset N, length L in our shared region".
+
+Setting up the shared region is itself an IPC, so the bulk path only wins when the payload is large enough that the SHM setup cost is amortized.
+The cross-over point in practice is around 1 KB; for smaller transfers, the inline path is faster.
+
+=== The bulk protocol
+
+Bulk transfer uses three labels from xref:../abi/protocol-labels.adoc#_vfs_server_vfs_rs[the VFS catalog]:
+
+[cols="1,3"]
+|===
+| Label | Role
+
+| `VFS_BULK_SETUP` (64) | Establish the shared region. The client sends a frame capability; VFS maps it on its side and remembers the mapping.
+| `VFS_BULK_READ` (65)  | Bulk read. VFS reads from a file into the shared region and replies with the byte count.
+| `VFS_BULK_PWRITE` (72) | Bulk positional write. VFS reads from the shared region and writes to the file.
+|===
+
+Note that the same SHM region is used for both directions — VFS does not need to know in advance whether the client will read or write.
+
+The frame size is configured by `BULK_SHM_PAGES = 256` from `uapi/consts/server.rs`, which is 256 × 4 KiB = 1 MiB per client.
+This is enough to handle every individual `read` / `write` POSIX makes (writes larger than the buffer get split by trona_posix internally).
+
+=== Lifetime of the SHM region
+
+The SHM region is set up lazily on the first bulk transfer and lives for the lifetime of the process.
+There is no API for tearing it down — it gets reaped when the process exits via `RES_RECLAIM_OWNER`.
+
+This means a process that does a single large read once pays the SHM setup cost forever, but it also means a process that does many large reads only pays the setup cost once.
+The trade-off is good for typical workloads (servers, build tools) and bad for scripts that do exactly one large operation and exit.
+Those scripts could be fixed by having the bulk module expose an explicit teardown — that has not been done yet.
+
+=== When bulk is used
+
+The decision is made by `file.rs` and `socket.rs` based on a fixed 4 KiB threshold (one page).
+The check is hardcoded inline — there is no named constant — and looks like:
+
+[source,rust]
+----
+if count > 4096 {
+    bulk::read_into(fd, buf, count)
+} else {
+    inline_read(fd, buf, count)
+}
+----
+
+A 4 KiB threshold matches the IPC buffer page size, so any payload that fits in a single page goes through the inline IPC register path; anything larger pays the SHM setup cost.
+Trace logs in dev builds show how often each path is taken if you want to adjust the threshold for a specific workload.
+
+== What about io_uring or async fd
+
+trona_posix has no async interface — every blocking operation actually blocks the calling thread.
+Multi-threaded servers handle concurrency by running multiple worker threads (see xref:../substrate/threads-and-workers.adoc[Threads, TLS, and Worker Pool]) rather than by issuing multiple async ops from a single thread.
+
+For network operations specifically, the underlying netsrv exposes a "split-blocking" API (`NET_RECV_WAIT`, `NET_SEND_WAIT`, `NET_ACCEPT_WAIT`, `NET_RECVFROM_WAIT`, `NET_SENDTO_WAIT`) that lets clients submit a request and then wait on a notification for completion.
+trona_posix's socket layer does not currently use this API — it issues straight blocking calls — but it is the substrate that would let an async runtime be added in the future.
+
+== Related pages
+
+* xref:../abi/protocol-labels.adoc#_vfs_server_vfs_rs[VFS Protocol Labels] — every label this page references.
+* xref:posix/file-and-at.adoc[File I/O and *at()] — the primary consumer of `bulk.rs`.
+* xref:posix/sockets-and-dns.adoc[Sockets and DNS] — the secondary consumer.
+* xref:basalt::net/poll-and-select.adoc[basalt: Poll and Select] — the C-side wrappers around `posix_poll` and `posix_select`.

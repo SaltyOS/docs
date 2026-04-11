@@ -1,0 +1,127 @@
+= Reading the trona Tree
+:description: A source-tree tour for first-time contributors — what to read in what order, and which questions each module answers
+
+trona is a 25,000-line tree spread across five Rust crates, two C dynamic linkers, and a standalone Win32 stub.
+This guide is for someone reading the source for the first time and trying to figure out where to start.
+
+== One-paragraph map
+
+`lib/trona/` has seven top-level subdirectories:
+
+[source]
+----
+lib/trona/
+├── substrate/   # the trona Rust crate — core runtime
+├── posix/       # the trona_posix Rust crate — POSIX delegations
+├── loader/      # the trona_loader Rust crate — ELF/PE/CPIO loading
+├── win32/       # kernel32_pe.c (built) + dead Rust crate (not built)
+├── rtld/        # ld-trona.so (ELF) and ld-trona-pe.so (PE)
+├── arch/        # libtrona.so linker scripts
+└── uapi/        # shared kernel↔userland constants and types
+----
+
+substrate, posix, and loader together produce `libtrona.so`.
+rtld and win32 each produce their own standalone binaries.
+uapi is consumed via `include!` from substrate.
+
+xref:../architecture.adoc[Architecture] has the full structural breakdown.
+
+== Where to start by question
+
+[cols="2,3"]
+|===
+| If you want to know how... | Read
+
+| ...userspace makes a syscall | `lib/trona/substrate/syscall.rs` (196 lines). Single function, two arch branches.
+| ...userspace talks to a server | `lib/trona/substrate/ipc.rs` (483 lines). 9 IPC primitives + cap transfer protocol.
+| ...userspace invokes a kernel object | `lib/trona/substrate/invoke.rs` (689 lines). 75 typed wrappers.
+| ...synchronization is implemented | `lib/trona/substrate/sync.rs` (1,150 lines). Mutex, RWLock, Condvar, Barrier, Semaphore, Once.
+| ...threads work | `lib/trona/substrate/tls.rs` (788) and `worker.rs` (1,094). ThreadDesc pool, TLS layout, server event loop.
+| ...the slot allocator works | `lib/trona/substrate/slot_alloc.rs` (729). Multi-segment bump allocator with async expansion.
+| ...the cap table is populated | `lib/trona/substrate/cap_table.rs` (312) plus `lib.rs` weak symbols.
+| ...VA layout is computed | `lib/trona/substrate/layout.rs` (456). VmLayoutPlan + CSpace layout planner.
+| ...a POSIX call dispatches | `lib/trona/posix/<module>.rs` for the specific call. Pick the file by name (`file.rs`, `socket.rs`, `proc.rs`, `pthread.rs`, …).
+| ...signal delivery works | `lib/trona/posix/signals.rs` (386). Cooperative dispatcher path.
+| ...fork actually forks | `lib/trona/posix/arch/<arch>/fork.S` plus `_posix_fork_impl` in `posix/proc.rs`.
+| ...binary loading works | `lib/trona/loader/elf_loader.rs` (753) for ELF, `pe_loader.rs` (1,067) for PE.
+| ...a process actually starts running | `lib/trona/rtld/elf/rtld_main.c` (625). The 12-step startup sequence.
+| ...PE binaries get their kernel32 imports | `lib/trona/rtld/pe/rtld_pe_main.c` (844) + `kernel32_pe.c` (1,503).
+| ...syscall numbers / invoke labels are defined | `lib/trona/uapi/consts/kernel.rs`. The single source of truth.
+| ...IPC protocol labels for each server are defined | `lib/trona/uapi/protocol/<server>.rs`.
+|===
+
+== A recommended reading order
+
+If you read the files in this order, every file you reach will reference only material from earlier files.
+
+. **`uapi/consts/kernel.rs`** — the constants that everything else uses. Read it once to know what `SYS_CALL`, `VSPACE_MAP`, `TRONA_OK`, and `AT_TRONA_CSPACE_LAYOUT` are. ~400 lines.
+. **`substrate/syscall.rs`** — the inline-asm syscall wrapper. Look at the two `cfg(target_arch)` blocks side by side. 196 lines.
+. **`substrate/ipc.rs`** — `TronaMsg`, `IpcContext`, the nine IPC primitives, msginfo encoding. 483 lines.
+. **`substrate/invoke.rs`** — the typed invoke wrappers. Skim — most functions are one line. 689 lines.
+. **`substrate/slot_alloc.rs`** — read the doc comments at the top, then the segment data structure, then the expansion protocol. 729 lines.
+. **`substrate/sync.rs`** — start with the `Mutex` three-phase acquire. Skip the timed and typed variants on first read. 1,150 lines.
+. **`substrate/tls.rs`** + **`substrate/worker.rs`** — `ThreadDesc`, `ThreadLocalBlock`, `run_workers()`. 1,882 lines combined.
+. **`substrate/layout.rs`** + **`substrate/cap_table.rs`** + **`substrate/caps.rs`** — VA/CSpace planning and well-known caps. 894 lines combined.
+. **`posix/lib.rs`** — module declarations, signal state, `trona_err_to_posix`. 644 lines.
+. **`posix/file.rs`** + **`posix/at.rs`** — the largest POSIX module first; everything else follows the same pattern. 1,194 lines combined.
+. **`posix/proc.rs`** + **`posix/signals.rs`** — process and signal delivery. 1,278 lines combined.
+. **`posix/pthread.rs`** — thread lifecycle. 965 lines.
+. **`loader/elf_loader.rs`** — the scratch-map strategy. 753 lines.
+. **`rtld/elf/rtld_main.c`** + **`rtld/elf/rtld_internal.h`** — the freestanding ELF rtld. 1,397 lines combined.
+
+After step 14 you have read roughly 12,600 lines and will have a complete picture of how a SaltyOS process boots and runs.
+The remaining files (PE loader, PE rtld, kernel32_pe.c, win32 Rust crate) are independent — they can be read in any order once you understand the ELF path.
+
+== Where the line counts are NOT helpful
+
+Three files in the tree have large line counts that do not reflect their conceptual complexity:
+
+- **`substrate/casefold_table.rs`** (1,471 lines) — auto-generated Unicode case-folding table. Do not read it manually.
+- **`substrate/sync.rs`** (1,150 lines) — half is type-safe wrappers (`TypedMutex<T>`, `Once`'s closure type plumbing) and timed variants. The actual sync logic is ~400 lines.
+- **`substrate/worker.rs`** (1,094 lines) — half is the worker startup sequence (TCB creation, stack mapping). The event loop itself is ~150 lines.
+
+If you find yourself getting lost in any of these, skip ahead — the interesting stuff is bookended by the boilerplate.
+
+== Where to NOT start
+
+A few files look central but are bad starting points:
+
+- **`substrate/lib.rs`** — too much weak-symbol declaration. The actual code is in the per-module files. Read `lib.rs` only after you have read every other substrate module, as a wrap-up.
+- **`uapi/types/core.rs`** — 774 lines of `#[repr(C)]` structs with very little prose. Useful as a reference but not as a starting point.
+- **`rtld/elf/rtld_internal.h`** — 772 lines, but most of it is type definitions and inline-syscall macros. The actual rtld logic is in `rtld_main.c` and `rtld_elf.c`.
+
+== Doc comments are gold
+
+The substrate files have unusually thorough module-level doc comments (`//! ...` at the top of each file).
+For most modules, reading the doc comment is enough to understand what the module does without reading any code.
+Recommended order:
+
+. `substrate/syscall.rs` (lines 1-34) — register ABI tables for both architectures.
+. `substrate/ipc.rs` (lines 1-19) — msginfo encoding + cap transfer protocol.
+. `substrate/invoke.rs` (lines 1-11) — invoke as universal capability operation.
+. `substrate/slot_alloc.rs` (lines 1-11) — segment allocator + expansion protocol.
+. `substrate/tls.rs` (lines 1-25) — thread architecture diagram.
+. `substrate/sync.rs` (lines 1-22) — futex-based personality-neutral primitives.
+. `substrate/caps.rs` (lines 1-11) — cap getter rationale.
+. `substrate/lib.rs` (lines 1-29) — substrate's own module list.
+
+For trona_posix, only `posix/lib.rs` has a substantial doc comment at the top — the rest of the modules have minimal headers because the function names are self-documenting.
+
+For the rtld, every C source file has a brief comment at the top explaining its job; `rtld_internal.h` has the most thorough one because it documents the link_map struct, the rtld state, and the inline-syscall macros all in one place.
+
+== If you remember nothing else
+
+Three things to internalize from your first reading pass:
+
+. **Substrate is the floor.** Every Rust file in trona either is substrate or depends on substrate. There is nothing below substrate except syscalls.
+. **Every server call goes through `ipc::call_ctx`.** If a function is named `posix_*` or makes a server request, somewhere in its body it calls `ipc::call_ctx(ctx, server_ep, &msg, &reply)` with a label from `uapi/protocol/`. There are no other server-call paths.
+. **rtld is freestanding.** The ELF rtld and the PE rtld do not link against `libtrona.so` — they cannot, because they are what loads `libtrona.so`. They have their own copies of every primitive they need. Do not look for `trona::*` or `trona_posix::*` calls inside the rtld; they do not exist.
+
+Once you have those three internalized, the rest of the tree falls into place quickly.
+
+== Related pages
+
+* xref:../architecture.adoc[Architecture] — the high-level structural map.
+* xref:../substrate/index.adoc[substrate Overview] — module-by-module breakdown.
+* xref:../posix/index.adoc[trona_posix Overview] — POSIX delegation map.
+* xref:guides/adding-a-kernel-op.adoc[Adding a Syscall or Invoke] — the contributor guide once you know the layout.

@@ -1,0 +1,189 @@
+= Sockets and DNS
+:description: posix/socket.rs full BSD/POSIX socket surface and posix/dns.rs DNS client targeting dnssrv
+
+The socket and DNS pieces of trona_posix are documented together because both are network-facing and both ultimately translate to IPC.
+`socket.rs` (731 lines) targets the VFS endpoint with `VFS_POSIX_SOCKET*` labels — the socket fd is just a special kind of fd in the unified VFS fd table.
+`dns.rs` (394 lines) targets the dnssrv endpoint, which is itself looked up through namesrv on first use and then cached.
+
+Both files are pure marshalling layers — none of the network protocol logic lives in trona_posix.
+
+== Sockets — `socket.rs`
+
+=== Connection lifecycle
+
+[cols="1,2"]
+|===
+| Function | VFS label
+
+| `posix_socket(domain, sock_type, protocol)`
+| `VFS_POSIX_SOCKET` (20)
+
+| `posix_bind(fd, sockaddr, addrlen)`
+| `VFS_POSIX_BIND` (21)
+
+| `posix_listen(fd, backlog)`
+| `VFS_POSIX_LISTEN` (22)
+
+| `posix_accept(fd)`
+| `VFS_POSIX_ACCEPT` (23). Returns the new connected fd, plus optionally fills in a peer sockaddr.
+
+| `posix_connect(fd, sockaddr, addrlen)`
+| `VFS_POSIX_CONNECT` (24)
+
+| `posix_shutdown(fd, how)`
+| `VFS_POSIX_SHUTDOWN` (28)
+
+| `posix_socketpair(domain, type, protocol, fds)`
+| `VFS_POSIX_SOCKPAIR` (27). Returns two connected fds.
+|===
+
+The supported domains are:
+
+- **`AF_UNIX`** — Unix domain sockets, file-system-named or anonymous (via `socketpair`). VFS handles these locally without involving netsrv.
+- **`AF_INET`** — IPv4 sockets. VFS forwards to netsrv via the `NET_*` protocol labels documented in xref:../abi/protocol-labels.adoc#_network_stack_netsrv[netsrv labels].
+
+The supported socket types are `SOCK_STREAM` (TCP for AF_INET, byte-stream for AF_UNIX) and `SOCK_DGRAM` (UDP for AF_INET, message-oriented for AF_UNIX).
+
+=== Data transfer
+
+[cols="1,2"]
+|===
+| Function | VFS label
+
+| `posix_send(fd, buf, count, flags)`     | `VFS_POSIX_SENDMSG` (25) with a synthetic msghdr containing one iovec.
+| `posix_sendto(fd, buf, count, flags, addr, addrlen)` | Same, with destination address.
+| `posix_sendmsg(fd, msghdr, flags)`      | `VFS_POSIX_SENDMSG` (25) with the full msghdr (iovec array, control message buffer).
+| `posix_recv(fd, buf, count, flags)`     | `VFS_POSIX_RECVMSG` (26) with a synthetic single-iovec msghdr.
+| `posix_recvfrom(fd, buf, count, flags, addr, addrlen)` | Same, with peer address fill-in.
+| `posix_recvmsg(fd, msghdr, flags)`      | `VFS_POSIX_RECVMSG` (26) with the full msghdr.
+|===
+
+trona_posix collapses `send` / `sendto` / `sendmsg` into a single VFS label — `VFS_POSIX_SENDMSG` — and the same for `recv` / `recvfrom` / `recvmsg`.
+The simpler entry points just build a one-element iovec internally.
+This keeps the VFS server's dispatch table small and means there is only one place where the message control buffer parsing has to live.
+
+For TCP, large reads / writes use the bulk SHM transfer path automatically, the same way `posix_read` and `posix_write` do (see xref:posix/poll-pipe-bulk.adoc[Poll, Pipe, and Bulk I/O]).
+
+=== Socket options
+
+[cols="1,2"]
+|===
+| Function | VFS label
+
+| `posix_setsockopt(fd, level, optname, optval, optlen)` | `VFS_POSIX_SETSOCKOPT` (68)
+| `posix_getsockopt(fd, level, optname, optval, optlen)` | `VFS_POSIX_GETSOCKOPT` (69)
+|===
+
+The `level` argument distinguishes `SOL_SOCKET` (generic socket options like `SO_REUSEADDR`, `SO_KEEPALIVE`, `SO_LINGER`) from protocol-specific levels (`IPPROTO_TCP` for `TCP_NODELAY`, `IPPROTO_IP` for `IP_TTL`).
+Both VFS and netsrv know which option codes they handle; trona_posix is pure passthrough.
+
+The `optval` payload is variable length: small options (one or two integers) ride in IPC registers, larger ones (e.g. `SO_LINGER` with a `linger` struct) use the IPC buffer overflow.
+
+=== Address queries
+
+[cols="1,2"]
+|===
+| Function | VFS label
+
+| `posix_getsockname(fd, addr, addrlen)` | `VFS_POSIX_GETSOCKNAME` (66)
+| `posix_getpeername(fd, addr, addrlen)` | `VFS_POSIX_GETPEERNAME` (67)
+|===
+
+Both fill in a sockaddr through the IPC buffer.
+The caller passes in `addrlen` as a max buffer size; the server writes back the actual length.
+
+== DNS — `dns.rs`
+
+`dns.rs` is the Rust client for the dnssrv DNS resolver server.
+It is interesting because it does not have a hard-coded server endpoint — dnssrv is found through namesrv on first use, and then the result is cached.
+
+=== Endpoint resolution
+
+[source,rust]
+----
+static DNSSRV_EP: AtomicU64 = AtomicU64::new(0);
+
+fn get_dnssrv_ep() -> Cap {
+    let cached = DNSSRV_EP.load(Ordering::Acquire);
+    if cached != 0 { return cached; }
+
+    // First call — look up "dnssrv" via namesrv.
+    let mut msg = TronaMsg::zeroed();
+    msg.label = NS_LOOKUP;
+    // ... pack "dnssrv" name into msg.regs ...
+
+    let mut reply = TronaMsg::zeroed();
+    unsafe {
+        ipc::call_ctx(current_ipc_ctx(), caps::namesrv_ep(), &msg, &mut reply);
+    }
+    if reply.label != TRONA_OK { return 0; }
+
+    // The endpoint cap arrived in the receive slot configured before the call.
+    let ep = reply.regs[0];
+    DNSSRV_EP.store(ep, Ordering::Release);
+    ep
+}
+----
+
+The `AtomicU64` cache is process-global, so the namesrv lookup happens at most once per process even from multiple threads.
+The first thread to make a DNS call pays the namesrv round-trip; everyone else hits the fast path.
+
+If namesrv does not know about dnssrv (e.g. dnssrv is not yet started), the first lookup returns 0, all DNS calls fail, and the next call retries.
+There is no exponential backoff — the assumption is that by the time userland is making DNS calls, namesrv has long since registered every server.
+
+=== Public API
+
+[cols="1,2"]
+|===
+| Function | dnssrv label
+
+| `dns_resolve(hostname) -> u32`
+| `DNS_RESOLVE` (1). Single-result quick lookup; returns the first IPv4 address as `u32` or 0 on failure.
+
+| `dns_resolve_multi(hostname) -> DnsResult`
+| `DNS_RESOLVE` (1). Multi-result lookup — returns up to N addresses with TTLs in a `DnsResult` struct.
+
+| `posix_getaddrinfo(node, result)`
+| `DNS_RESOLVE` (1). POSIX-shaped surface that fills a `DnsAddrInfo` struct compatible with the C `addrinfo` layout.
+
+| `posix_gethostbyname(name) -> u32`
+| Legacy single-result lookup, equivalent to `dns_resolve(name)`. Returns the first address.
+
+| `dns_reverse_lookup(ip, hostname_out, hostname_max)`
+| `DNS_REVERSE_LOOKUP` (3). PTR lookup — converts an IP to a hostname.
+
+| `dns_cache_flush()`
+| `DNS_CACHE_FLUSH` (2). Clears the dnssrv cache. Used by integration tests.
+|===
+
+=== Hostname length limit
+
+The maximum hostname length supported by the IPC packing is **120 bytes**.
+Longer hostnames return an `EINVAL` without ever reaching dnssrv.
+This is a technical limit — the IPC buffer's overflow region is large enough that this could be raised — but the current cap matches the practical limit imposed by the DNS wire protocol (255 bytes total, minus label-length overhead).
+
+=== Error mapping
+
+dnssrv replies use the network-extended error codes from xref:../abi/error-codes.adoc#_extended_network_errors_consts_server_rs[`uapi/consts/server.rs`]:
+
+- `TRONA_DNS_NXDOMAIN` (23) — name does not exist.
+- `TRONA_DNS_SERVER_FAIL` (24) — upstream server returned SERVFAIL.
+- `TRONA_TIMED_OUT` (22) — query timed out.
+
+`posix_getaddrinfo` translates these into the standard `EAI_*` codes (`EAI_NONAME`, `EAI_FAIL`, `EAI_AGAIN`); the simpler `dns_resolve` family just returns 0 on any failure.
+
+=== Why DNS lives in trona_posix and not the caller
+
+It would be possible to put DNS resolution in basaltc's getaddrinfo wrapper directly, since basaltc already has access to the namesrv endpoint via substrate.
+The choice to put it in trona_posix instead has two reasons:
+
+. **Pure Rust caller surface.** Native Rust services that need DNS (e.g. a HTTP client built on top of trona_posix sockets) get a clean Rust API without going through libc.
+. **Endpoint caching.** Putting the dnssrv endpoint cache in `dns.rs` means it is amortized across every consumer in the process. If basaltc owned the cache, native Rust services would have to do their own caching.
+
+== Related pages
+
+* xref:../abi/protocol-labels.adoc#_vfs_server_vfs_rs[VFS Protocol Labels] — the `VFS_POSIX_SOCKET*` labels.
+* xref:../abi/protocol-labels.adoc#_network_stack_netsrv[netsrv Protocol Labels] — what VFS forwards AF_INET socket calls to.
+* xref:../abi/protocol-labels.adoc#_dns_service[DNS Service Labels] — the dnssrv labels.
+* xref:posix/poll-pipe-bulk.adoc[Poll, Pipe, and Bulk I/O] — the bulk SHM path used by large socket reads / writes.
+* xref:basalt::net/sockets.adoc[basalt: Sockets] — the C wrappers on top of this module.

@@ -1,0 +1,243 @@
+= Syscall ABI
+:description: The 28 kernite syscalls, their numbers, the register calling convention on x86_64 and aarch64, and the TronaResult return contract
+
+This page is the reference for the 28 syscalls defined in `lib/trona/uapi/consts/kernel.rs`.
+Every number, label, and register mapping documented here is consumed verbatim by `substrate/syscall.rs` and by the kernel handler in `kernite/src/syscall/mod.rs` — any change to this contract requires matching edits on both sides.
+
+The source-of-truth file is:
+
+[source]
+----
+lib/trona/uapi/consts/kernel.rs
+----
+
+which is `include!`'d into substrate via `substrate/consts.rs`, so every substrate call site sees the same numeric constants at compile time.
+
+== Syscall numbers
+
+[cols="1,2,4"]
+|===
+| #  | Name | Description
+
+| 0  | `SYS_SEND` | Blocking send to an endpoint. Transfers the message registers and any staged capabilities. Blocks until a receiver accepts the message.
+| 1  | `SYS_RECV` | Blocking receive from an endpoint. Writes the incoming message and sender badge into the caller's IPC buffer.
+| 2  | `SYS_CALL` | Client RPC: send + blocking receive. The server replies using `SYS_REPLY_RECV`. This is the IPC fastpath in the kernel.
+| 3  | `SYS_REPLY_RECV` | Server event loop primitive: reply to the current caller and immediately block waiting for the next request on the same endpoint. Fastpath.
+| 4  | `SYS_NBSEND` | Non-blocking send. Fails with `TRONA_WOULD_BLOCK` if no receiver is waiting.
+| 5  | `SYS_SIGNAL` | Signal a notification object. Wakes any TCB bound or waiting on the notification with the supplied bitmask OR-merged into the pending bits.
+| 6  | `SYS_WAIT` | Wait on a notification object. Blocks until at least one bit is pending, then returns the pending bitmask and clears it.
+| 7  | `SYS_POLL` | Non-blocking notification poll. Returns the current pending bitmask and clears it. Never blocks.
+| 8  | `SYS_YIELD` | Voluntarily yield the remaining scheduling budget back to the scheduler.
+| 9  | `SYS_INVOKE` | Invoke a capability. The universal entry point for every typed operation (`CNODE_COPY`, `TCB_CONFIGURE`, `VSPACE_MAP`, `MO_COMMIT`, …). See xref:abi/invoke-labels.adoc[Invoke Labels].
+| 10 | `SYS_DEBUG_PUTCHAR` | Write a single character to the kernel debug serial port. Debug-only; gated by the kernel's debug console control.
+| 11 | `SYS_DEBUG_DUMP_STATE` | Dump CPU register state to the debug serial port. Used by the userspace panic handler.
+| 12 | `SYS_CLOCK_GETTIME` | Read the kernel clock. Supports `CLOCK_REALTIME` (0) and `CLOCK_MONOTONIC` (1).
+| 13 | `SYS_NANOSLEEP` | Sleep for a requested duration in nanoseconds.
+| 14 | `SYS_DEBUG_PUTSTR` | Write a NUL-terminated string to the debug serial port.
+| 15 | `SYS_DEBUG_PUTBUF` | Write a sized buffer to the debug serial port.
+| 16 | `SYS_DEBUG_CONSOLE_CONTROL` | Enable/disable the kernel debug console output. Used by the console server to mute kernel logs after userland takes over.
+| 17 | `SYS_SET_INVOKE_DEPTHS` | Set the source/destination CNode resolution depth for subsequent invocations on the calling thread.
+| 18 | `SYS_FUTEX` | Userspace futex operation. Sub-op in `arg1`: `FUTEX_WAIT` (0), `FUTEX_WAKE` (1), `FUTEX_WAIT_TIMEOUT` (2). Drives every sync primitive in substrate.
+| 19 | `SYS_GETRANDOM` | Read a single `u64` of entropy from the kernel RNG.
+| 20 | `SYS_SHUTDOWN` | Power off the machine via ACPI (x86_64) or PSCI (aarch64). Does not return.
+| 21 | `SYS_SEND_TIMED` | Blocking send with a nanosecond timeout. Returns `TRONA_TIMEOUT` if no receiver appears in time.
+| 22 | `SYS_RECV_TIMED` | Blocking receive with a timeout.
+| 23 | `SYS_RECV_ANY` | Receive from any endpoint in a caller-supplied badged source array. The kernel picks the first endpoint with a pending sender; the source index is reported in the return value.
+| 24 | `SYS_REPLY_RECV_ANY` | Reply to the current caller and then receive from any endpoint in the source array — server event loop across multiple endpoints.
+| 25 | `SYS_RECV_ANY_TIMED` | `SYS_RECV_ANY` with a timeout.
+| 26 | `SYS_REPLY_RECV_ANY_TIMED` | `SYS_REPLY_RECV_ANY` with a timeout.
+| 27 | `SYS_NOTIF_RETURN` | Return from a kernel-injected notification frame. The notification dispatcher jumps back through this syscall to restore the pre-notification TCB state.
+|===
+
+The value `u64::MAX` is reserved as `IPC_RECV_SOURCE_NOTIFICATION`, used in `SYS_RECV_ANY` return values to indicate the wake came from a notification rather than a regular endpoint.
+
+== Register calling convention — x86_64
+
+On x86_64, SaltyOS uses the AMD64 `syscall` instruction (not `int 0x80`).
+The convention follows the AMD64 SysV layout but with different clobber semantics.
+
+[cols="1,2,3"]
+|===
+| Register | Role | Notes
+
+| `%rax` | Syscall number in → error code out | Overwritten by the `SYS_*` constant on entry, replaced by `TronaResult.error` on return.
+| `%rdi` | `arg0` | First argument.
+| `%rsi` | `arg1` | Second argument.
+| `%rdx` | `arg2` in → result value out | Input is the third argument; on return holds `TronaResult.value`.
+| `%r10` | `arg3` | Fourth argument. Note this uses `%r10`, not `%rcx`, because the `syscall` instruction clobbers `%rcx`.
+| `%r8`  | `arg4` | Fifth argument.
+| `%r9`  | `arg5` | Sixth argument.
+| `%rcx` | — | Clobbered by `syscall`; holds the return RIP on re-entry to user.
+| `%r11` | — | Clobbered by `syscall`; holds the saved RFLAGS on re-entry to user.
+|===
+
+The substrate implementation in `substrate/syscall.rs` encodes this directly:
+
+[source,rust]
+----
+#[cfg(target_arch = "x86_64")]
+unsafe {
+    core::arch::asm!(
+        "syscall",
+        inlateout("rax") num => error,
+        in("rdi") a0,
+        in("rsi") a1,
+        inlateout("rdx") a2 => value,
+        in("r10") a3,
+        in("r8") a4,
+        in("r9") a5,
+        lateout("rcx") _,
+        lateout("r11") _,
+        options(nostack),
+    );
+}
+----
+
+The `nostack` option tells the compiler that the syscall does not touch the red zone below `%rsp`, which lets the caller keep the frame intact across the transition.
+
+== Register calling convention — aarch64
+
+On aarch64, SaltyOS uses `svc #0` and the ARMv8-A AAPCS64 register layout, with one non-standard twist: the syscall number is passed in `x8` rather than being encoded in the `svc` immediate.
+
+[cols="1,2,3"]
+|===
+| Register | Role | Notes
+
+| `x8`  | Syscall number in | Matches the Linux aarch64 convention so that existing toolchains do not need special handling.
+| `x0`  | `arg0` in → error code out | First argument, replaced on return with `TronaResult.error`.
+| `x1`  | `arg1` in → result value out | Second argument, replaced on return with `TronaResult.value`.
+| `x2`  | `arg2` | Third argument.
+| `x3`  | `arg3` | Fourth argument.
+| `x4`  | `arg4` | Fifth argument.
+| `x5`  | `arg5` | Sixth argument.
+|===
+
+The inline assembly:
+
+[source,rust]
+----
+#[cfg(target_arch = "aarch64")]
+unsafe {
+    core::arch::asm!(
+        "svc #0",
+        in("x8") num,
+        inlateout("x0") a0 => error,
+        inlateout("x1") a1 => value,
+        in("x2") a2,
+        in("x3") a3,
+        in("x4") a4,
+        in("x5") a5,
+        options(nostack),
+    );
+}
+----
+
+Note that on aarch64 the result value lives in `x1`, not `x2`, because the ARM64 syscall ABI already uses `x0`/`x1` as the natural return pair.
+This is the one meaningful difference from x86_64: callers that want to read both the error and the value must extract them from different registers on the two architectures.
+The substrate wrapper hides this difference behind a single `TronaResult { error, value }` struct.
+
+== The TronaResult return contract
+
+Every syscall that returns to userspace produces a `TronaResult`:
+
+[source,rust]
+----
+#[repr(C)]
+pub struct TronaResult {
+    pub error: u64,   // 0 = TRONA_OK, non-zero = error code
+    pub value: u64,   // result on success; undefined on error
+}
+----
+
+Callers should treat any non-zero `error` as "the value field is not meaningful".
+Error codes are listed on xref:abi/error-codes.adoc[Error Codes]; the common ones are `TRONA_INVALID_CAPABILITY`, `TRONA_INVALID_ARGUMENT`, `TRONA_WOULD_BLOCK`, `TRONA_TIMEOUT` (encoded as `TRONA_RESTART` in some paths), and `TRONA_NOT_FOUND`.
+
+For the two syscalls that return pure error (`SYS_SIGNAL`, `SYS_YIELD`, `SYS_DEBUG_*`), the `value` field is left at zero and callers ignore it.
+For syscalls that return a real value (`SYS_GETRANDOM`, `SYS_WAIT`, `SYS_POLL`, `SYS_CLOCK_GETTIME`), the result lives entirely in `value` and `error` is `TRONA_OK` on success.
+
+== Message registers for IPC
+
+`SYS_SEND`, `SYS_RECV`, `SYS_CALL`, and `SYS_REPLY_RECV` take a 64-bit **message info** word as their first argument and 32 additional message registers from the `TronaMsg` struct.
+The IPC buffer page (mapped at a fixed virtual address per thread) holds the overflow: message registers beyond what fits in the syscall register window are read and written through the per-thread IPC buffer.
+
+The seL4-style msginfo encoding packs three fields into a single `u64`:
+
+[cols="1,1,3"]
+|===
+| Bits | Field | Meaning
+
+| 6:0   | `length`     | 0–127: number of message registers carrying payload data.
+| 11:7  | `extra_caps` | 0–31: number of capability slots staged in the IPC buffer's cap window for this transfer.
+| 51:12 | `label`      | 40-bit operation identifier. This is where the IPC protocol label (`VFS_READ`, `PM_SPAWN`, `MM_PAGER_FAULT`, …) lives.
+|===
+
+`substrate/ipc.rs` provides `msginfo(label, length, caps) -> u64` and three accessors (`msginfo_label`, `msginfo_length`, `msginfo_extracaps`) so call sites never manipulate the bit layout by hand.
+
+== Futex operation codes
+
+`SYS_FUTEX` is the only syscall whose `arg1` further splits into a sub-operation:
+
+[cols="1,1,3"]
+|===
+| Code | Name | Semantics
+
+| 0 | `FUTEX_WAIT` | Atomically check that `*addr == expected`, and if so, block until a matching `FUTEX_WAKE` arrives.
+| 1 | `FUTEX_WAKE` | Wake up to `count` threads currently blocked on `addr`.
+| 2 | `FUTEX_WAIT_TIMEOUT` | Like `FUTEX_WAIT` but with an additional nanosecond timeout in `arg4`; returns `TRONA_TIMEOUT` on expiry.
+|===
+
+This is what the `Mutex`, `Condvar`, `RWLock`, and `Once` primitives in xref:../substrate/sync-primitives.adoc[Synchronization Primitives] sit on top of.
+
+== Clock IDs
+
+`SYS_CLOCK_GETTIME` takes a clock identifier as its first argument:
+
+[cols="1,2,3"]
+|===
+| ID | Constant | Semantics
+
+| 0 | `CLOCK_REALTIME` | Wall-clock time since the UNIX epoch. Monotonicity is not guaranteed if the system clock is adjusted.
+| 1 | `CLOCK_MONOTONIC` | Monotonic time since boot. Guaranteed non-decreasing; preferred for measuring intervals.
+|===
+
+These are the only two clock IDs currently defined.
+POSIX clocks beyond these (`CLOCK_PROCESS_CPUTIME_ID`, `CLOCK_THREAD_CPUTIME_ID`) are not implemented by the kernel.
+
+== Auxv tags consumed by trona
+
+The spawner (init or procmgr) hands the child process an auxv vector that includes the standard ELF tags (`AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_ENTRY`, `AT_BASE`) plus a small set of SaltyOS-specific tags defined in `uapi/consts/kernel.rs`:
+
+[cols="1,2,4"]
+|===
+| Value | Tag | Role
+
+| `0x1005` | `AT_TRONA_CSPACE_LAYOUT` | Pointer to a `TronaCspaceLayoutV1` struct describing the child's CNode slot ranges (alloc_base, alloc_limit, recv_base, recv_limit, expand_base, expand_limit).
+| `0x100A` | `AT_TRONA_CSPACE_NTFN` | Notification capability slot the slot allocator signals when it runs out of slots and needs a CSpace expansion.
+| `0x100C` | `AT_TRONA_IPC_BUFFER` | Virtual address of the thread's IPC buffer page.
+| `0x100E` | `AT_TRONA_SC_CAP` | SchedContext capability slot for the main thread.
+| `0x101C` | `AT_TRONA_CAP_TABLE` | Pointer to the `TronaCapTableV1` startup capability table. This is the single channel for delivering every well-known capability (procmgr control endpoint, VFS/namesrv/mmsrv clients, signal/readiness notifications, initrd/framebuffer untypeds, PCI/COM1 ioports). Legacy per-cap `AT_TRONA_*_EP` tags in the `0x1010..0x101B` range were removed.
+|===
+
+For PE processes spawned by the Win32 subsystem, the PE rtld also consumes a separate range:
+
+[cols="1,2,4"]
+|===
+| Value | Tag | Role
+
+| `0x2000` | `AT_SALTYOS_PE_BASE` | Pre-mapped base address of the PE image.
+| `0x2001` | `AT_SALTYOS_PE_SIZE` | Size of the PE image mapping.
+| `0x2002` | `AT_SALTYOS_WIN32SRV` | Endpoint capability for `win32_csrss` (import resolution and client registration).
+| `0x2003` | `AT_SALTYOS_KERNEL32_BASE` | Pre-mapped base of `kernel32.dll`.
+| `0x2004` | `AT_SALTYOS_KERNEL32_SIZE` | Size of the `kernel32.dll` mapping.
+|===
+
+The ELF rtld (`ld-trona.so`) consumes the first block; the PE rtld (`ld-trona-pe.so`) consumes the second.
+See xref:../rtld/elf-rtld.adoc[ELF Dynamic Linker] and xref:../rtld/pe-rtld.adoc[PE Dynamic Linker] for how each tag is acted on.
+
+== Related pages
+
+* xref:abi/invoke-labels.adoc[Invoke Labels] — the labels consumed by `SYS_INVOKE`.
+* xref:abi/protocol-labels.adoc[IPC Protocol Labels] — the labels consumed by `SYS_CALL` / `SYS_SEND` on behalf of each server.
+* xref:abi/error-codes.adoc[Error Codes] — the `TRONA_*` error space.
+* xref:../substrate/syscalls.adoc[Syscall Wrappers] — the substrate module that turns these numbers into Rust function calls.
+* `docs/spec/syscalls.md` in the saltyos tree — the prose specification of each syscall's behavior.

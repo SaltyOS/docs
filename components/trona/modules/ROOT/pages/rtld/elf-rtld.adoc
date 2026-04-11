@@ -1,0 +1,213 @@
+= ELF Dynamic Linker (ld-trona.so)
+:description: Walking the ELF rtld — entry, self-relocation, auxv, DT_NEEDED loading, TLS finalization, capability table installation, and lazy PLT binding
+
+`ld-trona.so` is the runtime dynamic linker SaltyOS dynamic ELF binaries name as their interpreter via `PT_INTERP`.
+It is built freestanding (no libc, no libtrona) from four C files plus a self-contained header and an arch-specific PLT resolver in assembly:
+
+[cols="1,1,3"]
+|===
+| File | Lines | Role
+
+| `rtld/elf/rtld_main.c`         | 625 | Entry point. Stack parsing, self-relocation, auxv consumption, DT_NEEDED walking, static TLS finalization, cap table installation, init_array dispatch, jump to executable entry.
+| `rtld/elf/rtld_elf.c`          | 557 | ELF-specific helpers: `parse_dynamic`, `load_shared_library`, PT_TLS extraction, optional initrd device-mapping path.
+| `rtld/elf/rtld_symbol.c`       | 134 | Symbol resolution — GNU hash with bloom filter and a linear-scan fallback.
+| `rtld/elf/rtld_reloc.c`        | 226 | Relocation processing — `R_RELATIVE`, `R_ABS64`, `R_GLOB_DAT`, `R_JUMP_SLOT`, `R_TLSDESC`.
+| `rtld/elf/rtld_internal.h`     | 772 | The single self-contained header. Contains ELF type definitions, inline syscall macros, the rtld's own CPIO parser, the `link_map` struct, and the `rtld_state` struct.
+| `rtld/elf/arch/<arch>/rtld_resolve.S` | ~75 | Architecture-specific PLT resolver. Saves caller-saved registers, calls `_dl_fixup`, restores registers, jumps to the resolved function.
+|===
+
+The total is around 2,300 lines of C plus 150 lines of assembly.
+Everything inside it is freestanding — there are no calls to libc functions, no use of `malloc`, no dynamic allocation at all.
+The state lives in a single global `rtld_state` struct allocated in `.bss`, sized for the worst case (a small number of loaded libraries plus the executable itself).
+
+This is intentional: rtld must run before `libtrona.so` is mapped, so it cannot use anything from it.
+The only kernel interface available is the syscall instruction, wrapped in inline-asm macros from `rtld/elf/arch/<arch>/rtld_syscall.h`.
+
+== The startup sequence
+
+The full startup sequence runs through `rtld_main.c` from beginning to end:
+
+. **`_start`** (assembly stub at the top of `rtld_main.c`).
+   Zero `%ebp`, hand `%rsp` as the first argument, call `rtld_main`.
+. **`rtld_main(sp)`** parses the user stack: `argc`, `argv`, `envp`, and the auxv vector.
+. **Self-relocation.** The rtld walks its own RELA section (relative to `AT_BASE`) and applies every `R_RELATIVE` entry. Until this step finishes, no global pointer in the rtld is valid.
+. **Auxv extraction.** Walk the auxv looking for the standard ELF tags (`AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_ENTRY`, `AT_BASE`) plus the SaltyOS-specific tags (`AT_TRONA_CSPACE_LAYOUT`, `AT_TRONA_CSPACE_NTFN`, `AT_TRONA_IPC_BUFFER`, `AT_TRONA_SC_CAP`, `AT_TRONA_CAP_TABLE`).
+. **Find the executable's PT_DYNAMIC.** Walk the program headers via `AT_PHDR` to locate the dynamic section.
+. **`parse_dynamic`** (in `rtld_elf.c`) extracts every interesting `DT_*` entry — `DT_SYMTAB`, `DT_STRTAB`, `DT_HASH` / `DT_GNU_HASH`, `DT_RELA` / `DT_RELASZ`, `DT_PLTREL` / `DT_PLTRELSZ`, `DT_NEEDED`, `DT_INIT`, `DT_INIT_ARRAY` — and stores them in the executable's `link_map` entry.
+. **DT_NEEDED loading.** For each `DT_NEEDED` entry, call `load_shared_library(name)`. This:
+  .. Resolves the name to an initrd CPIO path via `resolve_interp_to_cpio_path`.
+  .. Reads the library bytes out of the initrd CPIO using the rtld's own CPIO parser.
+  .. Allocates a load region in the executable's vspace.
+  .. Loads it via the rtld's own ELF loader (a copy of the loader logic from `trona_loader::elf_loader`, also freestanding).
+  .. Parses its `.dynamic` section.
+  .. Adds it to the global `link_map` chain.
+  .. Recursively loads its own DT_NEEDED entries.
+. **Finalize static TLS layout.** Walk every loaded module that has a `PT_TLS`, compute per-module offsets relative to the thread pointer, and write the totals into the `__trona_tls_*` weak symbols on `libtrona.so`.
+. **Walk the cap table.** If `AT_TRONA_CAP_TABLE` is present, iterate the role entries and write each slot number into the matching `__trona_cap_*` weak symbol on `libtrona.so` via `resolve_symbol_addr_in_object`.
+. **Apply non-PLT relocations.** Walk every loaded module's `DT_RELA` and apply `R_RELATIVE`, `R_ABS64`, `R_GLOB_DAT`, and `R_TLSDESC` entries. Symbol-bound relocations are resolved via `resolve_symbol_addr` (gnu hash with linear fallback).
+. **Set up PLT lazy binding.** Initialize each module's `GOT[1]` and `GOT[2]` to point at the link_map entry and the runtime resolver trampoline. PLT relocations are not eagerly resolved — they are filled in on first call.
+. **Run init functions.** Call `DT_INIT` (if present) for each loaded module in load order, then walk `DT_INIT_ARRAY`. The executable's `_init` and `.init_array` run last.
+. **Jump to the executable entry point.** A small assembly stub (`rtld_jump_entry`) loads the saved auxv pointer back onto the stack and jumps to `AT_ENTRY` (relocated for ET_DYN). The rtld is no longer in the picture for normal user code.
+
+== `link_map`
+
+The central data structure is the `link_map` struct in `rtld_internal.h`:
+
+[source,c]
+----
+struct link_map {
+    uint64_t    base;             // load base address
+    const char *name;             // canonical name (e.g. "lib/libtrona.so")
+    char        name_storage[96]; // storage for the name string
+    Elf64_Sym  *symtab;           // DT_SYMTAB
+    uint64_t    symtab_count;
+    const char *strtab;           // DT_STRTAB
+    uint64_t    strtab_size;
+    uint32_t   *gnu_hash;         // DT_GNU_HASH
+    Elf64_Rela *jmprel;           // DT_JMPREL (PLT relocations)
+    uint64_t    jmprel_count;
+    uint64_t   *pltgot;           // DT_PLTGOT
+    Elf64_Rela *rela;             // DT_RELA
+    uint64_t    rela_count;
+    uint64_t    load_size;        // VA footprint
+    void      (*init_fn)(void);              // DT_INIT
+    void     (**init_array)(void);           // DT_INIT_ARRAY
+    uint64_t    init_array_count;
+    uint64_t    tls_template;     // PT_TLS image base
+    uint64_t    tls_filesz;
+    uint64_t    tls_memsz;
+    uint64_t    tls_align;
+    int64_t     tls_tpoff;        // module offset from TP
+    uint64_t    tls_module_id;    // 1-based
+    Elf64_Dyn  *dyn_section;
+    struct link_map *next;
+};
+----
+
+The `next` pointer threads every loaded module into a singly-linked chain rooted at `__rtld_global` — an exported symbol that `libtrona.so` reads to implement `dl_iterate_phdr` and the future `dladdr`.
+
+The chain order matches load order: the executable is first, then DT_NEEDED libraries in the order they were loaded.
+Symbol resolution scans the chain in order, which gives standard ELF symbol-resolution semantics.
+
+== `__rtld_global`
+
+[source,c]
+----
+extern struct link_map *__rtld_global;
+----
+
+This is the rtld's exported anchor.
+basaltc's `dlfcn.rs` reads it via a weak symbol and walks the chain to implement `dl_iterate_phdr` and `dladdr`.
+
+There is no `dlopen` / `dlclose` / `dlsym` machinery in the rtld itself.
+SaltyOS does not currently support runtime DSO loading — every shared library must be available via `DT_NEEDED` at startup.
+This is a deliberate simplification.
+basaltc's `dlfcn.rs` reflects that by exposing `dl_iterate_phdr` (which works) but stubbing out `dlopen` (which returns an error).
+
+== Symbol resolution — `rtld_symbol.c`
+
+The rtld supports two lookup paths:
+
+. **GNU hash** — the modern hash table format used by glibc and llvm-libc. Faster than the old SysV hash because it uses a 32-bit bloom filter to skip non-matching buckets without a string compare. Used when `DT_GNU_HASH` is present.
+. **Linear scan** — fallback for libraries that have no hash table. Iterate the symbol table from start to end and `strcmp` against every name.
+
+`resolve_symbol_addr(state, name)` walks the link_map chain in order and returns the first match.
+Weak symbols return 0 if no strong definition is found; strong symbols cause the rtld to abort with a fatal error if unresolved.
+
+There is no version checking — all symbol lookups are unversioned.
+This means a binary linked against a versioned glibc symbol would not load correctly on SaltyOS, but no SaltyOS binary uses versioned symbols.
+
+== Relocation types — `rtld_reloc.c`
+
+The supported relocation types are listed in `rtld/elf/arch/<arch>/rtld_reloc_types.h`:
+
+[cols="1,1,3"]
+|===
+| x86_64 | aarch64 | Operation
+
+| `R_X86_64_RELATIVE = 8`   | `R_AARCH64_RELATIVE = 1027`  | `*loc = base + addend` — base-relative fixup with no symbol resolution.
+| `R_X86_64_64 = 1`         | `R_AARCH64_ABS64 = 257`      | `*loc = symbol + addend` — absolute symbol address.
+| `R_X86_64_GLOB_DAT = 6`   | `R_AARCH64_GLOB_DAT = 1025`  | `*loc = symbol` — used for data symbols.
+| `R_X86_64_JUMP_SLOT = 7`  | `R_AARCH64_JUMP_SLOT = 1026` | `*loc = symbol` — PLT entries; lazy-bound by default.
+|                           | `R_AARCH64_TLSDESC = 1031`   | TLS descriptor — resolved by `_tlsdesc_static_resolver` at first access.
+|===
+
+`R_TLSDESC` is the most exotic — it requires a small assembly resolver (`_tlsdesc_static_resolver`) that takes the descriptor and returns the TLS offset.
+Static TLS access on aarch64 routes through it; static TLS access on x86_64 uses simpler `TPOFF64` relocations that the loader resolves directly.
+
+== Lazy PLT binding
+
+PLT relocations are not resolved eagerly during startup.
+Instead, the rtld initializes each module's `GOT[1]` to point at the module's `link_map` and `GOT[2]` to point at `_dl_runtime_resolve` (the assembly trampoline in `rtld_resolve.S`).
+Every PLT entry initially jumps to `GOT[2]`.
+
+On the first call to a function via the PLT:
+
+. The PLT entry pushes a relocation index and jumps to `GOT[2]` (`_dl_runtime_resolve`).
+. The trampoline saves every caller-saved register — on x86_64 that is the GPRs plus XMM0–XMM7; on aarch64 it is the GPRs plus the full Q0–Q31 NEON file. The aarch64 save is much larger because aarch64 functions can pass and return SIMD values in those registers, and the resolver could clobber them.
+. The trampoline calls `_dl_fixup(link_map, reloc_index)`. `_dl_fixup` (in `rtld_reloc.c`) reads the PLT relocation, looks up the target symbol via `resolve_symbol_addr`, writes the result into the GOT entry, and returns the resolved address.
+. The trampoline restores the caller-saved registers and jumps to the resolved address.
+
+Subsequent calls bypass the resolver — the PLT entry now jumps directly through the GOT to the resolved function.
+
+This is the standard lazy-binding pattern from the Solaris ABI / glibc.
+Eager binding (`-z now`) is not implemented; every PLT relocation is lazy.
+
+== Static TLS finalization
+
+ELF programs that use `__thread` variables put their TLS template in a `PT_TLS` program header.
+At load time, the program header just describes where the template lives in the file.
+At thread creation time, the kernel cannot copy TLS templates into per-thread blocks because it does not know the per-process TLS layout.
+
+The rtld bridges this gap.
+After every module is loaded:
+
+. Walk the link_map chain.
+. For each module with `PT_TLS`, assign it a 1-based module id and compute its offset from the thread pointer.
+   - **x86_64**: TLS grows downward from TP. The offset is negative.
+   - **aarch64**: TLS grows upward. The 16-byte TP header sits below the first module. The offset is positive.
+. Write the totals — total size, max alignment, per-module entries — into `__trona_tls_template`, `__trona_tls_filesz`, `__trona_tls_memsz`, `__trona_tls_align`, `__trona_tls_module_count`, and `__trona_tls_modules[]` on `libtrona.so`.
+
+This is the only point in the system where rtld writes into substrate's static state.
+Substrate's TLS module then reads those symbols whenever a new thread is created — see xref:../substrate/threads-and-workers.adoc[Threads, TLS, and Worker Pool].
+
+== Cap table installation
+
+`AT_TRONA_CAP_TABLE` (`0x101C`) carries a pointer to a `TronaCapTableV1` struct laid out by the spawner.
+The rtld:
+
+. Validates the magic (`SATC` = `0x43544153`) and version.
+. Walks `entries[0..entry_count]`.
+. For each entry, looks up the matching weak symbol on `libtrona.so` via `resolve_symbol_addr_in_object` (e.g. `__trona_cap_vfs_ep` for `ROLE_VFS_CLIENT`).
+. Writes the slot number into the symbol.
+
+This is what makes `caps::vfs_ep()` and friends in xref:../substrate/layout-and-caps.adoc[VA Layout and Capability Table] work — by the time the executable's `main()` runs, every cap getter has the right slot number.
+
+The mapping from `ROLE_*` constants to symbol names is generated at build time by `tools/role_map_gen.py` into `cap_table_roles.h`, included by `rtld_main.c`.
+Adding a new role is therefore a single-edit operation: add the constant to `uapi/consts/kernel.rs` and the build system regenerates the header.
+
+== Init function dispatch
+
+After every relocation has been applied and every cap installed, the rtld calls each module's initialization functions in load order:
+
+. `DT_INIT` (if present) — the legacy single function.
+. `DT_INIT_ARRAY` — an array of function pointers, called in array order.
+
+The executable's init functions run last so that constructors (in C++) and `__attribute__((constructor))` functions (in C) see a fully-initialized library set.
+
+== `RTLD_DEBUG`
+
+`rtld/elf/meson.build` adds `-DRTLD_DEBUG` to the compile flags when the global `userland_log_level` option is `debug` or `trace`.
+`RTLD_DEBUG` enables `rtld_log("...")` calls scattered through `rtld_main.c` and `rtld_elf.c` that print to the kernel debug serial port via `SYS_DEBUG_PUTSTR`.
+This is what makes `RTLD_DEBUG=1 ./binary` style traces possible — except the flag is compile-time, not environment-time.
+
+In a release build, every `rtld_log` call compiles to nothing.
+
+== Related pages
+
+* xref:rtld/pe-rtld.adoc[PE Dynamic Linker (ld-trona-pe.so)] — the sister rtld for PE binaries.
+* xref:../loader/elf-loader.adoc[ELF Loader] — the trona_loader crate's ELF loader, which the rtld duplicates internally because it must be freestanding.
+* xref:../substrate/layout-and-caps.adoc[VA Layout and Capability Table] — where the cap table that rtld installs comes from.
+* xref:../substrate/threads-and-workers.adoc[Threads, TLS, and Worker Pool] — the substrate consumer of the `__trona_tls_*` symbols rtld writes.
+* xref:../abi/syscall-abi.adoc[Syscall ABI] — the auxv tag definitions rtld consumes.
+* xref:basalt::runtime/dynamic-linking.adoc[basalt: Dynamic Linking] — the libc-side dlfcn API that uses `__rtld_global`.

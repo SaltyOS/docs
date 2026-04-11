@@ -1,0 +1,399 @@
+= Build System
+:description: How libtrona.so, ld-trona.so, ld-trona-pe.so, and kernel32.dll are produced — the meson.build pipeline and the rustc / clang / lld-link flags behind each artifact
+
+The trona tree compiles into **four independent binaries**, each built by a different custom_target chain:
+
+[cols="1,2,3"]
+|===
+| Artifact | Toolchain | Role
+
+| `libtrona.so`
+| `rustc` (three crates) + clang for `fork.S` + clang linker front-end
+| The shared library loaded by every SaltyOS userspace program.
+| `ld-trona.so`
+| clang (C, freestanding) + clang linker front-end
+| The ELF runtime dynamic linker. Listed as the interpreter (`PT_INTERP`) of every dynamic ELF binary.
+| `ld-trona-pe.so`
+| clang (C, freestanding) + clang linker front-end
+| The PE runtime dynamic linker used for Windows-style PE binaries.
+| `kernel32.dll`
+| clang (`--target=<arch>-w64-windows-gnu`) + `lld-link`
+| A real PE/COFF DLL. Loaded by PE binaries to provide the Win32 API surface.
+|===
+
+Every custom_target declaration lives under `lib/trona/`.
+This page walks through each artifact in the order meson encounters it.
+
+== The shared rustc invocation: `rust_userland_args`
+
+`lib/trona/meson.build` begins by assembling a common rustc command line that is used unchanged by all three Rust crates (`trona`, `trona_posix`, `trona_loader`).
+Any time you see `rust_userland_args` below, these are the flags:
+
+[source,meson]
+----
+rust_userland_args = [
+  '--edition=2024',
+  '--target=' + rust_target,
+  '-C', 'panic=abort',
+  '-C', 'opt-level=2',
+  '-C', 'code-model=small',
+  '-C', 'relocation-model=pic',
+  '--sysroot=/dev/null',
+  '--extern', 'core=' + rust_build_dir / 'libcore.rmeta',
+  '--extern', 'compiler_builtins=' + rust_build_dir / 'libcompiler_builtins.rmeta',
+  '-L', rust_build_dir,
+  '-L', libtrona_build_dir,
+]
+----
+
+- `--edition=2024` switches on Rust 2024 edition rules — notably `unsafe_op_in_unsafe_fn` and the prohibition on taking references to `static mut`.
+- `--target=<rust_target>` uses the built-in userland target (`x86_64-unknown-saltyos` or `aarch64-unknown-saltyos`) from the patched toolchain.
+- `panic=abort` is mandatory: there is no `_Unwind_Resume` available from substrate, so panic unwinding is compiled out.
+- `code-model=small` and `relocation-model=pic` together match the ELF small code model SaltyOS uses for all PIC DSOs.
+- `--sysroot=/dev/null` removes the default sysroot lookup — substrate explicitly provides `core` and `compiler_builtins` via `--extern`.
+
+The same file adds feature flags per architecture:
+
+[source,meson]
+----
+if arch == 'x86_64'
+  rust_userland_args += ['--cfg=basaltc_sse2',
+    '-C', 'target-feature=+sse,+sse2']
+endif
+if arch == 'aarch64'
+  rust_userland_args += ['--cfg=basaltc_neon']
+endif
+----
+
+The `basaltc_sse2` / `basaltc_neon` cfgs propagate into the substrate module-dispatch traits used by basalt's math and memory routines (documented in xref:basalt::arch/multi-arch-dispatch.adoc[Multi-Architecture Dispatch]).
+
+The userland log level is also turned into `--cfg` flags at this point:
+
+[source,meson]
+----
+ulog_level = get_option('userland_log_level')
+if ulog_level == 'trace'
+  rust_userland_args += ['--cfg', 'ulog_trace', '--cfg', 'ulog_debug', '--cfg', 'ulog_info', '--cfg', 'ulog_warn']
+elif ulog_level == 'debug'
+  ...
+----
+
+These drive the `uinfo!` / `udebug!` / `uwarn!` / `uerror!` macros in `substrate/serial.rs`.
+When the level is `error` (default in release builds), no cfg is set and every gated logging statement is compiled out entirely — zero runtime cost.
+
+== Crate 1 — trona (substrate)
+
+[source,meson]
+----
+trona_substrate = custom_target('trona_substrate',
+  input: files('substrate/lib.rs'),
+  output: ['libtrona.o', 'libtrona.rmeta'],
+  depfile: 'libtrona.d',
+  command: [rustc,
+    rust_userland_args,
+    '--emit=obj=@OUTPUT0@,metadata=@OUTPUT1@,dep-info=@DEPFILE@',
+    '--crate-name=trona',
+    '--crate-type=lib',
+    '@INPUT@',
+  ],
+  depends: [core, compiler_builtins],
+  build_by_default: true,
+)
+----
+
+Only a single input file is listed: `substrate/lib.rs`.
+Rustc discovers everything else via the `pub mod` declarations inside it, and meson's `depfile` integration re-reads `libtrona.d` on subsequent runs so that changes to any included file (including the `include!()` pull from `uapi/`) force a rebuild.
+
+**Outputs:**
+
+- `libtrona.o` — the object file that gets linked into `libtrona.so`.
+- `libtrona.rmeta` — Rust metadata consumed by `trona_posix` and `trona_loader` via `--extern`.
+
+The `core` and `compiler_builtins` custom targets from `rust/meson.build` are listed as `depends` so that meson knows to wait for the Rust core rebuild before compiling substrate.
+Substrate itself never writes `Cargo.toml` or uses `cargo build` — everything is direct rustc invocation by meson.
+
+== Crate 2 — trona_posix
+
+[source,meson]
+----
+trona_posix = custom_target('trona_posix',
+  input: files('posix/lib.rs'),
+  output: ['libtrona_posix.o', 'libtrona_posix.rmeta'],
+  ...
+  command: [rustc, rust_userland_args, ...,
+    '--crate-name=trona_posix',
+    '--crate-type=lib',
+    '--extern', 'trona=' + trona_rmeta,
+    '@INPUT@',
+  ],
+  depends: [core, compiler_builtins, trona_substrate],
+)
+----
+
+The differences from substrate are the `--crate-name` and the extra `--extern trona=...` that points rustc at `libtrona.rmeta` — this is how `posix/lib.rs` can write `extern crate trona;` and use `trona::ipc::*` / `trona::invoke::*`.
+
+Build ordering is enforced by the `depends` list: `trona_posix` cannot start until `trona_substrate` has emitted `libtrona.rmeta`.
+
+== Crate 3 — trona_loader
+
+[source,meson]
+----
+trona_loader = custom_target('trona_loader',
+  input: files('loader/lib.rs'),
+  output: ['libtrona_loader.o', 'libtrona_loader.rmeta'],
+  ...
+  command: [rustc, ...,
+    '--extern', 'trona=' + trona_rmeta,
+    '--extern', 'trona_posix=' + trona_posix_rmeta,
+    '@INPUT@',
+  ],
+  depends: [core, compiler_builtins, trona_substrate, trona_posix],
+)
+----
+
+This one requires both upstream metadata files — the loader uses substrate for IPC/invokes and `trona_posix::posix_mmap` for the scratch-map strategy (see xref:loader/elf-loader.adoc[ELF Loader]).
+
+== fork.S
+
+The fork trampoline is assembled as a normal object file via clang:
+
+[source,meson]
+----
+fork_obj = custom_target('fork_asm',
+  input: files('posix/arch' / arch / 'fork.S'),
+  output: 'fork.o',
+  command: [cc_cmd, '--target=' + c_target, fork_asm_args, '-c', '@INPUT@', '-o', '@OUTPUT@'],
+)
+----
+
+On x86_64, `fork_asm_args` sets `-DSALTY_X86_SIMD=1`, which enables the XMM0–XMM15 save/restore slots inside the assembly.
+On aarch64 the NEON Q0–Q31 save is unconditional.
+The result — `fork.o` — is linked directly into `libtrona.so` alongside the three Rust object files.
+
+== Linking libtrona.so
+
+[source,meson]
+----
+libtrona_so = custom_target('libtrona_so',
+  input: [trona_substrate_obj, trona_posix_obj, trona_loader_obj,
+          fork_obj, core_obj, compiler_builtins_obj],
+  output: 'libtrona.so',
+  command: [cc_cmd,
+    '--target=' + c_target,
+    '-shared',
+    '-nostdlib', '-nostartfiles',
+    '-fno-stack-protector',
+    '-Wl,-soname,libtrona.so',
+    '-T', libtrona_link,
+    '-o', '@OUTPUT@',
+    '@INPUT@',
+  ],
+)
+----
+
+Meson invokes clang as the linker front-end, not `ld.lld` directly.
+The key flags:
+
+- `-shared` produces an ET_DYN shared object.
+- `-nostdlib` / `-nostartfiles` drop the normal C startup files — substrate is self-contained and does not need `crt1.o` or `libc`.
+- `-fno-stack-protector` disables `-fstack-protector-strong` which would insert references to `__stack_chk_guard` that substrate does not provide.
+- `-Wl,-soname,libtrona.so` sets the DT_SONAME so other binaries can link with `-ltrona`.
+- `-T $libtrona_link` uses the per-architecture linker script at `lib/trona/arch/<arch>/libtrona.ld` — see xref:internals/fork-and-linker-scripts.adoc[fork.S and Linker Scripts] for the script layout.
+
+The six input objects (three Rust, one assembly, plus Rust `core` and `compiler_builtins`) produce a single ~200 KB DSO that every SaltyOS userland program links against as `-ltrona`.
+
+== ld-trona.so — ELF dynamic linker
+
+The ELF rtld lives under `lib/trona/rtld/elf/` and has its own `meson.build`.
+It is compiled in three steps.
+
+=== Step 0 — generate cap_table_roles.h
+
+`lib/trona/rtld/meson.build` first runs a code generator:
+
+[source,meson]
+----
+py_prog = find_program('python3')
+role_map_gen = custom_target('role_map_gen',
+  input:  files('../uapi/consts/kernel.rs'),
+  output: ['cap_table_roles.h', 'role_map_data.py'],
+  command: [py_prog, files('../../../tools/role_map_gen.py'),
+            '--input', '@INPUT@',
+            '--c-output', '@OUTPUT0@',
+            '--py-output', '@OUTPUT1@'],
+)
+----
+
+`tools/role_map_gen.py` parses the `ROLE_*` constants out of `uapi/consts/kernel.rs` and emits a C header that the rtld includes at compile time.
+This is how the C dynamic linker and the Rust UAPI stay in lockstep: adding a new `ROLE_*` constant to `kernel.rs` automatically updates `cap_table_roles.h` on the next rebuild, and rtld picks it up without manual sync.
+`role_map_data.py` is the same table in a Python-importable form, used by `tools/svc_caps_gen.py` elsewhere in the tree.
+
+=== Step 1 — compile the C sources
+
+Four C sources (`rtld_main.c`, `rtld_elf.c`, `rtld_symbol.c`, `rtld_reloc.c`) are compiled **individually** so that the meson depfile integration picks up header changes:
+
+[source,meson]
+----
+rtld_c_args = [
+    '--target=' + c_target,
+    '-ffreestanding',
+    '-fPIC',
+    '-fno-plt',
+    '-fno-stack-protector',
+    '-I', meson.current_source_dir(),
+    '-I', rtld_generated_dir,
+] + rtld_extra_args  // adds -DRTLD_DEBUG at debug/trace log levels
+----
+
+Key choices:
+
+- `-ffreestanding` tells the compiler that no libc is available — no `memcpy` built-in, no `printf`, nothing that would need external runtime. rtld provides its own inline syscall wrappers and string/memory helpers inside `rtld_internal.h`.
+- `-fPIC` is required because rtld itself is loaded at a non-fixed address as a shared object.
+- `-fno-plt` avoids PLT indirection for any call the compiler might emit — rtld is its own symbol resolver, so PLT entries would be nonsensical.
+- The two `-I` flags add the rtld source directory (for `rtld_internal.h`) and the parent build directory where `cap_table_roles.h` lands.
+
+=== Step 2 — assemble the PLT resolver
+
+[source,meson]
+----
+rtld_resolve_obj = custom_target('rtld_resolve_asm',
+    input: files('arch' / arch / 'rtld_resolve.S'),
+    output: 'rtld_resolve.o',
+    command: [cc_cmd, '--target=' + c_target, '-c', '-o', '@OUTPUT@', '@INPUT@'],
+)
+----
+
+This is the arch-specific `_dl_runtime_resolve` trampoline that saves caller-saved registers, calls into `_dl_fixup`, and restores state before jumping to the resolved function.
+On x86_64 it saves GPRs and XMM0–XMM7; on aarch64 it saves GPRs and the full Q0–Q31 NEON register file.
+See xref:rtld/elf-rtld.adoc[ELF Dynamic Linker] for the full walkthrough.
+
+=== Step 3 — link ld-trona.so
+
+[source,meson]
+----
+ld_trona_so = custom_target('ld_trona_so',
+    input: rtld_objs + [rtld_resolve_obj],
+    output: 'ld-trona.so',
+    command: [cc_cmd,
+        '--target=' + c_target,
+        '-nostdlib', '-nostartfiles',
+        '-fno-stack-protector',
+        '-Wl,-Bsymbolic',
+        '-T', rtld_link_script,
+        '-Wl,-soname,ld-trona.so',
+        '-o', '@OUTPUT@',
+        '@INPUT@',
+    ],
+)
+----
+
+`-Wl,-Bsymbolic` tells the linker to bind local references within ld-trona.so directly, bypassing the dynamic symbol table.
+This matters because rtld must never try to go through the DT_SYMTAB chain during its own startup — it has to be fully self-contained before any dynamic symbol machinery is available.
+
+The linker script at `lib/trona/rtld/elf/arch/<arch>/rtld.ld` lays out a static PIE (ET_DYN, small-code model, metadata inside the first page).
+It is documented in xref:internals/fork-and-linker-scripts.adoc[fork.S and Linker Scripts].
+
+== ld-trona-pe.so — PE dynamic linker
+
+The PE rtld is simpler because it is one C file:
+
+[source,meson]
+----
+pe_rtld_c_sources = files('rtld_pe_main.c')
+
+pe_rtld_c_args = [
+    '--target=' + c_target,
+    '-ffreestanding',
+    '-fPIC',
+    '-fno-plt',
+    '-fno-stack-protector',
+    '-I', meson.current_source_dir(),
+    '-I', rtld_generated_dir,
+]
+----
+
+The compile flags are identical to the ELF rtld — freestanding, PIC, no PLT.
+The single object is then linked with the same `-nostdlib -nostartfiles -Wl,-Bsymbolic -T <linker-script>` pattern, producing `ld-trona-pe.so`.
+
+There is no PLT resolver assembly because the PE linker does not do lazy binding — all Windows imports are resolved eagerly at load time via a round-trip to `win32_csrss` (see xref:rtld/pe-rtld.adoc[PE Dynamic Linker]).
+
+Both rtld binaries depend on the `role_map_gen` custom target, so any change to `uapi/consts/kernel.rs` forces both `ld-trona.so` and `ld-trona-pe.so` to rebuild together.
+
+== kernel32.dll — a real PE/COFF DLL
+
+[source,meson]
+----
+if arch == 'x86_64'
+  kernel32_pe_target = 'x86_64-w64-windows-gnu'
+  kernel32_pe_machine = 'amd64'
+elif arch == 'aarch64'
+  kernel32_pe_target = 'aarch64-w64-windows-gnu'
+  kernel32_pe_machine = 'arm64'
+endif
+
+kernel32_pe_args = [
+  '--target=' + kernel32_pe_target,
+  '-ffreestanding',
+  '-fno-stack-protector',
+  '-fno-builtin',
+  '-fvisibility=hidden',
+]
+----
+
+The PE build is the only place in the tree where clang targets a non-SaltyOS ABI.
+The `*-w64-windows-gnu` triple produces PE/COFF object files compatible with `lld-link`.
+Combined with `-fvisibility=hidden`, this means only the symbols explicitly listed in `kernel32_pe.def` end up as PE exports.
+
+Linking:
+
+[source,meson]
+----
+kernel32_dll = custom_target('kernel32_dll',
+  input: [kernel32_pe_obj, files('win32/kernel32_pe.def')],
+  output: 'kernel32.dll',
+  command: [lld_link,
+    '-dll',
+    '-noentry',
+    '-nodefaultlib',
+    '-machine:' + kernel32_pe_machine,
+    '-def:@INPUT1@',
+    '-out:@OUTPUT@',
+    '@INPUT0@',
+  ],
+)
+----
+
+`lld-link` is Windows-style link (not the usual ELF `ld.lld`).
+The `-def` file lists the exported ordinals and symbol names.
+The resulting `kernel32.dll` is a fully valid PE/COFF DLL that PE binaries can dlopen by mapping it into their address space, exactly as they would on Windows — just with the concrete implementations redirected at SaltyOS syscalls and VFS IPC rather than the NT kernel.
+
+See xref:win32/kernel32-stub.adoc[kernel32.dll PE Stub] for the actual API surface that `kernel32_pe.c` exports.
+
+== Build ordering summary
+
+Meson processes the top-level `lib/trona/meson.build` in this order:
+
+. `trona` substrate rustc build (reads `substrate/lib.rs`)
+. `trona_posix` rustc build (needs `libtrona.rmeta`)
+. `trona_loader` rustc build (needs both `libtrona.rmeta` and `libtrona_posix.rmeta`)
+. `kernel32.dll` clang + lld-link build (independent, parallel with the Rust crates)
+. `fork.o` clang assembly (independent)
+. `libtrona.so` link step (needs all Rust objects + `fork.o`)
+. `subdir('rtld')` — generates `cap_table_roles.h`, then builds `ld-trona.so` and `ld-trona-pe.so`
+
+Steps 1-6 produce the files that every dynamic SaltyOS binary links against: `libtrona.so` is referenced with `-ltrona` and `ld-trona.so` is the interpreter of every dynamic ELF.
+Step 7 is independent of libtrona because rtld binaries do not link against libtrona — they are the component that loads libtrona.
+
+== Adding a new source file
+
+Adding a `.rs` file under `substrate/`, `posix/`, or `loader/` requires **no meson change** — rustc discovers the file via `pub mod` in `lib.rs`, and meson's `depfile` picks up the dependency on the next build.
+
+Adding a new C source to `rtld/elf/` means appending it to the `rtld_c_sources = files(...)` list in `lib/trona/rtld/elf/meson.build`; adding an rtld header just requires touching the existing sources (meson picks up the new include via the depfile).
+
+Adding a new Windows API to `kernel32.dll` means editing `kernel32_pe.c` for the implementation and `kernel32_pe.def` for the export listing, then rebuilding.
+
+== Related pages
+
+* xref:architecture.adoc[Architecture] — for the crate dependency graph.
+* xref:internals/fork-and-linker-scripts.adoc[fork.S and Linker Scripts] — for what the `libtrona.ld` and `rtld.ld` linker scripts actually contain.
+* xref:guides/adding-a-kernel-op.adoc[Adding a Syscall or Invoke] — for what happens on the kernite side of a change.

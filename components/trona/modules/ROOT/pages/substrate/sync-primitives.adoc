@@ -1,0 +1,224 @@
+= Synchronization Primitives
+:description: The futex-based Mutex, TypedMutex, Condvar, RWLock, Barrier, Semaphore, and Once primitives in substrate/sync.rs
+
+`substrate/sync.rs` is the largest single file in substrate — 1,150 lines — and it implements every synchronization primitive in trona.
+basaltc's pthread layer wraps these directly; the Rust worker pool, the slot allocator, and the loader's page-frame pool all use them.
+No part of trona has its own synchronization implementation; everything routes through this file.
+
+Every primitive is **futex-based and subsystem-neutral**:
+
+- No kernel objects are consumed — each primitive is a single atomic word plus `futex_wait` / `futex_wake` syscalls on contention.
+- No personality coupling — the file returns `TRONA_*` status codes (`TRONA_OK`, `TRONA_BUSY`, `TRONA_DEADLOCK`, `TRONA_TIMED_OUT`, `TRONA_INVALID_OPERATION`). Each personality layer translates these into its own error space (POSIX `errno`, NT status, …).
+
+The futex syscall wrappers come from xref:substrate/syscalls.adoc[`substrate/syscall.rs`] (`futex_wait`, `futex_wait_timeout`, `futex_wake`); `sync.rs` adds thin counters around them for `debug_lock_stats()` but otherwise hands calls straight through.
+
+== The seven primitives
+
+[cols="1,3"]
+|===
+| Type | Purpose
+
+| `Mutex`        | Plain mutual exclusion with three-phase acquire.
+| `TypedMutex`   | A `Mutex`-protected value — `TypedMutex<T>` with a RAII guard, analogous to `std::sync::Mutex<T>`. Substrate's own code uses this for every shared data structure.
+| `Condvar`      | Condition variable paired with a `Mutex`. Supports `wait`, `wait_timeout`, `signal` (wake one), and `broadcast` (wake all).
+| `RWLock`       | Writer-preference read/write lock. Readers stack; writers hold exclusively; queued writers block new readers.
+| `Barrier`      | Classic barrier — N threads meet at a point. Implemented as a counter + generation word.
+| `Semaphore`    | Counting semaphore with `post` / `wait` (and timed variants).
+| `Once`         | One-shot initialization — the first thread to reach the `call_once` point runs the closure, others block until it completes.
+|===
+
+Every primitive exposes a `const fn new()` so it can be declared in `static` position without heap allocation.
+The hot-path fast-case is always a single atomic operation; contention pays the futex syscall.
+
+== Mutex — the canonical primitive
+
+`Mutex` is the simplest of the seven and the model for the rest.
+The state is a single atomic u32:
+
+[source,rust]
+----
+pub struct Mutex {
+    state: AtomicU32,
+}
+----
+
+The three encoded states are `UNLOCKED = 0`, `LOCKED = 1`, and `LOCKED_WITH_WAITERS = 2`.
+
+=== Three-phase acquire
+
+The lock path has three phases — the fast uncontended path, a bounded spin, and a futex wait.
+This is the classic "futex backed mutex" pattern from the Linux futex(7) manual, and the doc comment in the source spells it out:
+
+. **Fast path** — single CAS from `UNLOCKED (0)` to `LOCKED (1)`. In the uncontended case (which is the overwhelming majority of real workloads), this is the only instruction the mutex executes. No syscall.
+. **Spin phase** — brief bounded userspace spin (~40 iterations) re-reading the state. This catches the case where the holder is about to release; spinning for a few dozen cycles is much cheaper than a context switch.
+. **Futex phase** — if the lock is still held after spinning, the waiter atomically transitions the state to `LOCKED_WITH_WAITERS (2)` via a swap, then issues `futex_wait(&state, 2)`. The kernel parks the thread.
+
+The release path is symmetric: CAS `LOCKED → UNLOCKED` if no waiters; otherwise swap down to `UNLOCKED` and issue a `futex_wake(&state, 1)` to wake one waiter.
+
+Every entry into the futex phase increments a debug counter (`MUTEX_SLOWPATH_COUNT`) so that `debug_lock_stats()` can report how often the slow path is taken.
+
+=== Mutex API
+
+[cols="2,3"]
+|===
+| Method | Semantics
+
+| `const fn new()` | Construct in-place; state starts as `UNLOCKED`.
+| `fn lock()` | Blocking acquire. Runs the three-phase algorithm.
+| `fn try_lock() -> bool` | Single CAS attempt. Returns `true` on success, `false` on failure.
+| `fn unlock()` | Release. Wakes a waiter if any.
+|===
+
+There are also timed variants (`lock_timeout(ns)`) and the `ErrorCheck` / `Recursive` flavors used by basaltc's pthread mutex attrs — those are built as thin wrappers over the base `Mutex` plus an owner TID field managed at the pthread layer.
+
+== TypedMutex — mutex + data
+
+`TypedMutex<T>` packs a value and a `Mutex` so that the locked data and the lock itself can never diverge:
+
+[source,rust]
+----
+pub struct TypedMutex<T> {
+    mutex: Mutex,
+    value: UnsafeCell<T>,
+}
+
+impl<T> TypedMutex<T> {
+    pub const fn new(value: T) -> Self { ... }
+    pub fn lock(&self) -> TypedMutexGuard<'_, T> { ... }
+    pub fn try_lock(&self) -> Option<TypedMutexGuard<'_, T>> { ... }
+}
+----
+
+The returned guard implements `Deref` / `DerefMut` so the caller accesses the inner value directly, and drops the lock on scope exit.
+This is substrate's equivalent of `std::sync::Mutex<T>` — the same ergonomics without pulling in `std`.
+
+Substrate's slot allocator, pending request table, and cap table all use `TypedMutex` for their protected state.
+
+== Condvar
+
+`Condvar` is the classic condition variable paired with a `Mutex`.
+It is implemented as a `u64` wait-counter that is incremented on every signal or broadcast — waiters read the current value, drop the mutex, and `futex_wait` on the counter.
+When a signal arrives, the counter is bumped and a `futex_wake` is issued on the new counter value.
+
+[cols="2,3"]
+|===
+| Method | Semantics
+
+| `wait(&self, guard: &mut TypedMutexGuard<T>) -> u64`
+| Atomically release `guard.mutex`, block on the wait counter, reacquire `guard.mutex` on wake. Returns `TRONA_OK` or a cancellation code.
+
+| `wait_timeout(&self, guard: &mut TypedMutexGuard<T>, ns: u64) -> u64`
+| As above, with a timeout. Returns `TRONA_TIMED_OUT` on expiry.
+
+| `signal(&self)`
+| Wake one waiter.
+
+| `broadcast(&self)`
+| Wake every waiter.
+|===
+
+Condvar `wait` is one of the cancellation points in substrate: if the thread's TLS `cancel_pending` flag is set and a cancellation hook has been installed (see below), the wait returns with `TRONA_CANCELLED` and the hook decides what to do next.
+
+== RWLock — writer-preference
+
+`RWLock` uses a single `AtomicU32` whose low 30 bits are the reader count and whose high 2 bits encode writer-pending / writer-active.
+Acquire paths:
+
+- **Read acquire.** If no writer is pending or active, atomically increment the reader count. Otherwise, futex-wait until the writer finishes — new readers queue behind pending writers to prevent writer starvation.
+- **Write acquire.** Set the writer-pending bit, wait for reader count to drain to zero, then transition to writer-active.
+- **Release (reader).** Atomically decrement the reader count; if we were the last reader and a writer is pending, wake the writer.
+- **Release (writer).** Clear writer-active; wake every pending reader and any single pending writer.
+
+The writer preference is intentional: under continuous read load, unbounded waiters can starve indefinitely without it.
+Substrate pays a modest read-latency hit in exchange for the starvation guarantee.
+
+== Barrier
+
+`Barrier` is a pair of `u64` fields — a count and a generation:
+
+[source,rust]
+----
+pub struct Barrier {
+    state: AtomicU64,  // packs (count, generation)
+    total: u32,
+}
+----
+
+Every `wait()` reads the current generation, decrements the count, and either:
+
+- If the count is still positive, futex-waits on the generation field expecting the value it just read.
+- If the count reaches zero, resets the count to `total`, increments the generation, and futex-wakes everyone waiting on the old generation.
+
+This gives classic N-to-1 rendezvous semantics without any per-thread state and reuses the same barrier across rounds.
+
+== Semaphore
+
+`Semaphore` is a counting semaphore with the standard `post` (signal) and `wait` (wait) API.
+The state is a `u32` count; `post` increments and `futex_wake(1)`s, and `wait` decrements-if-positive in a loop with `futex_wait` in between.
+There is a timed variant (`wait_timeout(ns)`) that returns `TRONA_TIMED_OUT` on expiry.
+
+It is used as a general-purpose resource counter — the loader's frame pool, for example, uses it to block waiters when the pool is empty.
+
+== Once
+
+`Once` implements one-shot initialization with a three-state atomic:
+
+- `0` — not yet called
+- `1` — in progress
+- `2` — done
+
+The first thread to reach `call_once` CAS's the state from `0` to `1`, runs the initialization closure, transitions to `2`, and issues a broadcast futex wake.
+Subsequent callers observe the state and either return immediately (already done) or wait on the state word until the initializer completes.
+
+The pthread `pthread_once` implementation in trona_posix and basaltc is a thin wrapper over this primitive.
+
+== Cancellation hook
+
+`sync.rs` has one concession to the fact that POSIX threads support cancellation and substrate itself does not know about pthread cancellation: blocking primitives observe a `cancel_pending` flag on the current thread's TLS block and, if set, invoke a runtime-installed hook.
+
+[source,rust]
+----
+pub unsafe fn install_cancel_hook(hook: unsafe fn());
+----
+
+When substrate is used from basaltc, `trona_posix::pthread::init_main_thread_tls()` installs a hook that checks the per-thread cancellation state and, if deferred cancellation is pending and allowed, calls `pthread_exit(PTHREAD_CANCELED)` before returning into whoever was blocked.
+
+When substrate is used from a bare Rust server (with no pthread layer), the hook is never installed, and `cancel_pending` remains permanently `false` — cancellation is a no-op.
+
+This is the one place in substrate where the subsystem boundary is visible: everything else in `sync.rs` is personality-neutral, but the cancellation hook is the narrow seam through which personalities plug their own cancellation semantics in.
+
+== Debug counters
+
+For diagnosing contention issues, `sync.rs` exposes `debug_lock_stats()`:
+
+[source,rust]
+----
+pub fn debug_lock_stats() -> (u64, u64, u64) {
+    (mutex_slowpath, futex_wait_calls, futex_wake_calls)
+}
+----
+
+- `mutex_slowpath` — number of times a `Mutex::lock()` had to fall past the fast CAS and enter the spin or futex phase.
+- `futex_wait_calls` — total `futex_wait` syscalls issued by all primitives.
+- `futex_wake_calls` — total `futex_wake` syscalls.
+
+The counters are `AtomicU64::fetch_add(Relaxed)` — they have essentially zero cost on the fast path.
+Services like `posix_ttysrv` expose these stats via a debug command to help track down pathological contention; they are not wired into production logging.
+
+== Why substrate does not use std::sync
+
+The obvious question is: why re-implement all this when `std::sync` exists?
+Two reasons:
+
+- **No `std`.** Substrate is `#![no_std]` — every top-level substrate module compiles against `core` + `compiler_builtins` only, and pulling in `std` would drag along the entire Rust runtime (`alloc`, `io`, OS hooks, …). That is not viable in a file that has to run before the allocator is alive.
+- **No target support.** `std::sync` delegates to platform primitives via `std::sys`, and SaltyOS does not ship a `std::sys` adapter. Implementing one would mean writing a second copy of this file with a different type wrapper on top — wasted effort.
+
+The substrate versions are also more constrained by design — no `poisoning`, no spurious-wakeup handling beyond what futex gives you, no `RwLock` fairness beyond writer-preference.
+Keeping the primitives narrow makes the ~1,100-line file auditable for lock-ordering bugs and deadlocks.
+
+== Related pages
+
+* xref:substrate/syscalls.adoc[Syscall Wrappers] — the `futex_wait` / `futex_wake` helpers that `sync.rs` calls on contention.
+* xref:substrate/threads-and-workers.adoc[Threads, TLS, and Worker Pool] — the TLS block where the `cancel_pending` flag lives.
+* xref:../posix/pthread.adoc[POSIX Threads] — the `trona_posix::pthread` layer that wraps these primitives and installs the cancellation hook.
+* xref:basalt::process/threads-and-sync.adoc[basalt: Threads and Synchronization] — the C ABI surface that sits on top of pthread and, indirectly, this file.

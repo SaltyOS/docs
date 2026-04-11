@@ -1,0 +1,170 @@
+= Glossary
+:description: Definitions for terms that appear across the trona documentation
+
+This glossary collects the recurring terms used in the trona docs.
+For terms specific to one subsystem, the per-page documentation is the more thorough source.
+
+[glossary]
+== Terms
+
+`AT_TRONA_*` auxv tags::
+Custom auxv vector tags in the `0x1000`–`0x101F` range that the spawner uses to communicate the child's runtime environment. The current set is `AT_TRONA_CSPACE_LAYOUT` (`0x1005`), `AT_TRONA_CSPACE_NTFN` (`0x100A`), `AT_TRONA_IPC_BUFFER` (`0x100C`), `AT_TRONA_SC_CAP` (`0x100E`), and `AT_TRONA_CAP_TABLE` (`0x101C`). Defined in `uapi/consts/kernel.rs`.
+
+`AT_SALTYOS_*` auxv tags::
+PE-specific auxv tags in the `0x2000`–`0x2004` range used by `ld-trona-pe.so` to receive pre-mapped PE image and `kernel32.dll` info from procmgr.
+
+base relocation::
+A PE32+ relocation entry that fixes up an absolute address inside a loaded image when the image is mapped at an address other than its preferred `image_base`. Only `IMAGE_REL_BASED_DIR64` is implemented in trona.
+
+`basaltc`::
+The Rust C standard library implementation. Calls into `trona_posix` for every non-trivial POSIX function. Documented in xref:basalt::index.adoc[basalt].
+
+bulk SHM transfer::
+The shared-memory I/O path used by `trona_posix::file` and `trona_posix::socket` for payloads larger than the IPC register window. Set up via `VFS_BULK_SETUP`, used via `VFS_BULK_READ` / `VFS_BULK_PWRITE`. The SHM region is 256 pages = 1 MiB per client.
+
+`cap_table` / `TronaCapTableV1`::
+The startup capability table the spawner builds in a frame and hands to the child via `AT_TRONA_CAP_TABLE`. Each entry is a `(role_id, slot, flags, rights)` tuple. The child's rtld walks the table at startup and writes each slot into the matching `__trona_cap_*` weak symbol.
+
+CNode::
+A capability node — the basic container for kernel capabilities in seL4-style microkernels. SaltyOS uses CNodes to give each process a private cap namespace. See xref:kernite::concepts/capabilities.adoc[kernite: Capabilities].
+
+CPIO newc::
+The CPIO archive format trona uses for the initrd. Magic `070701`, 110-byte ASCII headers, 4-byte alignment, sentinel name `TRAILER!!!`. Two parsers exist: one in kernite, one in `trona_loader::cpio` (the rtld has its own copy as well).
+
+CSpace expansion::
+The asynchronous protocol the slot allocator uses when it runs out of CNode slots — signal `__trona_cspace_ntfn`, then probe a deterministic slot for the new sub-CNode.
+
+`DT_NEEDED`::
+ELF dynamic-section entry naming a shared library this object depends on. The rtld walks `DT_NEEDED` entries during startup and loads each library.
+
+ET_DYN / ET_EXEC::
+ELF executable types. `ET_EXEC` is fixed-address, `ET_DYN` is position-independent. SaltyOS uses ET_DYN for almost everything because rtld randomization needs it.
+
+fork trampoline::
+The arch-specific assembly file (`lib/trona/posix/arch/<arch>/fork.S`) that saves register state, calls `_posix_fork_impl`, and either returns to the parent or jumps to `fork_child_entry`. Implemented in assembly because pure-Rust would lose caller-saved registers across the call.
+
+fastpath::
+The kernel's hand-written assembly path for `SYS_CALL` (#2) and `SYS_REPLY_RECV` (#3) that handles the common case (small message, no caps, synchronous partner) without entering the C slowpath.
+
+futex::
+The kernel synchronization primitive (`SYS_FUTEX = 18`) that substrate's sync primitives sit on top of. Three sub-operations: `FUTEX_WAIT`, `FUTEX_WAKE`, `FUTEX_WAIT_TIMEOUT`.
+
+GNU hash::
+The modern ELF symbol-lookup hash table format. The rtld supports it in addition to the older SysV hash. Uses a 32-bit bloom filter to skip non-matching buckets without a string compare.
+
+`IMAGE_REL_BASED_DIR64`::
+The 64-bit absolute address PE base relocation type. trona's PE loader supports this and `IMAGE_REL_BASED_ABSOLUTE` (a no-op padding entry). Other PE relocation types are 32-bit-only and not implemented.
+
+`IpcBuffer` / `IpcContext`::
+The two structs that hold per-thread IPC state. `IpcBuffer` is the 4 KiB kernel-shared page; `IpcContext` is the per-thread `{ipc_buffer ptr, send_cap_count}` struct.
+
+invoke / invoke label::
+A typed operation on a kernel capability, dispatched through `SYS_INVOKE` (#9). The 40-bit label encodes which operation. See xref:abi/invoke-labels.adoc[Invoke Labels].
+
+`kernel32.dll`::
+The PE/COFF DLL that PE binaries import. Built from `lib/trona/win32/kernel32_pe.c` via `clang --target=<arch>-w64-windows-gnu` and `lld-link`. Exports 12 functions plus 4 data symbols. See xref:win32/kernel32-stub.adoc[kernel32.dll PE Stub].
+
+`ld-trona.so`::
+The ELF runtime dynamic linker. Listed as `PT_INTERP` in every dynamic ELF binary on SaltyOS. Built from five C files under `lib/trona/rtld/elf/`. Freestanding.
+
+`ld-trona-pe.so`::
+The PE runtime dynamic linker. Used as the interpreter for PE binaries. Built from `lib/trona/rtld/pe/rtld_pe_main.c`. Freestanding.
+
+`libtrona.so`::
+The shared library that bundles substrate, trona_posix, trona_loader, the fork trampoline, and the Rust core/compiler_builtins. Loaded by every dynamic SaltyOS process after rtld bootstrapping.
+
+link_map::
+The C struct in `rtld_internal.h` that represents one loaded ELF object. The rtld threads them into a singly-linked chain rooted at `__rtld_global`.
+
+`MemoryObject` (MO)::
+The Fuchsia-inspired kernel object for variable-size paged memory. Supports commit, decommit, clone, resize, and side-band read/write. Invoke labels live in the `0x90`–`0x97` range.
+
+`msginfo`::
+The 64-bit word that encodes an IPC operation. Bits 6:0 are length (0–127 message registers), bits 11:7 are extra_caps (0–4), bits 51:12 are the protocol label.
+
+`PendingRequest`::
+An entry in the worker pool's pending request table. Servers store one of these when they accept a request but cannot reply immediately, then look it up later when the underlying resource becomes ready.
+
+`PE32+`::
+The 64-bit Portable Executable format used by Windows. SaltyOS supports loading PE32+ binaries via `trona_loader::pe_loader` and runs them through `ld-trona-pe.so`.
+
+`PT_INTERP`::
+ELF program header type that names the interpreter for an executable. For SaltyOS dynamic binaries it points at `/lib/ld-trona.so`.
+
+procmgr::
+The userspace process manager. Owns process and thread lifecycle, signals, credentials, resource limits, and session/pgrp state. The largest server in SaltyOS by far.
+
+`role_id` / `ROLE_*`::
+Identifiers in the `cap_table` that name the purpose of a capability slot — `ROLE_PROCMGR_CONTROL`, `ROLE_VFS_CLIENT`, `ROLE_MMSRV_CLIENT`, etc. Defined in `uapi/consts/kernel.rs`. Generated into `cap_table_roles.h` for the rtld via `tools/role_map_gen.py`.
+
+rtld::
+Runtime dynamic linker. Two of them in trona — `ld-trona.so` (ELF) and `ld-trona-pe.so` (PE).
+
+`scratch-map strategy`::
+The technique used by `trona_loader` to install ELF/PE pages in another vspace. Allocate a fresh frame, map it locally at `SCRATCH_VADDR`, copy the bytes in, unmap, then map into the destination vspace.
+
+`SlotAlloc` / slot allocator::
+Substrate's CNode slot allocator. Multi-segment bump allocator with a global spinlock and an asynchronous CSpace expansion protocol. See xref:substrate/slot-allocator.adoc[Slot Allocator].
+
+substrate::
+The trona Rust crate. The core kernel ABI layer — syscalls, IPC, invokes, sync primitives, TLS, slot allocator, layout planner. The leaf of the trona crate dependency graph.
+
+`__sig_dispatcher`::
+The kernel-injected entry point for signal delivery to a thread blocked in IPC. Registered per-thread via `TCB_SET_NOTIFICATION_DISPATCHER`. The dispatcher walks pending signals, runs handlers, and returns via `SYS_NOTIF_RETURN`.
+
+`SYS_NOTIF_RETURN`::
+Syscall #27. The "return from signal dispatcher" path. Restores the pre-notification TCB state and resumes the interrupted operation.
+
+`TCB`::
+Thread Control Block. The kernel object representing one thread. Created via `untyped_retype` with `OBJ_TCB`, configured via `TCB_CONFIGURE`, resumed via `TCB_RESUME`.
+
+`ThreadDesc`::
+Substrate's per-thread descriptor in the per-process thread pool. Holds state, generation, TLS block pointer, IPC context, TCB cap, stack base, owner, and personality data.
+
+`ThreadLocalBlock`::
+Substrate's per-thread mutable state block, accessed through the thread pointer (FS base on x86_64, `tpidr_el0` on aarch64). Holds errno, IPC context, signal mask, cancellation state, and TLS block pointer.
+
+TLS / static TLS::
+Thread-local storage. The rtld computes per-module offsets from the thread pointer at startup and exports the layout into `__trona_tls_*` weak symbols. SaltyOS supports static TLS only — no dynamic TLS loading after process start.
+
+trona_posix::
+The Rust crate at `lib/trona/posix/` that wraps substrate IPC into POSIX-shaped function calls. basaltc's C ABI calls into this crate.
+
+trona_loader::
+The Rust crate at `lib/trona/loader/` that implements ELF, PE, and CPIO loading. Used by init, procmgr, and the rtlds.
+
+trona_win32::
+The Rust crate at `lib/trona/win32/`. **Currently not built by any meson target** — the source files exist as design intent. The functioning Win32 component is `kernel32_pe.c` (C, not Rust).
+
+`TronaCspaceLayoutV1`::
+The struct passed via `AT_TRONA_CSPACE_LAYOUT` describing a child's CNode slot ranges. Fields: `version`, `flags`, `cnode_bits`, `frame_slot_base`, and the three half-open ranges `[alloc_base, alloc_limit)`, `[recv_base, recv_limit)`, `[expand_base, expand_limit)`.
+
+`TronaMsg`::
+The user-visible IPC message struct. 32-element u64 register array plus header fields. Only `regs[0..=3]` travel in CPU registers; `regs[4..19]` overflow via the IPC buffer page.
+
+`TronaResult`::
+The struct every syscall returns. `error` (0 = success) and `value` (operation-specific result on success).
+
+`uapi`::
+The shared kernel↔userland source tree at `lib/trona/uapi/`. Not a crate — substrate `include!`s it. Holds syscall numbers, invoke labels, IPC protocol labels, error codes, types, and auxv tag definitions.
+
+`untyped` / `OBJ_UNTYPED`::
+The seL4-style untyped memory object. Every kernel object in SaltyOS is carved from an untyped via `UNTYPED_RETYPE`.
+
+`VFS_BACKEND_RESOLVE_BACKING`::
+The VFS label mmsrv uses to ask "what is the backing for this fd?" when handling a file-backed mmap.
+
+`VmLayoutPlan`::
+The struct returned by `substrate::layout::compute_vm_layout` describing the VA layout of a new child process — IPC buffer, ELF code, rtld, shared libs, stack, scratch, initrd.
+
+`W32_RESOLVE_IMPORT`::
+Win32 protocol label `0x100`. Used by `ld-trona-pe.so` to ask `win32_csrss` for the kernel32 export RVA matching an imported function name.
+
+worker / worker pool::
+The substrate `run_workers` event loop that every SaltyOS server runs on. Worker threads share an endpoint set and dispatch incoming requests through a user-supplied handler. See xref:substrate/threads-and-workers.adoc[Threads, TLS, and Worker Pool].
+
+== Related pages
+
+* xref:index.adoc[Trona] — the component overview.
+* xref:architecture.adoc[Architecture] — the structural map.
+* xref:guides/reading-trona.adoc[Reading the trona Tree] — where to start reading the source.

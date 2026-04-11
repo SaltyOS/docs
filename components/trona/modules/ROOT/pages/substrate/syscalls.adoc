@@ -1,0 +1,194 @@
+= Syscall Wrappers
+:description: The single polymorphic syscall function and the seven specialized helpers in substrate/syscall.rs that every kernel entry in userspace flows through
+
+`substrate/syscall.rs` is the lowest-level file in userland.
+It is 196 lines, and those 196 lines are the only place in the entire tree that actually executes a `syscall` or `svc #0` instruction from user mode.
+Every other caller — from `substrate/ipc::call_ctx` to basaltc's `write()` to the loader's scratch-map sequence — eventually routes through this file.
+
+The file defines exactly one polymorphic entry point (`syscall()`) and seven specialized helpers for syscalls where the register calling convention is awkward or the inlining benefits from having a dedicated function.
+Everything else, including all of the IPC and invoke wrappers, calls `syscall()` directly.
+
+== The polymorphic entry point
+
+[source,rust]
+----
+#[inline(always)]
+pub fn syscall(
+    num: u64,
+    a0: u64, a1: u64, a2: u64,
+    a3: u64, a4: u64, a5: u64,
+) -> TronaResult {
+    let error: u64;
+    let value: u64;
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") num => error,
+            in("rdi") a0,
+            in("rsi") a1,
+            inlateout("rdx") a2 => value,
+            in("r10") a3,
+            in("r8") a4,
+            in("r9") a5,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") num,
+            inlateout("x0") a0 => error,
+            inlateout("x1") a1 => value,
+            in("x2") a2,
+            in("x3") a3,
+            in("x4") a4,
+            in("x5") a5,
+            options(nostack),
+        );
+    }
+
+    TronaResult { error, value }
+}
+----
+
+One function, two architecture branches, no subdirectories.
+The `#[inline(always)]` hint means every caller gets the syscall inlined at the call site — there is never an actual function call when issuing a syscall.
+
+The two branches are exactly what xref:../abi/syscall-abi.adoc[Syscall ABI] specifies — on x86_64 the number lives in `%rax` and the result lives in `%rax` (error) and `%rdx` (value), while on aarch64 the number is in `x8` and the result is in `x0` / `x1`.
+Note the asymmetry: on x86_64 `a2` enters and the return value exits through the same register (`%rdx`), so the caller cannot use the original `a2` after the call; on aarch64 the value lives in `x1`, which also means the original `a1` is consumed.
+Both branches `inlateout` those registers so the borrow checker understands the dataflow.
+
+`options(nostack)` tells the compiler that the syscall does not touch the user stack — the kernel switches to a per-thread kernel stack before running the handler.
+This lets the caller keep the red zone below `%rsp` (on x86_64) intact across the syscall.
+
+== The seven specialized helpers
+
+For a handful of syscalls, `syscall.rs` defines a dedicated wrapper.
+All of them simply call the main `syscall()` function with the right `SYS_*` number and argument layout — they exist to give upstream callers a clean signature and to unify the few common extraction patterns.
+
+=== Futex operations
+
+[source,rust]
+----
+#[inline]
+pub fn futex_wait(addr: *const u32, expected: u32) -> u64 {
+    syscall(SYS_FUTEX, addr as u64, FUTEX_WAIT, expected as u64, 0, 0, 0).error
+}
+
+#[inline]
+pub fn futex_wait_timeout(addr: *const u32, expected: u32, timeout_ns: u64) -> u64 {
+    syscall(SYS_FUTEX, addr as u64, FUTEX_WAIT_TIMEOUT, expected as u64, timeout_ns, 0, 0).error
+}
+
+#[inline]
+pub fn futex_wake(addr: *const u32, count: u32) -> u64 {
+    syscall(SYS_FUTEX, addr as u64, FUTEX_WAKE, count as u64, 0, 0, 0).value
+}
+----
+
+`SYS_FUTEX` is special because the operation is encoded as the second argument (`FUTEX_WAIT` / `FUTEX_WAKE` / `FUTEX_WAIT_TIMEOUT`) rather than being its own syscall number.
+The three helpers wrap that convention so that `substrate/sync.rs` and `tls.rs` never have to remember the sub-op codes.
+
+`futex_wait` returns the raw error code:
+
+- `0` — the thread was woken by a matching `FUTEX_WAKE`.
+- `TRONA_WOULD_BLOCK` (9) — the atomic compare failed: `*addr != expected` at kernel entry.
+- Anything else — a fault or invalid argument.
+
+`futex_wait_timeout` returns the same error space plus `TRONA_CANCELLED` (12) on timeout expiry.
+
+`futex_wake` returns the number of threads actually woken as a `u64` — note that this value comes from the `value` field, not the `error` field.
+
+These three helpers are how xref:substrate/sync-primitives.adoc[`Mutex`, `Condvar`, `RWLock`, `Barrier`, `Semaphore`, and `Once`] all eventually block and unblock.
+
+=== Hardware random
+
+[source,rust]
+----
+#[inline]
+pub fn sys_getrandom() -> Option<u64> {
+    let r = syscall(SYS_GETRANDOM, 0, 0, 0, 0, 0, 0);
+    if r.error == 0 { Some(r.value) } else { None }
+}
+----
+
+`SYS_GETRANDOM` returns a single 64-bit hardware random number from the kernel RNG (RDRAND on x86_64, the architectural random instruction on aarch64).
+If the hardware RNG is unavailable, the kernel returns a non-zero error and this wrapper returns `None`.
+
+Callers that need more than 64 bits of entropy typically sit in a loop calling this and accumulating into a buffer; basaltc's `getrandom()` is implemented exactly that way.
+
+=== System shutdown
+
+[source,rust]
+----
+#[inline]
+pub fn sys_shutdown() -> ! {
+    syscall(SYS_SHUTDOWN, 0, 0, 0, 0, 0, 0);
+    loop {}
+}
+----
+
+`SYS_SHUTDOWN` is the ACPI `S5` shutdown path on x86_64 and the PSCI `SYSTEM_OFF` call on aarch64.
+The syscall does not return on success — the kernel powers off before completing the return to user — so the wrapper is marked `-> !` and has a trailing `loop {}` to satisfy the compiler in the (impossible) case that the syscall ever returns.
+
+Only the init process is expected to call this; every other userspace program should exit via `posix_exit` / `PM_EXIT` and let init handle shutdown.
+
+=== Timed IPC
+
+[source,rust]
+----
+#[inline]
+pub fn sys_send_timed(cap: u64, msg_info: u64, mr0: u64, timeout_ns: u64) -> u64 {
+    syscall(SYS_SEND_TIMED, cap, msg_info, mr0, timeout_ns, 0, 0).error
+}
+
+#[inline]
+pub fn sys_recv_timed(cap: u64, timeout_ns: u64) -> TronaResult {
+    syscall(SYS_RECV_TIMED, cap, timeout_ns, 0, 0, 0, 0)
+}
+----
+
+These are lower-level than the `ipc::send_ctx` / `ipc::recv_timed_ctx` API in xref:substrate/ipc.adoc[IPC] — they do not touch the IPC buffer overflow area or the per-thread `IpcContext`, and they expect the caller to have already placed the first message register in `mr0`.
+
+The IPC module uses them as building blocks.
+Direct callers are rare; the only consumers are a handful of substrate-internal paths that need to issue a single-register timed send without paying the overhead of the full IPC context protocol.
+
+== What is deliberately not in this file
+
+A number of syscalls that xref:../abi/syscall-abi.adoc[Syscall ABI] lists have no dedicated wrapper in `syscall.rs`:
+
+- `SYS_SEND`, `SYS_RECV`, `SYS_CALL`, `SYS_REPLY_RECV`, `SYS_NBSEND`, `SYS_RECV_ANY`, `SYS_REPLY_RECV_ANY` — all live in `substrate/ipc.rs` with the IPC context plumbing.
+- `SYS_INVOKE` — lives in `substrate/invoke.rs`, which provides 75 typed wrappers over it.
+- `SYS_YIELD`, `SYS_DEBUG_*`, `SYS_SET_INVOKE_DEPTHS`, `SYS_NOTIF_RETURN` — called directly as `syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0)` at their single call sites.
+- `SYS_CLOCK_GETTIME`, `SYS_NANOSLEEP` — called from `posix/proc.rs` with inline `syscall()` calls since they are POSIX-facing and only make sense in that context.
+- `SYS_SIGNAL`, `SYS_WAIT`, `SYS_POLL` — called from `substrate/lib.rs`'s `trona_signal` / `trona_wait` / `trona_poll` C ABI wrappers.
+
+The rule of thumb: a syscall gets a dedicated helper in `syscall.rs` if it is called from more than one file or if its argument layout is weird enough that a helper saves the caller from remembering a convention.
+Everything else is just `syscall(SYS_FOO, ...)` at the call site.
+
+== What this file does not hide
+
+`syscall.rs` is intentionally as thin as possible.
+It does not:
+
+- Translate errors to `Result` — that is `substrate/invoke.rs`'s and `substrate/ipc.rs`'s job.
+- Check for null pointers or out-of-range slots — the kernel does that.
+- Retry `TRONA_RESTART` — higher layers in trona_posix handle cancellation-aware restarts.
+- Handle TLS or per-thread state — the substrate TLS module does that.
+- Trace or log — the serial logging macros live in `substrate/serial.rs`.
+
+Every one of those policies belongs somewhere else.
+`syscall.rs` is the single narrow point where userspace transitions into kernel mode, and everything above it can be understood as a Rust API on top of "kernel entry plus a register convention".
+
+== Related pages
+
+* xref:../abi/syscall-abi.adoc[Syscall ABI] — the 28 syscall numbers and their calling convention.
+* xref:substrate/ipc.adoc[IPC] — the module that builds `TronaMsg` structures and calls `syscall(SYS_SEND / SYS_RECV / SYS_CALL / …)`.
+* xref:substrate/invoke.adoc[Capability Invocation] — the module that builds `SYS_INVOKE` calls from 75 typed helpers.
+* xref:substrate/sync-primitives.adoc[Synchronization Primitives] — the futex-based sync layer built on the three futex wrappers documented here.

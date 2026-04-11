@@ -1,0 +1,212 @@
+= Process and Signals
+:description: posix/proc.rs process management, credentials, and time, plus posix/signals.rs cooperative signal delivery
+
+This page covers two tightly-coupled modules:
+
+- `posix/proc.rs` (892 lines) — `fork`, `execve`, `waitpid`, `exit`, pgid/sid, credentials, `clock_gettime`, `nanosleep`.
+- `posix/signals.rs` (386 lines) — `sigaction`, `sigprocmask`, `sigsuspend`, `kill`, `raise`, the `posix_sigcheck` cooperative poll, and the kernel-injected `__signal_dispatcher` frame.
+
+Everything in `proc.rs` targets the procmgr endpoint (`caps::procmgr_ep()`) with `PM_*` labels.
+`signals.rs` is split between `PM_KILL` / `PM_SIGACTION` calls to procmgr and a dispatcher path that rides on the per-thread signal notification.
+
+== Process lifecycle — `proc.rs`
+
+=== fork
+
+`posix_fork()` is unusual: most of its body is in assembly, not Rust.
+
+The calling convention:
+
+[source,rust]
+----
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn posix_fork() -> i32;  // implemented in fork.S
+----
+
+The assembly trampoline is at `posix/arch/x86_64/fork.S` and `posix/arch/aarch64/fork.S`.
+It saves the callee-saved GPRs (and the full SSE / NEON register file on x86_64 and aarch64 respectively), calls into `_posix_fork_impl` — the Rust function that issues `PM_FORK` to procmgr — and either returns the child PID to the parent or resumes at a `fork_child_entry` label in the child.
+
+The Rust side of `_posix_fork_impl` does the usual work:
+
+. Send `PM_FORK` to procmgr. procmgr creates a new TCB, clones the VSpace pages via mmsrv, and sets the new TCB's entry point to the saved `fork_child_entry` address.
+. If procmgr replies with a positive child PID, the parent returns that PID.
+. If the child TCB is resumed, control arrives at `fork_child_entry`, which calls `_trona_post_fork_child` to reset per-process runtime state (thread pool, allocator counters, pending tables) and then returns `0` to the fork caller.
+
+xref:../internals/fork-and-linker-scripts.adoc[fork.S and Linker Scripts] covers the assembly trampoline in detail.
+
+=== execve
+
+[source,rust]
+----
+pub unsafe fn posix_execve(
+    path: *const u8,
+    argv: *const *const u8,
+    envp: *const *const u8,
+) -> i32;
+----
+
+`posix_execve` packages the path, argv, and envp into a single `PM_EXEC` IPC and sends it to procmgr.
+Procmgr re-reads the executable via VFS (using `VFS_POSIX_STAT_FOR_EXEC` to validate permissions), parses its ELF headers, lays out a fresh VA layout via `substrate::layout`, and then does an in-place VSpace swap: the old pages are unmapped, the new ones are mapped, and the TCB is resumed at the new entry point.
+
+From the caller's perspective, a successful exec never returns — control never comes back from the `PM_EXEC` call.
+A failed exec returns a negative errno.
+
+=== waitpid and exit
+
+[cols="1,2"]
+|===
+| Function | Label
+
+| `posix_waitpid(pid, status, options)`
+| `PM_WAIT`
+
+| `posix_exit(status)` (never returns)
+| `PM_EXIT`
+|===
+
+`PM_EXIT` is the last IPC the process ever makes — procmgr tears down the TCB, reclaims all capabilities via `RES_RECLAIM_OWNER`, and removes the PID from the list.
+`posix_exit` is marked `-> !` because it cannot return.
+
+`PM_WAIT` supports the usual POSIX flags:
+
+- `WNOHANG` — return immediately if no child has exited.
+- `WUNTRACED` — also report stopped children.
+- PID `-1` — wait for any child.
+- PID `0` — wait for any child in the caller's process group.
+
+The returned `status` word encodes the exit status, termination signal, and stop signal in the traditional POSIX bit layout.
+
+=== Process group and session
+
+[cols="1,2"]
+|===
+| Function | Label
+
+| `posix_setpgid(pid, pgid)` | `PM_SETPGID`
+| `posix_getpgid(pid)`       | `PM_GETPGID` (or `PM_GETPGID_BADGE` when querying self)
+| `posix_setsid()`           | `PM_SETSID`
+| `posix_getsid(pid)`        | `PM_GETSID` (or `PM_GETSID_BADGE` when querying self)
+| `posix_kill(pid, sig)`     | `PM_KILL`
+|===
+
+The `_BADGE` variants exist because procmgr can validate "the caller is asking about itself" via the IPC badge without looking up a PID table entry — a faster path for the common case.
+
+=== Credentials
+
+`proc.rs` exposes the full POSIX credential surface:
+
+[cols="1,2"]
+|===
+| Function | Label
+
+| `posix_getuid()` / `posix_geteuid()` / `posix_getgid()` / `posix_getegid()` | `PM_GETUID` / `PM_GETEUID` / `PM_GETGID` / `PM_GETEGID`
+| `posix_setuid(uid)` / `posix_setgid(gid)` | `PM_SETUID` / `PM_SETGID`
+| `posix_seteuid(euid)` / `posix_setegid(egid)` | `PM_SETEUID` / `PM_SETEGID`
+| `posix_setreuid(r, e)` / `posix_setregid(r, e)` | `PM_SETREUID` / `PM_SETREGID`
+| `posix_setresuid(r, e, s)` / `posix_setresgid(r, e, s)` | `PM_SETRESUID` / `PM_SETRESGID`
+| `posix_getresuid(&r, &e, &s)` / `posix_getresgid(&r, &e, &s)` | `PM_GETRESUID` / `PM_GETRESGID`
+| `posix_getgroups(size, list)` / `posix_setgroups(size, list)` | `PM_GETGROUPS` / `PM_SETGROUPS`
+|===
+
+All credential checks happen at procmgr.
+trona_posix just marshals the arguments and returns the errno.
+
+=== Resource limits
+
+[cols="1,2"]
+|===
+| Function | Label
+
+| `posix_getrlimit(resource, rlim)` | `PM_GETRLIMIT`
+| `posix_setrlimit(resource, rlim)` | `PM_SETRLIMIT`
+|===
+
+`resource` is one of the `RLIMIT_*` constants defined in `uapi/consts/posix.rs`.
+Enforcement happens at procmgr — trona_posix is pure wire.
+
+=== Clock and sleep
+
+[cols="1,2"]
+|===
+| Function | Syscall
+
+| `posix_clock_gettime(clock_id, ts)` | `SYS_CLOCK_GETTIME` (#12)
+| `posix_gettimeofday(tv)` | Computed from `SYS_CLOCK_GETTIME` with `CLOCK_REALTIME`.
+| `posix_nanosleep(req, rem)` | `SYS_NANOSLEEP` (#13)
+| `posix_usleep(usec)` | `SYS_NANOSLEEP` with nanosecond conversion.
+| `posix_sleep(seconds)` | `SYS_NANOSLEEP` with second conversion.
+|===
+
+These are the only `posix_*` functions in `proc.rs` that talk directly to the kernel rather than to procmgr.
+The kernel clock is authoritative — no userspace caching.
+
+`CLOCK_REALTIME` (0) and `CLOCK_MONOTONIC` (1) are the only two supported clock IDs; other POSIX clocks (`CLOCK_PROCESS_CPUTIME_ID`, `CLOCK_THREAD_CPUTIME_ID`) are not implemented.
+
+== Signals — `signals.rs`
+
+SaltyOS's signal delivery is **cooperative**: the kernel never preempts a running userspace thread to deliver a signal.
+Instead, the signal arrives as a notification on the per-thread `caps::signal_ntfn()`, and the thread picks it up at one of two points:
+
+. **`posix_sigcheck()`** — an explicit check basaltc inserts in its C ABI wrappers around blocking syscalls. Before a blocking wait, basaltc calls `posix_sigcheck()`; if any signal bits are pending and not masked, the handler runs before the thread ever enters the syscall.
+. **`__signal_dispatcher`** — a kernel-injected path used when a thread is already blocked in an IPC. The kernel arranges for the thread to resume at a well-known dispatcher address with a `NotifFrame` on the stack; the dispatcher runs any pending handlers and then returns to the interrupted code via `SYS_NOTIF_RETURN`.
+
+Both paths consult the same global state in `posix/lib.rs`:
+
+[source,rust]
+----
+static mut __sig_handlers: [AtomicU64; NSIG];
+static mut __sig_blocked_mask: AtomicU64;
+static mut __sig_sa_mask: [AtomicU64; NSIG];
+static mut __sig_sa_flags: [AtomicU32; NSIG];
+static mut __sig_last_restart: AtomicBool;
+----
+
+=== Signal installation
+
+[cols="1,2"]
+|===
+| Function | Label / action
+
+| `posix_sigaction(sig, act, oldact)` | Updates the `__sig_*` arrays locally; also sends `PM_SIGACTION` to procmgr so procmgr knows the handler exists (for `fork()` copying and for `kill(pid, SIGKILL)` bypass checks).
+| `posix_sigprocmask(how, set, oldset)` | Updates `__sig_blocked_mask` with the `SIG_BLOCK` / `SIG_UNBLOCK` / `SIG_SETMASK` operation. Does not send IPC.
+| `posix_sigsuspend(mask)` | Temporarily installs `mask`, blocks on the signal notification, runs any delivered handler, restores the old mask.
+| `posix_kill(pid, sig)` | `PM_KILL` — procmgr locates the target thread's signal notification and calls `SYS_SIGNAL` on it with the appropriate bit.
+| `posix_raise(sig)` | Local call to `posix_kill(getpid(), sig)`.
+| `posix_pause()` | Block on the signal notification; return when any signal wakes the caller.
+|===
+
+=== The dispatcher path and NotifFrame
+
+When the kernel needs to inject a signal into a thread that is currently blocked in an IPC, it:
+
+. Saves the TCB's current register state.
+. Allocates a `NotifFrame` on the thread's stack containing the saved registers and some metadata (`interrupted_syscall`, `syscall_cap_ptr`, `syscall_msg_info`, `magic = 0x5A17535349464652`).
+. Rewrites the TCB's RIP to the user-registered `__signal_dispatcher` address and resumes.
+
+The `__signal_dispatcher` is a C ABI function in `signals.rs` that:
+
+. Reads the pending bitmask from the signal notification via `SYS_WAIT`.
+. For each pending bit, if the matching handler is not `SIG_DFL`/`SIG_IGN` and not masked, calls the handler with the signal number.
+. Clears the bits that were handled.
+. Either calls `SYS_NOTIF_RETURN` to resume the interrupted operation (if any handler had `SA_RESTART`) or abandons it and returns a `TRONA_INTERRUPTED` error to the original caller.
+
+The `__sig_last_restart` flag records whether the most recently dispatched signal had `SA_RESTART` set; the kernel consults it when deciding whether to re-run the interrupted syscall.
+
+The dispatcher is registered once per thread via `TCB_SET_NOTIFICATION_DISPATCHER` during thread creation.
+Threads that have not registered a dispatcher have their NotifFrame dropped — the kernel silently resumes them at the original blocked location.
+
+=== SA_RESTART is intentionally not implemented
+
+The source has a comment near `SA_RESTART` handling noting that it is stored but intentionally not acted on.
+The rationale is that SaltyOS's cooperative delivery model already makes most system calls restartable implicitly — the kernel does not interrupt a syscall in the middle unless the TCB was actually blocked, and basaltc's C wrappers check for pending signals before every blocking call.
+So `SA_RESTART` ends up being a no-op: either the signal would have been caught by `posix_sigcheck` before the syscall started, or the kernel delivered it mid-block and the dispatcher will decide whether to restart.
+
+Writing `SA_RESTART` via `sigaction` is accepted and the bit is stored — so POSIX test suites that set it do not error — but the bit does not change runtime behavior.
+This matches what FreeBSD does for many of its "advisory" signal flags.
+
+== Related pages
+
+* xref:../abi/protocol-labels.adoc#_process_manager_procmgr_rs[Procmgr Protocol Labels] — the `PM_*` labels this page references.
+* xref:../internals/fork-and-linker-scripts.adoc[fork.S and Linker Scripts] — the assembly trampoline for `posix_fork`.
+* xref:posix/pthread.adoc[POSIX Threads] — thread lifecycle, including `pthread_kill` which also uses `PM_KILL`.
+* xref:basalt::process/processes-and-signals.adoc[basalt: Processes and Signals] — the C-side view of this code.

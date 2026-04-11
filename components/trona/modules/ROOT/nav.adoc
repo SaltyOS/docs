@@ -1,1 +1,40 @@
-* xref:index.adoc[Overview]
+* xref:index.adoc[Trona]
+* trona Guides
+** xref:guides/reading-trona.adoc[Reading the trona Tree]
+** xref:guides/adding-a-kernel-op.adoc[Adding a Syscall or Invoke]
+* xref:architecture.adoc[Architecture]
+* xref:build-system.adoc[Build System]
+* Kernel ABI
+** xref:abi/syscall-abi.adoc[Syscall ABI]
+** xref:abi/invoke-labels.adoc[Invoke Labels]
+** xref:abi/protocol-labels.adoc[IPC Protocol Labels]
+** xref:abi/error-codes.adoc[Error Codes]
+* substrate — Core Runtime
+** xref:substrate/index.adoc[substrate Overview]
+** xref:substrate/syscalls.adoc[Syscall Wrappers]
+** xref:substrate/ipc.adoc[IPC]
+** xref:substrate/invoke.adoc[Capability Invocation]
+** xref:substrate/slot-allocator.adoc[Slot Allocator]
+** xref:substrate/sync-primitives.adoc[Synchronization Primitives]
+** xref:substrate/threads-and-workers.adoc[Threads, TLS, and Worker Pool]
+** xref:substrate/layout-and-caps.adoc[VA Layout and Cap Table]
+* trona_posix — POSIX Client
+** xref:posix/index.adoc[trona_posix Overview]
+** xref:posix/file-and-at.adoc[File I/O and *at()]
+** xref:posix/process-and-signals.adoc[Process and Signals]
+** xref:posix/sockets-and-dns.adoc[Sockets and DNS]
+** xref:posix/poll-pipe-bulk.adoc[Poll, Pipe, and Bulk I/O]
+** xref:posix/mm.adoc[Memory Management]
+** xref:posix/pthread.adoc[POSIX Threads]
+* trona_loader — Binary Loading
+** xref:loader/elf-loader.adoc[ELF Loader]
+** xref:loader/pe-and-cpio.adoc[PE Loader and CPIO]
+* Dynamic Linkers
+** xref:rtld/elf-rtld.adoc[ELF rtld (ld-trona.so)]
+** xref:rtld/pe-rtld.adoc[PE rtld (ld-trona-pe.so)]
+* trona_win32 — Win32 Personality
+** xref:win32/index.adoc[trona_win32 Overview]
+** xref:win32/kernel32-stub.adoc[kernel32.dll Stub]
+* Internals
+** xref:internals/fork-and-linker-scripts.adoc[fork.S and Linker Scripts]
+* xref:glossary.adoc[Glossary]

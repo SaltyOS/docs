@@ -1,0 +1,177 @@
+= File I/O and *at() Family
+:description: The posix/file.rs and posix/at.rs modules — how basic file I/O and the directory-relative *at() family translate to VFS IPC labels
+
+`trona_posix::file` and `trona_posix::at` together cover the POSIX file system surface that basaltc's C wrappers call into.
+`file.rs` (753 lines) owns the traditional path-based API plus the fd-based operations.
+`at.rs` (441 lines) owns the `*at()` variants that resolve paths relative to an `dirfd`.
+
+Both modules target the VFS endpoint (`caps::vfs_ep()`) and use labels from xref:../abi/protocol-labels.adoc#_vfs_server_vfs_rs[the VFS label catalog].
+Neither module implements anything substantive on its own — the actual filesystem semantics live in the `vfs` server.
+
+== Path-based file I/O — `file.rs`
+
+=== Open, close, read, write, lseek
+
+The five core POSIX operations each map to a single VFS label:
+
+[cols="1,2"]
+|===
+| Function | VFS label
+
+| `posix_open(path, flags, mode) -> i32`
+| `VFS_POSIX_OPEN` (1). Returns a new fd, or a negative errno.
+
+| `posix_close(fd) -> i32`
+| `VFS_CLOSE` (4).
+
+| `posix_read(fd, buf, count) -> isize`
+| `VFS_READ` (2) for short reads; transparently upgraded to `VFS_BULK_READ` (65) when `count > BULK_THRESHOLD`.
+
+| `posix_write(fd, buf, count) -> isize`
+| `VFS_WRITE` (3); upgraded to `VFS_BULK_SETUP` + `VFS_BULK_READ`-style bulk path above the threshold.
+
+| `posix_lseek(fd, offset, whence) -> off_t`
+| `VFS_LSEEK` (6). Returns the new absolute offset.
+|===
+
+The bulk upgrade is the biggest non-trivial thing `file.rs` does.
+Short reads and writes fit in the IPC register window (up to ~16 × 8 bytes = 128 bytes of inline payload) and use the plain label.
+Larger ones call into `bulk.rs` (see xref:posix/poll-pipe-bulk.adoc[Poll, Pipe, and Bulk I/O]) which sets up a shared memory region with the VFS server and transfers through it.
+
+The threshold is tuned so that the one-time cost of setting up a shared memory region amortizes across the transfer.
+For small reads the IPC-register path is always faster; for large reads the bulk path dominates.
+
+=== Positional variants
+
+[cols="1,2"]
+|===
+| Function | VFS label
+
+| `posix_pread(fd, buf, count, offset)`  | `VFS_PREAD` (62).
+| `posix_pwrite(fd, buf, count, offset)` | `VFS_PWRITE` (63).
+|===
+
+`pread`/`pwrite` are the thread-safe alternatives to an `lseek`-then-`read` pair — the seek is atomic with the transfer at the VFS server.
+trona_posix just exposes them; the atomicity is the server's responsibility.
+
+=== Stat family
+
+[cols="1,2"]
+|===
+| Function | VFS label
+
+| `posix_stat(path, statbuf)`  | `VFS_POSIX_STAT` (5).
+| `posix_fstat(fd, statbuf)`   | `VFS_POSIX_FSTAT` (7).
+| `posix_lstat(path, statbuf)` | `VFS_POSIX_LSTAT` (15).
+|===
+
+Each one writes a `PosixStat` struct (defined in `uapi/types/posix.rs`) through the IPC buffer — VFS fills in inode, mode, nlink, uid, gid, size, atime / mtime / ctime, and block counts.
+
+There is no caching in trona_posix itself; every call is a round-trip to VFS.
+Most hot-path code that needs stat-like info uses `VFS_POSIX_FSTAT` with a cached fd rather than the path-based variants.
+
+=== Remove, rename, permissions
+
+[cols="1,2"]
+|===
+| Function | VFS label
+
+| `posix_unlink(path)`         | `VFS_POSIX_UNLINK` (9)
+| `posix_rename(old, new)`     | `VFS_POSIX_RENAME` (10)
+| `posix_mkdir(path, mode)`    | `VFS_POSIX_MKDIR` (11)
+| `posix_rmdir(path)`          | `VFS_POSIX_RMDIR` (12)
+| `posix_access(path, mode)`   | `VFS_POSIX_ACCESS` (8)
+| `posix_chmod(path, mode)`    | Forwarded via VFS (via `VFS_POSIX_FCHMODAT` with `dirfd=AT_FDCWD`)
+| `posix_fchmod(fd, mode)`     | `VFS_POSIX_FCHMOD` (59)
+| `posix_fchown(fd, uid, gid)` | `VFS_POSIX_FCHOWN` (60)
+| `posix_ftruncate(fd, len)`   | `VFS_POSIX_FTRUNCATE` (19)
+| `posix_fsync(fd)`             | `VFS_FSYNC` (77)
+|===
+
+Note the asymmetry: `posix_chmod` is implemented as an `openat`-with-`AT_FDCWD` against `VFS_POSIX_FCHMODAT` rather than having its own label, because adding a dedicated plain-path `chmod` label would duplicate logic that already exists in the `*at()` dispatcher.
+
+=== Opendir and readdir
+
+Directory enumeration is two calls:
+
+[source,rust]
+----
+let dirfd = posix_opendir(path);        // → VFS_POSIX_OPENDIR (13)
+loop {
+    let entry = posix_readdir(dirfd);   // → VFS_POSIX_READDIR (14)
+    if entry.is_null() { break; }
+    // use entry
+}
+posix_close(dirfd);
+----
+
+Each `readdir` returns exactly one entry, so the client is in control of pagination.
+basaltc's C `readdir()` wraps this with a small per-fd cache to avoid one IPC per entry.
+
+== `*at()` family — `at.rs`
+
+The `*at()` functions take an extra `dirfd` argument that is the base for relative paths.
+`AT_FDCWD` (defined as `-100`) is a special value that means "use the current working directory", which lets the same dispatcher handle both plain and relative paths on the VFS side.
+
+[cols="1,2"]
+|===
+| Function | VFS label
+
+| `posix_openat(dirfd, path, flags, mode)` | `VFS_POSIX_OPENAT` (47)
+| `posix_fstatat(dirfd, path, stat, at_flags)` | `VFS_POSIX_FSTATAT` (48)
+| `posix_unlinkat(dirfd, path, at_flags)` | `VFS_POSIX_UNLINKAT` (49)
+| `posix_renameat(olddirfd, oldpath, newdirfd, newpath)` | `VFS_POSIX_RENAMEAT` (50)
+| `posix_mkdirat(dirfd, path, mode)` | `VFS_POSIX_MKDIRAT` (51)
+| `posix_faccessat(dirfd, path, mode, at_flags)` | `VFS_POSIX_FACCESSAT` (52)
+| `posix_fchmodat(dirfd, path, mode, at_flags)` | `VFS_POSIX_FCHMODAT` (53)
+| `posix_fchownat(dirfd, path, uid, gid, at_flags)` | `VFS_POSIX_FCHOWNAT` (54)
+| `posix_linkat(olddirfd, oldpath, newdirfd, newpath, flags)` | `VFS_POSIX_LINKAT` (55)
+| `posix_symlinkat(target, dirfd, linkpath)` | `VFS_POSIX_SYMLINKAT` (56)
+| `posix_readlinkat(dirfd, path, buf, bufsiz)` | `VFS_POSIX_READLINKAT` (57)
+| `posix_utimensat(dirfd, path, times, flags)` | `VFS_POSIX_UTIMENSAT` (58)
+|===
+
+The `at_flags` argument carries `AT_SYMLINK_NOFOLLOW`, `AT_SYMLINK_FOLLOW`, `AT_REMOVEDIR`, and similar — trona_posix passes these through unchanged; VFS interprets them.
+
+The renameat/linkat variants take **two** `dirfd` arguments because the source and destination can be in different directories.
+Both dirfds travel as register fields; the path strings follow as inline bytes in the IPC buffer overflow.
+
+== Path encoding
+
+Paths in VFS IPC are always UTF-8 byte sequences, NUL-terminated, with a maximum length of 4,096 bytes (`PATH_MAX`).
+trona_posix packs them as follows:
+
+- Short paths (fit in register window + overflow): all inline in the `TronaMsg` registers.
+- Long paths: via bulk SHM transfer, same mechanism as `posix_read`/`posix_write`.
+
+VFS validates the NUL termination and the length on the server side; trona_posix does not.
+Passing a non-NUL-terminated path is an undefined-behavior-leading bug.
+
+== What is deliberately not here
+
+A few operations that might belong in `file.rs` live elsewhere:
+
+- **`dup` / `dup2` / `dup3`** — in `pipe.rs`, because they are descriptor-table operations rather than file operations.
+- **`mmap`** — in `mm.rs`, because it targets mmsrv, not VFS.
+- **`ioctl`** — in `misc.rs`, because it is a catch-all for everything that is not a standard fd operation.
+- **`fcntl`** — in `misc.rs`, same reason.
+- **`shm_open` / `shm_unlink`** — in `misc.rs`; they use the `VFS_POSIX_SHM_*` labels but are conventionally grouped with SHM operations rather than file operations.
+
+== Error translation
+
+Every function in `file.rs` and `at.rs` calls `trona_err_to_posix` (defined in `posix/lib.rs` — see xref:index.adoc[trona_posix Overview]) to translate the `TRONA_*` reply into a negative POSIX `errno`.
+A few error cases are mapped differently than the generic table:
+
+- `TRONA_NOT_FOUND` from a path lookup → `-ENOENT`.
+- `TRONA_NOT_FOUND` from a `readdir` that has reached the end → `0` (end-of-directory, not an error).
+- `TRONA_IS_DIRECTORY` from an `open(O_WRONLY)` on a directory → `-EISDIR`.
+- `TRONA_READONLY` from a write to a read-only file → `-EROFS`.
+
+basaltc's C ABI layer flips the sign, stores the positive value in per-thread `errno`, and returns `-1`.
+
+== Related pages
+
+* xref:../abi/protocol-labels.adoc#_vfs_server_vfs_rs[VFS Protocol Labels] — the full list of labels referenced here.
+* xref:posix/poll-pipe-bulk.adoc[Poll, Pipe, and Bulk I/O] — the bulk SHM transfer path used for large reads and writes.
+* xref:posix/sockets-and-dns.adoc[Sockets and DNS] — another major consumer of the VFS endpoint.
+* xref:basalt::io/files-and-directories.adoc[basalt: Files and Directories] — the C wrappers on top of these functions.

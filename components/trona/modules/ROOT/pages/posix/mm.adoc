@@ -1,0 +1,159 @@
+= POSIX Memory Management
+:description: posix/mm.rs — brk, mmap, and the file-backed mmap path through mmsrv
+
+`trona_posix::mm` is the smallest substantive POSIX module — 190 lines for six functions.
+Every one of them targets the memory manager server (`caps::mmsrv_ep()`) with `MM_*` labels from xref:../abi/protocol-labels.adoc#_memory_manager_mmsrv_rs[the mmsrv catalog].
+
+== The six functions
+
+[cols="1,2,3"]
+|===
+| Function | mmsrv label | Role
+
+| `posix_brk(addr) -> i32`
+| `MM_BRK` (0x82)
+| Set the program break (heap end). Returns 0 on success, -1 on failure.
+
+| `posix_sbrk(increment) -> u64`
+| `MM_SBRK` (0x83)
+| Increment the program break by `increment` bytes (which may be negative). Returns the **previous** break address on success, `u64::MAX` on failure.
+
+| `posix_mmap(addr, length, prot, flags, fd, offset) -> usize`
+| `MM_MMAP` (0x84) for anonymous; `MM_FILE_MMAP` (0x95) for file-backed
+| Map pages. Returns the mapped base address, or `MAP_FAILED` (`usize::MAX`) on failure.
+
+| `posix_munmap(addr, length) -> i32`
+| `MM_MUNMAP` (0x85)
+| Unmap a previously-mapped region.
+
+| `posix_mprotect(addr, length, prot) -> i32`
+| `MM_MPROTECT` (0x86)
+| Change the protection flags of a mapped region.
+
+| `posix_msync(addr, length, flags) -> i32`
+| `MM_SYNC_FILE_BACKING` (0x94) when called on a file-backed region; ignored otherwise.
+| Sync a mapped region to its backing file.
+|===
+
+`mm.rs` is the only POSIX module other than the synchronization-free filesystem path that touches mmsrv directly — every other client of mmsrv (the loader, the worker pool when allocating thread stacks) uses `trona::invoke::*` operations on MemoryObjects rather than going through the POSIX `mmap` interface.
+
+== brk and sbrk
+
+`brk` and `sbrk` set the heap break — the upper boundary of the process's data segment.
+mmsrv tracks the current break per client and maps additional pages on demand when the break grows.
+
+`posix_brk(addr)`:
+
+. Sends `MM_BRK` with `regs[0] = addr`.
+. mmsrv either grows the heap region up to `addr` (mapping new frames) or shrinks it (unmapping frames above the new break).
+. Replies `TRONA_OK` with `regs[0]` set to the new break.
+
+`posix_sbrk(increment)`:
+
+. Sends `MM_SBRK` with `regs[0] = increment` (signed; negative means shrink).
+. mmsrv computes `new_break = old_break + increment` and applies it.
+. Replies `TRONA_OK` with `regs[0]` set to the **old** break.
+
+The asymmetry between `brk` and `sbrk` (one returns the new break, the other returns the old) is the standard POSIX semantics, preserved here so that basaltc's `malloc` implementation works without modification.
+
+basaltc only ever calls `posix_sbrk` with positive increments — its allocator never tries to shrink the heap.
+A negative `sbrk` will work, but it is not exercised in the current code base.
+
+== Anonymous mmap
+
+`posix_mmap` with `MAP_ANONYMOUS` set in `flags` and `fd = -1` is the simple case:
+
+. Send `MM_MMAP` with the requested address (or `0` for "let mmsrv pick"), length, prot, and flags.
+. mmsrv allocates the requested number of frames, maps them into the caller's vspace, and returns the base address.
+. trona_posix returns the base, or `MAP_FAILED` on error.
+
+`MAP_PRIVATE` versus `MAP_SHARED` only matters for file-backed mappings — anonymous private and shared mappings behave identically (each is just zero-initialized memory unique to the process).
+
+`MAP_FIXED` is honored if the requested address is in a free range; otherwise the call fails with `MAP_FAILED`.
+There is no `MAP_FIXED_NOREPLACE` — a `MAP_FIXED` request is implicitly noreplace.
+
+== File-backed mmap
+
+`posix_mmap` with a valid `fd` (and without `MAP_ANONYMOUS`) routes to a different mmsrv label:
+
+[source]
+----
+posix_mmap(addr, length, prot, flags, fd, offset)
+    │
+    ▼
+MM_FILE_MMAP (0x95) → mmsrv
+    │
+    ▼
+mmsrv asks VFS:
+    VFS_BACKEND_RESOLVE_BACKING (73) → vfs server
+    │
+    ▼ (replies with backing file / mount / device descriptor)
+    │
+    ▼
+mmsrv installs the mapping with the backing descriptor as the pager.
+On a fault, mmsrv calls back into VFS via VFS_BACKEND_PAGER_READ (70) /
+VFS_BACKEND_PAGER_WRITE (71) to fill / write back pages.
+----
+
+The flow is:
+
+. trona_posix sends `MM_FILE_MMAP` with `fd`, `offset`, `length`, `prot`, `flags`.
+. mmsrv internally sends `VFS_BACKEND_RESOLVE_BACKING` to VFS, which translates the fd into a backing descriptor (file inode, mount handle, device id, depending on what kind of fd it is).
+. mmsrv allocates a `MemoryObject` (from xref:../abi/invoke-labels.adoc[the MemoryObject invoke labels]), configures it with the backing descriptor, and maps it into the caller's vspace via `VSPACE_MAP_MO`.
+. The caller starts using the mapping. On a page fault, mmsrv routes the fault back to VFS via `VFS_BACKEND_PAGER_READ` for read faults and `VFS_BACKEND_PAGER_WRITE` for writeback.
+
+This factoring is what lets mmsrv support every fd type uniformly:
+
+- A file fd → file pages, written back to the file.
+- A mount fd → mount-level pages.
+- A device fd → MMIO (via the driver's `pager` IPC).
+- A SHM fd → anonymous pages backed by a SHM object.
+
+The trona_posix client never knows which kind of backing it got — it just gets a mapping that pages itself.
+
+== munmap, mprotect, msync
+
+`posix_munmap`:
+
+. Sends `MM_MUNMAP` with `regs[0] = addr`, `regs[1] = length`.
+. mmsrv unmaps the region. If it was file-backed, mmsrv flushes any dirty pages back via the pager protocol before tearing down the mapping.
+. Replies `TRONA_OK` or an error.
+
+`posix_mprotect`:
+
+. Sends `MM_MPROTECT` with `regs[0] = addr`, `regs[1] = length`, `regs[2] = prot`.
+. mmsrv calls `VSPACE_PROTECT_RANGE` (or `VSPACE_PROTECT` for single-page changes) on every page in the range.
+. Replies with the result.
+
+`posix_msync`:
+
+. If the region is anonymous, returns `0` immediately without sending any IPC.
+. If the region is file-backed, sends `MM_SYNC_FILE_BACKING` with `regs[0] = addr`, `regs[1] = length`, `regs[2] = flags`.
+. mmsrv writes back any dirty pages in the range via `VFS_BACKEND_PAGER_WRITE`.
+
+The `MS_SYNC` / `MS_ASYNC` / `MS_INVALIDATE` flags from POSIX are passed through; mmsrv interprets them.
+SaltyOS does not currently distinguish sync vs async — every msync is treated as `MS_SYNC` because the writeback path is synchronous in the current implementation.
+
+== `MAP_FAILED`, return values
+
+The POSIX convention is that `mmap` returns `(void *) -1` on failure.
+trona_posix's Rust API returns `usize::MAX` for the same purpose, which basaltc casts to a void pointer at its boundary.
+
+The caller should check `result == usize::MAX` rather than `result < 0` because `usize` is unsigned.
+
+== What is not implemented
+
+A few POSIX mmap features are not currently supported:
+
+- **`MAP_HUGETLB`** — no large pages.
+- **`MAP_LOCKED`** — pages can be paged out by mmsrv even after `mlock`.
+- **`madvise`** — no equivalent in mmsrv yet; calls would be silently no-ops if exposed.
+- **`mremap`** — no in-place region resize. Use `munmap` + `mmap`.
+
+Most of these are not implemented because no port currently needs them, not because they would be hard to add.
+
+== Related pages
+
+* xref:../abi/protocol-labels.adoc#_memory_manager_mmsrv_rs[mmsrv Protocol Labels] — the full label catalog.
+* xref:../abi/invoke-labels.adoc[Invoke Labels] — the MemoryObject and VSpace operations mmsrv uses internally.
+* xref:basalt::runtime/heap-and-malloc.adoc[basalt: Heap and malloc] — the malloc implementation that calls `posix_sbrk`.

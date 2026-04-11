@@ -1,0 +1,266 @@
+= VA Layout and Capability Table
+:description: The substrate VA layout planner, CSpace layout planner, well-known capability getters, and the startup capability table that ties them together
+
+Three substrate modules solve the problem of "where does anything live in a new child process" — `layout.rs`, `caps.rs`, and `cap_table.rs`.
+Together they form the link between what the spawner (init or procmgr) knows at child-creation time and what the child itself can discover at runtime.
+
+[cols="1,1,3"]
+|===
+| Module | Lines | Role
+
+| `layout.rs`     | 456 | Computes the VA layout (IPC buffer, ELF code, stack, initrd, mmap region) and the CSpace layout (alloc / recv / expand slot ranges) for a new child.
+| `cap_table.rs`  | 312 | Builds and reads the `TronaCapTableV1` startup capability table that carries every well-known cap from the spawner to the child's `__trona_cap_*` weak symbols.
+| `caps.rs`       | 126 | Safe getters over the `__trona_cap_*` weak symbols.
+|===
+
+This page walks through them from the bottom up — starting with the well-known cap getters, then the cap table that populates them, then the layout planner.
+
+== `caps.rs` — reading well-known capabilities
+
+The simplest of the three modules is just a set of 14 one-line getters.
+Each reads a weak symbol that rtld writes during startup:
+
+[source,rust]
+----
+#[inline]
+pub fn procmgr_ep() -> Cap {
+    read(&raw const crate::__trona_cap_procmgr_ep)
+}
+----
+
+The `read` helper is a volatile pointer read.
+It uses raw pointers (not references) to avoid the Rust 2024 prohibition on `&`/`&mut` on `static mut`:
+
+[source,rust]
+----
+#[inline]
+fn read(p: *const u64) -> u64 {
+    unsafe { core::ptr::read_volatile(p) }
+}
+----
+
+The 14 getters are:
+
+[cols="1,2"]
+|===
+| Getter | Backing symbol / role
+
+| `procmgr_ep()`     | `__trona_cap_procmgr_ep`     / `ROLE_PROCMGR_CONTROL`
+| `vfs_ep()`         | `__trona_cap_vfs_ep`         / `ROLE_VFS_CLIENT`
+| `namesrv_ep()`     | `__trona_cap_namesrv_ep`     / `ROLE_NAMESRV_CLIENT`
+| `mmsrv_ep()`       | `__trona_cap_mmsrv_ep`       / `ROLE_MMSRV_CLIENT`
+| `rsrcsrv_ep()`     | `__trona_cap_rsrcsrv_ep`     / `ROLE_RSRCSRV_CLIENT`
+| `console_ep()`     | `__trona_cap_console_ep`     / `ROLE_CONSOLE_CLIENT`
+| `service_ep()`     | `__trona_cap_service_ep`     / `ROLE_SERVICE_EP`
+| `win32srv_ep()`    | `__trona_cap_win32srv_ep`    / `ROLE_WIN32SRV_CLIENT`
+| `signal_ntfn()`    | `__trona_cap_signal_ntfn`    / `ROLE_SIGNAL_NTFN`
+| `readiness_ntfn()` | `__trona_cap_readiness_ntfn` / `ROLE_READINESS_NTFN`
+| `initrd_untyped()` | `__trona_cap_initrd_untyped` / `ROLE_INITRD_UNTYPED`
+| `fb_untyped()`     | `__trona_cap_fb_untyped`     / `ROLE_FB_UNTYPED`
+| `pci_ioport()`     | `__trona_cap_pci_ioport`     / `ROLE_PCI_IOPORT`
+| `com1_ioport()`    | `__trona_cap_com1_ioport`    / `ROLE_COM1_IOPORT`
+|===
+
+Plus three other getters for per-thread or per-process context:
+
+- `sc_cap()` — the main thread's SchedContext cap, from `AT_TRONA_SC_CAP`.
+- `cspace_ntfn()` — the notification the slot allocator signals on exhaustion, from `AT_TRONA_CSPACE_NTFN`.
+- `next_frame_slot()` — the first CNode slot free for new frame allocations.
+
+Every getter returns `0` when the spawner did not provide that capability for this process.
+Callers must treat `0` as "not available" and either fall back or fail loudly — there is no panic path for missing caps in substrate itself.
+It is up to the consumer (e.g. trona_posix's DNS resolver, which needs `namesrv_ep` to find dnssrv) to decide how to react.
+
+== `cap_table.rs` — the role → slot contract
+
+The startup capability table is the single channel through which the spawner delivers every well-known cap to the child.
+It is defined in `uapi/types/core.rs` as:
+
+[source,rust]
+----
+#[repr(C)]
+pub struct TronaCapTableV1 {
+    pub magic: u32,        // = TRONA_CAP_TABLE_MAGIC = 0x43544153 "SATC"
+    pub version: u32,      // = TRONA_CAP_TABLE_VERSION = 1
+    pub entry_count: u32,
+    pub _reserved: u32,
+    pub entries: [TronaCapEntryV1; N],
+}
+
+#[repr(C)]
+pub struct TronaCapEntryV1 {
+    pub role_id: u32,      // ROLE_PROCMGR_CONTROL, ROLE_VFS_CLIENT, ...
+    pub flags: u32,        // CAP_TBL_FLAG_*
+    pub rights: u32,       // CAP_TBL_RIGHT_*
+    pub slot: u64,         // destination slot in the child's root CNode
+}
+----
+
+The spawner fills this struct into a frame that it maps into the child at a known address, then passes a pointer to that frame through `AT_TRONA_CAP_TABLE = 0x101C` in the child's auxv.
+
+On the child side, `cap_table.rs` exposes two paths:
+
+[source,rust]
+----
+pub unsafe fn runtime_install_from_auxv(auxv: *const u64) -> bool;
+----
+
+This is the function `substrate::lib.rs::runtime_set_auxv` calls after stashing the auxv pointer.
+It walks the auxv to find `AT_TRONA_CAP_TABLE`, validates the magic and version, iterates the entries, and for each `ROLE_*` entry writes the slot number into the matching `__trona_cap_*` weak symbol.
+
+The writeback path is a giant `match` over `role_id`:
+
+[source,rust]
+----
+match entry.role_id {
+    ROLE_PROCMGR_CONTROL  => __trona_cap_procmgr_ep = entry.slot,
+    ROLE_VFS_CLIENT       => __trona_cap_vfs_ep     = entry.slot,
+    ROLE_MMSRV_CLIENT     => __trona_cap_mmsrv_ep   = entry.slot,
+    // ... for every role listed above ...
+    _ => {}  // unknown roles are silently ignored
+}
+----
+
+Unknown role IDs are skipped rather than erroring, which lets the spawner include newer roles that older `libtrona.so` builds do not know about — the cap is still placed in the child's CNode, but the child does not see it via `caps::*`.
+
+This is how the "role-based cap delivery" system works in practice: the spawner never hard-codes slot numbers, the child never hard-codes slot numbers, and the two agree on a shared `ROLE_*` vocabulary defined in `uapi/consts/kernel.rs`.
+
+=== `cap_table.rs` for builders
+
+For the spawner side (init / procmgr), `cap_table.rs` also exposes a builder API:
+
+[source,rust]
+----
+pub struct CapTableBuilder { ... }
+
+impl CapTableBuilder {
+    pub fn new(frame_buf: *mut u8, cap_count: usize) -> Self;
+    pub fn add(&mut self, role_id: u32, slot: u64, flags: u32, rights: u32);
+    pub fn finalize(self) -> *const TronaCapTableV1;
+}
+----
+
+The builder writes the magic/version header, appends entries, and returns a pointer to the completed struct ready to be mapped into the child.
+
+The legacy per-tag `AT_TRONA_*_EP` / `_NTFN` / `_UNTYPED` / `_IOPORT` auxv tags that used to live at `0x1010..0x101B` have been removed from the code base.
+Every well-known cap flows through `AT_TRONA_CAP_TABLE` now, without exception.
+
+== `layout.rs` — VA and CSpace layout planning
+
+The `layout` module is the single source of truth for _where_ things land in a new child process.
+It is the spawner's planner: before procmgr retypes a child TCB, it asks `layout.rs` to compute the VA regions the child will use and the CSpace slot ranges it will get.
+
+=== VA layout
+
+The VA layout is expressed as a `VmLayoutPlan` — a struct of `VmRegion`s:
+
+[source,rust]
+----
+pub struct VmLayoutPlan {
+    pub ipc_buf: VmRegion,      // IPC buffer page (1 page)
+    pub elf_code: VmRegion,     // ELF code/data segments
+    pub rtld: VmRegion,         // Runtime dynamic linker (rtld)
+    pub shared_libs: VmRegion,  // Shared library cache region
+    pub stack: VmRegion,        // User stack
+    pub scratch: VmRegion,      // Scratch page for ELF loader page-copy operations
+    pub initrd: VmRegion,       // Initrd CPIO archive mapping window
+    pub stack_top: u64,         // Initial RSP (0 signals layout failure)
+}
+----
+
+`VmRegion` is a `{ base, size }` pair in bytes, page-aligned on both fields.
+
+The main computation entry point is:
+
+[source,rust]
+----
+pub fn compute_vm_layout(
+    elf_load_span: u64,
+    rtld_load_span: u64,
+    initrd_size: u64,
+    shared_libs_span: u64,
+    ipc_buf_base: u64,
+) -> VmLayoutPlan;
+----
+
+The computation runs from fixed low VA anchors upward, packing regions sequentially with page-boundary alignment.
+Key constants:
+
+[cols="1,2"]
+|===
+| Constant | Value
+
+| `IPC_BUF_BASE`       | `0x0000_0000_0020_0000` — the IPC buffer lives here unconditionally.
+| `CHILD_STACK_PAGES`  | `32` — 32 × 4 KiB = 128 KiB per thread, which is the stack budget for SaltyOS userspace.
+| `CHILD_FRAME_SLOT_BASE` | `64` — the first CNode slot available for frame allocations in the child.
+| `AUTHORITY_RECV_SLOT_COUNT` | `1024` — reserved at the top of the child's CNode for pager/authority incoming caps.
+|===
+
+A `stack_top = 0` in the returned plan signals that layout failed because the code regions overflowed every available VA window.
+Callers must check for this before proceeding.
+
+=== Randomized variant
+
+For address-space layout randomization, `compute_vm_layout_randomized()` is a drop-in replacement that uses `SYS_GETRANDOM` to pick a random base offset for the mmap region (and, optionally, the stack).
+The caller does not need to change any other code — every consumer of `VmLayoutPlan` treats the fields as opaque, so randomizing them is transparent.
+
+=== CSpace layout
+
+The CSpace side has its own planner:
+
+[source,rust]
+----
+pub enum CspaceLayoutProfile {
+    DefaultService,
+    Pager,
+    BootstrapAuthority,
+}
+
+pub fn compute_cspace_layout(
+    cnode_bits: u64,
+    frame_slot_floor: u64,
+    profile: CspaceLayoutProfile,
+    has_expand_window: bool,
+) -> TronaCspaceLayoutV1;
+----
+
+The profile argument controls how the slot ranges are carved:
+
+- **`DefaultService`** — standard service layout. Most of the CNode is allocation space; a modest receive window; no expansion reserve.
+- **`Pager`** — pagers need a larger receive window because they continuously receive untyped caps from mmsrv. The top 1,024 slots are reserved for incoming caps from authority.
+- **`BootstrapAuthority`** — init and procmgr themselves. Similar to `Pager` but also reserves the expansion range so they can grow their own CNode if they ever run out.
+
+The returned `TronaCspaceLayoutV1` struct is exactly what the spawner writes into the child's auxv under `AT_TRONA_CSPACE_LAYOUT = 0x1005`, so the child's slot allocator can read it back from `runtime_resolve_cspace_layout_from_auxv()` in `substrate/lib.rs`.
+
+=== The layout contract
+
+The invariants every `VmLayoutPlan` must satisfy:
+
+. **Page-aligned.** Every `base` and `size` is a multiple of 4,096.
+. **Non-overlapping.** No two regions overlap.
+. **Ascending.** Regions are laid out in ascending VA order: `ipc_buf < elf_code < rtld < shared_libs < stack < initrd < mmap pool`.
+. **Stack grows down.** `stack_top` is at the upper end of the stack region; the initial `%rsp` is set to `stack_top`.
+. **Scratch is inside the allocator's reach.** The scratch page must be mappable by the ELF loader without needing its own allocation path — it lives at a fixed offset just below the initrd window.
+
+The layout invariant checker (not exported) is run in debug builds over every plan returned by `compute_vm_layout` so that a bug in the planner surfaces as a panic in the spawner rather than a corrupted child address space.
+
+== Putting it all together — the spawn sequence
+
+A procmgr spawn of a new child runs through all three modules in this order:
+
+. **Spawner computes the CSpace layout** via `compute_cspace_layout(profile=DefaultService, cnode_bits=CNB, ...)`.
+. **Spawner computes the VA layout** via `compute_vm_layout(elf_span, rtld_span, initrd_size, ...)`.
+. **Spawner creates the child's VSpace and CSpace** through `untyped_retype` and populates it.
+. **Spawner builds the cap table** with `CapTableBuilder::new()` + `.add(ROLE_PROCMGR_CONTROL, ...)` + ... for every role the child needs.
+. **Spawner writes the auxv vector** with `AT_TRONA_CSPACE_LAYOUT` pointing at the layout struct and `AT_TRONA_CAP_TABLE` pointing at the cap table frame.
+. **Spawner starts the child.** rtld receives control, calls `runtime_set_auxv`, which in turn calls `cap_table::runtime_install_from_auxv`, which writes every `__trona_cap_*` weak symbol.
+. **The child begins normal execution.** Every subsequent call to `caps::vfs_ep()` / `caps::mmsrv_ep()` / etc. reads the slot number the spawner planted.
+
+The whole dance is invisible to user code: a child program that calls `posix_open(path)` eventually bottoms out in `trona_posix::file::posix_open → ipc::call_ctx(caps::vfs_ep(), ...)`, and `caps::vfs_ep()` returns whatever the spawner put in the cap table during step 4.
+
+== Related pages
+
+* xref:index.adoc[substrate Overview] — the list of `__trona_cap_*` weak symbols this module populates.
+* xref:substrate/slot-allocator.adoc[Slot Allocator] — the `[alloc_base, alloc_limit)` range from `TronaCspaceLayoutV1` is what seeds the slot allocator's initial segment.
+* xref:../abi/syscall-abi.adoc[Syscall ABI] — the `AT_TRONA_*` auxv tag definitions.
+* xref:../rtld/elf-rtld.adoc[ELF Dynamic Linker] — the component that actually walks the auxv and calls `runtime_set_auxv`.
