@@ -17,7 +17,7 @@ The TCB contains all per-thread kernel state:
 | `state` | `ThreadState` | Current execution state.
 | `priority` | `u64` | Effective deadline (may be boosted by PIP).
 | `base_priority` | `u64` | Original deadline (unaffected by inheritance).
-| `pip_donating_to` | `*mut Tcb` | TCB this thread is donating priority to.
+| `pip_donating_to` | `*mut Tcb` | TCB this thread is donating priority to. Refcount-managed via `set_pip_target` / `clear_pip_target` helpers — the raw pointer is never assigned directly.
 | `vspace_root` | `*mut VSpace` | Page table root for this thread.
 | `cspace_root` | `*mut CNode` | CSpace root CNode.
 | `ipc_buffer` | `u64` | Virtual address of the thread's IPC buffer page.
@@ -27,7 +27,7 @@ The TCB contains all per-thread kernel state:
 | `fault_endpoint` | `u64` | Capability address of fault endpoint.
 | `bound_notification` | `*mut Notification` | Bound notification for combined IPC wait.
 | `notification_dispatcher` | `u64` | Userspace dispatcher for notification delivery during Call.
-| `reply_tcb` | `*mut Tcb` | Saved reply target (for server-side reply capability).
+| `reply_tcb` | `*mut Tcb` | Saved reply target (for server-side reply capability). Refcount-managed via `set_reply_tcb` / `clear_reply_tcb` + `release_tcb_ref` helpers — the raw pointer is never assigned directly.
 | `blocked_reason` | `Option<BlockedReason>` | Why the thread is blocked.
 | `blocked_endpoint` | `*mut u8` | Endpoint the thread is blocked on.
 | `fpu_state` | `XSaveArea` | Saved FPU/SIMD register state.
@@ -119,16 +119,17 @@ When a high-priority thread blocks on a resource held by a lower-priority thread
 === Mechanism
 
 . Thread A (high deadline) sends to an endpoint where thread B (low deadline) is the expected receiver but is not yet waiting.
-. Thread A blocks.  The kernel records `A.pip_donating_to = B`.
+. Thread A blocks.  The kernel records `A.pip_donating_to = B` (via `set_pip_target`, which increments B's TCB refcount).
 . Thread B's effective priority (`priority` field) is set to A's deadline.
-. When B completes the operation and A is unblocked, B's priority reverts to `base_priority`.
+. When B completes the operation and A is unblocked, B's priority reverts to `base_priority`, and B is re-sorted in the ready queue (`resort_ready_thread`) so the scheduler sees the restored priority immediately. On SMP, the holder's `tcb_lock` is acquired during reversion to prevent concurrent priority races.
 
 === Properties
 
 * Donation is transitive: if B is itself blocked on C, the donation propagates.
 * Only one donation per thread is tracked at a time.
-* Reversion is automatic when the blocking reason is resolved.
+* Reversion is automatic when the blocking reason is resolved, and includes a ready-queue re-sort so the scheduler sees the restored priority without waiting for the next tick.
 * PIP applies to the thread's TCB `priority` field, not the SchedContext directly.
+* Both `pip_donating_to` and `reply_tcb` are refcount-managed: setting either field increments the target TCB's refcount, and clearing it decrements. This prevents use-after-free if the target TCB is destroyed while the pointer is still live.
 
 == FPU/SIMD State
 
