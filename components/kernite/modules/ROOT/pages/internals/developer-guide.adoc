@@ -12,12 +12,12 @@ The next available number follows the last entry in the `Syscall` enum.
 === Files to Modify
 
 . **`kernite/src/syscall/mod.rs`**
-.. Add a variant to the `Syscall` enum (e.g., `MyNewCall = 28`).
+.. Add a variant to the `Syscall` enum (e.g., `MyNewCall = 31` — the first unused slot after `SysMemInfo = 30`).
 .. Add the variant to the `TryFrom<u64>` implementation.
 .. Add a dispatch arm in `syscall_handle_rust()` that handles the new number.
 
 . **`lib/trona/uapi/consts/kernel.rs`**
-.. Add a matching constant (e.g., `pub const SYS_MY_NEW_CALL: u64 = 28;`).
+.. Add a matching constant (e.g., `pub const SYS_MY_NEW_CALL: u64 = 31;`).
 
 . **`lib/trona/substrate/syscall.rs`**
 .. Add a raw inline-assembly syscall wrapper function that userspace calls.
@@ -66,14 +66,14 @@ Each group has a reserved range (e.g., CNode `0x10-0x18`, TCB `0x40-0x4F`).
 | Object Type | Range
 
 | CNode | `0x10-0x18`
-| Untyped | `0x20`
+| Untyped | `0x20-0x21`
 | SchedContext | `0x30-0x31`
-| TCB | `0x40-0x4F`
-| VSpace | `0x50-0x5F`
+| TCB | `0x40-0x4F` (+ `0x80` for introspection extensions outside the saturated block)
+| VSpace | `0x50-0x5F` (+ `0x81-0x82` for accounting extensions)
 | IRQ | `0x60-0x64`
 | IoPort | `0x70-0x77`
-| MemoryObject | `0x90-0x97`
-| VSpace MO mapping | `0x97-0x9A`
+| MemoryObject | `0x90-0x99`
+| VSpace MO mapping | `0x97`, `0x99`, `0x9A` (label shared with MO namespace — dispatched by capability object type)
 |===
 
 == Adding a New Kernel Object Type

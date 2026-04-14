@@ -113,13 +113,38 @@ Map a range of MO pages into the VSpace at a specified virtual address:
 .. If uncommitted: install a PTE with `PRESENT=0`, `DEMAND=1` (demand marker for lazy commit on first access).
 . If the range is ≥ `RANGE_TLB_GLOBAL_THRESHOLD` (8 pages), use a full TLB flush instead of per-page invalidation.
 
-=== VSPACE_UNMAP_MO (invoke label 0x98)
+=== VSPACE_UNMAP (invoke label 0x51) for MO-backed ranges
+
+MO-backed ranges are torn down with the generic `VSPACE_UNMAP` invocation — there is no dedicated `VSPACE_UNMAP_MO` label.
 
 . Look up the VmArea in the Maple tree by virtual address.
 . Clear the corresponding PTEs.
 . Remove the `ReverseMapEntry` from the MO.
 . Remove the VmArea from the Maple tree.
 . Issue TLB invalidation (per-page or full flush based on page count).
+
+=== VSPACE_MAP_DEMAND / VSPACE_MAP_DEMAND_RANGE (invoke labels 0x59 / 0x5A)
+
+Install demand PTEs (`PRESENT = 0`, `DEMAND = 1`) for a single page or a contiguous range, while still registering the VmArea / reverse map metadata.  The range variant also carries a `VSPACE_FLAG_REGION_KIND` byte so that `VSPACE_GET_MEM_STATS` can classify the range as `VmStk` / `VmExe` / `VmLib` / `VmData` without an extra map-time round trip.
+
+The first touch of a demand PTE raises a page fault which is resolved by `handle_demand_fault()` (see xref:memory/page-faults.adoc[Page Fault Handling]) — either zero-filling an anonymous frame or committing the backing MO at the faulted page index.
+
+Per-VSpace counter `vm_demand_pages: AtomicU64` tracks live demand pages; `VSPACE_GET_MEM_STATS` surfaces the value as `VmDemand`.
+
+=== mmsrv-Coordinated Fault Servicing
+
+For policies that live outside the kernel fast path (user-mode pagers, hot COW frame pools) the VSpace capability exposes a cluster of invocations used by `mmsrv`:
+
+[cols="1,2,3"]
+|===
+| Label | Name | Purpose
+
+| `0x5B` | `VSPACE_COW_RESOLVE` | Inject a freshly-allocated frame into a faulting COW PTE on behalf of a user-mode pager.
+| `0x5C` | `VSPACE_SET_COW_POOL` | Register a MemoryObject whose committed frames serve as the COW fast-path pool.
+| `0x5D` | `VSPACE_SET_COW_NOTIF` | Bind a notification raised when the COW pool drops below its refill watermark.
+| `0x5E` | `VSPACE_REPLENISH_COW_POOL` | Re-link frames that the pager returned to the pool.
+| `0x5F` | `VSPACE_PROTECT_RANGE` | Bulk version of `VSPACE_PROTECT` for trimming dirty / non-writable ranges.
+|===
 
 === VSPACE_SHARE_RO_PAGE (invoke label 0x99)
 
@@ -237,6 +262,29 @@ Each VSpace is assigned an Address Space Identifier (ASID) to avoid full TLB flu
 * Generation tracking: if the global ASID generation has advanced past the VSpace's `asid_generation`, the ASID is stale and must be re-allocated.
 
 On x86_64, ASID is not used — CR3 writes implicitly flush the TLB (PCID support is not yet implemented).
+
+== Memory Statistics
+
+Two VSpace capability invocations expose per-address-space accounting for procfs-style tooling:
+
+[cols="1,2,3"]
+|===
+| Label | Name | Purpose
+
+| `0x81` | `VSPACE_GET_MEM_STATS` | Write a `TronaVSpaceMemStats` snapshot into a user buffer: `VmSize`, `VmRSS`, `VmLck`, `VmPTE`, `VmDemand`, plus per-region totals `VmStk` / `VmExe` / `VmLib` / `VmData`.
+| `0x82` | `VSPACE_GET_RANGE_STATS` | Write a `TronaVSpaceRangeStats` summary for the range `[start_vaddr, start_vaddr + page_count × 4 KiB)` — committed / demand / COW page counts and a composite permission / region-kind byte.
+|===
+
+The kernel maintains the counters directly on the `VSpaceTracking`:
+
+* `VmSize` tracks every page covered by a VmArea (committed or demand).
+* `VmRSS` counts only committed pages (those that hold a frame reference).
+* `VmLck` reflects pages pinned through MO flags (`MO_PAGE_FLAG_PINNED`).
+* `VmPTE` counts kernel-private page table pages allocated for this VSpace.
+* `VmDemand` is the live `vm_demand_pages` counter updated by the demand map / fault paths.
+* The region-kind totals are populated from the `region_kind` byte recorded at map time (`VSPACE_FLAG_REGION_KIND_*`).
+
+Because the counters are atomic, callers get a consistent snapshot without taking the VSpace lock.
 
 == Related Pages
 

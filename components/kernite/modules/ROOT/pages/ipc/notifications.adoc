@@ -60,7 +60,7 @@ No blocking occurs regardless of the result.
 [[bound-notifications]]
 == Bound Notifications
 
-A notification can be _bound_ to a TCB via `TCB_BIND_NOTIFICATION` (invoke label `0x46`).
+A notification can be _bound_ to a TCB via `TCB_BIND_NOTIFICATION` (invoke label `0x49`).
 This creates a bidirectional link: `notification.bound_tcb <-> tcb.bound_notification`.
 
 When a signal arrives on a bound notification and the bound TCB is blocked on an endpoint `Recv`, the kernel wakes the thread and sets `woken_by_notification = true`.

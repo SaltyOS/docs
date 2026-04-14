@@ -13,7 +13,7 @@ All other cases take the slowpath, which supports the full IPC feature set.
 [cols="1h,3"]
 |===
 | Fastpath | Call, ReplyRecv, ReplyRecvAny
-| Slowpath | All 28 syscalls including Send, Recv, NBSend, timed variants, multi-endpoint variants, and any Call/ReplyRecv that fails fastpath eligibility
+| Slowpath | All 31 syscalls including Send, Recv, NBSend, timed variants, multi-endpoint variants, and any Call/ReplyRecv that fails fastpath eligibility
 |===
 
 == Eligibility Conditions

@@ -6,7 +6,7 @@ By the end, you will have modified the kernel, the userland library, and verifie
 
 == What We Will Build
 
-A new syscall `SYS_DEBUG_FREE_FRAMES` (number 28) that returns the current count of free physical frames.
+A new syscall `SYS_DEBUG_FREE_FRAMES` (number 31, the next unused slot in the `Syscall` enum) that returns the current count of free physical frames.
 This is a read-only, side-effect-free operation -- safe to add and easy to verify.
 
 == Step 1: Add the Syscall to the Kernel
@@ -21,7 +21,10 @@ Add a new variant at the end:
 pub enum Syscall {
     // ... existing variants ...
     NotifReturn = 27,
-    DebugFreeFrames = 28,  // ← add this
+    ThreadExit = 28,
+    SysInfo = 29,
+    SysMemInfo = 30,
+    DebugFreeFrames = 31,  // ← add this
 }
 ----
 
@@ -32,7 +35,7 @@ Add the new mapping:
 
 [source,rust]
 ----
-28 => Ok(Syscall::DebugFreeFrames),
+31 => Ok(Syscall::DebugFreeFrames),
 ----
 
 === 1c. Add the dispatch handler
@@ -55,7 +58,7 @@ Open `lib/trona/uapi/consts/kernel.rs` and add:
 
 [source,rust]
 ----
-pub const SYS_DEBUG_FREE_FRAMES: u64 = 28;
+pub const SYS_DEBUG_FREE_FRAMES: u64 = 31;
 ----
 
 == Step 3: Add the Userland Wrapper

@@ -11,7 +11,7 @@ This page documents the aarch64 architecture backend in `kernite/src/arch/aarch6
 
 | `mod.rs` | Backend entry point, IRQ save/restore (DAIF manipulation), `halt()` (WFI), I/O port emulation stubs.
 | `boot.rs` | BSP bootstrap: GICv3, PSCI, generic timer, paging initialization.
-| `ap_boot.rs` | AP startup via PSCI `CPU_ON` + mailbox handoff structure.
+| `ap_boot.rs` | AP startup via PSCI `CPU_ON`.  The logical CPU index rides along as PSCI's `context ID`, delivered to the AP in `x0` at the entry point.
 | `gic.rs` | GICv3 interrupt controller: distributor (GICD), redistributor (GICR), CPU interface (ICC system registers).
 | `psci.rs` | Power State Coordination Interface — `CPU_ON`, `CPU_OFF`, `SYSTEM_OFF`, `SYSTEM_RESET` via HVC.
 | `timer.rs` | Generic timer: EL1 physical timer (CNTP), PPI 30, 10 ms tick interval.
@@ -19,7 +19,7 @@ This page documents the aarch64 architecture backend in `kernite/src/arch/aarch6
 | `context.rs` | Context switch: save/restore `x0`-`x30`, `sp_el0`, `elr_el1`, `spsr_el1`.
 | `cpu.rs` | Per-CPU data via `TPIDR_EL1`, CPU ID from `MPIDR_EL1`, kernel stack management.
 | `exceptions.rs` | Exception vector table: sync/IRQ/FIQ/SError handlers at EL1 and from EL0.
-| `fpu.rs` | NEON/FP lazy context switch via `CPACR_EL1` trapping, Q0-Q31 save/restore.
+| `fpu.rs` | NEON/FP eager context switch — Q0-Q31 + FPCR + FPSR saved/restored on every TCB switch, `CPACR_EL1.FPEN` held at `0b11`.
 | `pl011.rs` | PL011 UART driver for early serial console output.
 |===
 
@@ -175,9 +175,10 @@ Followed by `DSB ISH` + `ISB` barriers.
 
 === AP Startup
 
-. BSP discovers CPU topology from the device tree or ACPI MADT.
-. For each AP: call `PSCI CPU_ON` via HVC with the AP's MPIDR, entry point address, and a mailbox pointer.
-. The AP boots at EL2, drops to EL1, reads its stack pointer and per-CPU data from the mailbox.
+. BSP discovers CPU topology from the device tree or ACPI MADT and assigns each AP a logical CPU index.
+. For each AP: call `PSCI CPU_ON` via HVC with the AP's MPIDR, the shared `ap_entry` entry-point address, and the logical CPU index passed as PSCI's `context ID` argument.
+. PSCI delivers the `context ID` to the AP in `x0` at the entry point, so the AP identifies itself without polling an external mailbox.
+. The AP boots at EL2, drops to EL1, loads its per-CPU data (including the kernel stack pointer) indexed by the received logical CPU number.
 . AP initializes: GIC redistributor, per-CPU timer, `TPIDR_EL1`, exception vectors.
 . AP enters the idle loop.
 
@@ -198,13 +199,11 @@ SGIs are sent via `ICC_SGI1_EL1` system register, targeting specific CPUs by aff
 
 == FPU / NEON
 
-Lazy context switching via `CPACR_EL1`:
+Eager context switching:
 
-. On context switch, clear `CPACR_EL1.FPEN` (bits 21:20 = `0b00`), trapping all FPU/NEON access.
-. First NEON instruction triggers a synchronous exception (ESR_EL1 class = access flag fault on CPACR).
-. Handler saves previous thread's Q0-Q31 + FPCR + FPSR (528 bytes, 16-byte aligned).
-. Handler restores current thread's FPU state.
-. Handler sets `CPACR_EL1.FPEN = 0b11` to allow subsequent NEON instructions.
+. At boot (BSP and each AP), `CPACR_EL1.FPEN` is programmed to `0b11`, permanently disabling FPU/NEON traps from EL0 and EL1.
+. On every TCB switch, `fpu::switch()` calls `aarch64_fpsimd_save_state` on the outgoing TCB and `aarch64_fpsimd_restore_state` on the incoming TCB unconditionally — there is no trap-and-demand-load path.
+. `flush_current()` / `reload_current()` keep the live register file in sync after `TCB_COPY_FPU` or similar kernel-side mutations.
 
 Save area: `XSaveArea` — 528 bytes: 32 × Q registers (512 bytes) + FPCR (4) + FPSR (4) + padding.
 

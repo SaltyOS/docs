@@ -23,7 +23,7 @@ NOTE: All invoke label values in this page are verified against `lib/trona/uapi/
 | `0x18` | `CNODE_GET_INFO` | Return type, rights, badge, depth, and child count for a capability.
 |===
 
-== Untyped Operations (0x20)
+== Untyped Operations (0x20-0x21)
 
 [cols="1,2,4"]
 |===
@@ -31,6 +31,9 @@ NOTE: All invoke label values in this page are verified against `lib/trona/uapi/
 
 | `0x20` | `UNTYPED_RETYPE`
 | Carve typed kernel objects from untyped memory.  Arguments: object type, size_bits, destination CNode, destination offset, count.
+
+| `0x21` | `UNTYPED_RESET`
+| Reset the untyped watermark back to zero once every child capability has been revoked.  Fails while the untyped-child list is non-empty.
 |===
 
 Retype constraints:
@@ -63,6 +66,7 @@ Retype constraints:
 | `0x46` | `TCB_WRITE_REGISTERS` | Write saved register state (instruction pointer, stack pointer, arguments).
 | `0x48` | `TCB_SET_IPC_BUFFER` | Set IPC buffer virtual address.
 | `0x49` | `TCB_BIND_NOTIFICATION` | Bind a notification for combined endpoint+notification wait.
+| `0x4A` | `TCB_UNBIND_NOTIFICATION` | Break the TCB↔Notification link previously established by `TCB_BIND_NOTIFICATION`.
 | `0x4B` | `TCB_SET_FAULT_HANDLER` | Set fault handler endpoint.
 | `0x4C` | `TCB_COPY_FPU` | Copy FPU/SIMD state from another TCB.
 | `0x4D` | `TCB_SET_TLS_BASE` | Set TLS base register (`FS` on x86_64, `TPIDR_EL0` on aarch64).
@@ -70,7 +74,18 @@ Retype constraints:
 | `0x4F` | `TCB_GET_SPACE_INFO` | Return VSpace, CSpace, and IPC buffer configuration.
 |===
 
-NOTE: Labels 0x44, 0x45, 0x47, 0x4A are not assigned.  The numbering is sparse.
+NOTE: Labels 0x44, 0x45, 0x47 are not assigned — the numbering is sparse to leave room for future TCB operations.
+
+=== TCB Introspection Extensions
+
+The primary TCB block at 0x40-0x4F is saturated, so accounting / introspection extensions live at higher numbers while staying in the TCB namespace (capability type `ObjectType::Tcb`).
+
+[cols="1,2,4"]
+|===
+| Label | Name | Description
+
+| `0x80` | `TCB_GET_CPU_TIMES` | Sample the target thread's cumulative user and kernel ticks (`TronaResult.value` = user ticks, scratch MRs = kernel ticks / tick frequency).  Used by procfs-style accounting.
+|===
 
 == VSpace Operations (0x50-0x5F)
 
@@ -96,19 +111,32 @@ NOTE: Labels 0x44, 0x45, 0x47, 0x4A are not assigned.  The numbering is sparse.
 | `0x5F` | `VSPACE_PROTECT_RANGE` | Change permissions on a range of pages.
 |===
 
-== VSpace MemoryObject Mapping (0x97-0x9A)
+=== VSpace Accounting Extensions
+
+Assigned outside the 0x50-0x5F block because that block is saturated.  The capability type is still `ObjectType::VSpace`.
+
+[cols="1,2,4"]
+|===
+| Label | Name | Description
+
+| `0x81` | `VSPACE_GET_MEM_STATS` | Write a `TronaVSpaceMemStats` snapshot (`VmSize`, `VmRSS`, `VmLck`, `VmPTE`, `VmDemand`, `VmStk`/`VmExe`/`VmLib`/`VmData`) into a caller buffer.
+| `0x82` | `VSPACE_GET_RANGE_STATS` | Write a `TronaVSpaceRangeStats` summary for `[start_vaddr, start_vaddr + page_count × 4 KiB)` into a caller buffer.
+|===
+
+== VSpace MemoryObject Mapping (0x97, 0x99-0x9A)
 
 [cols="1,2,4"]
 |===
 | Label | Name | Description
 
 | `0x97` | `VSPACE_MAP_MO` | Map a MemoryObject page range into a VSpace.  Adds reverse map entry on the MO.
-| `0x98` | `VSPACE_UNMAP_MO` | Unmap a MemoryObject range.  Removes reverse map entry.
 | `0x99` | `VSPACE_SHARE_RO_PAGE` | Share a single read-only page between MemoryObjects.
 | `0x9A` | `VSPACE_FORK_RANGE` | Bulk COW fork: clone MO ranges and remap for fork.
 |===
 
-NOTE: Label `0x97` is shared between `MO_HAS_PAGE` (MemoryObject context) and `VSPACE_MAP_MO` (VSpace context).  The kernel dispatches based on the invoked capability's object type.
+MO-backed ranges are torn down with the plain `VSPACE_UNMAP` / `VSPACE_PROTECT_RANGE` invocations — there is no dedicated `VSPACE_UNMAP_MO` label.
+
+NOTE: Label `0x97` is shared between `MO_HAS_PAGE` (MemoryObject context) and `VSPACE_MAP_MO` (VSpace context).  Label `0x99` is similarly shared between `MO_UPDATE_PAGE_FLAGS` (MO context) and `VSPACE_SHARE_RO_PAGE` (VSpace context).  In both cases the kernel dispatches based on the invoked capability's object type.
 
 == IRQ Operations (0x60-0x64)
 
@@ -141,7 +169,7 @@ NOTE: Label `0x97` is shared between `MO_HAS_PAGE` (MemoryObject context) and `V
 
 NOTE: On aarch64, I/O port operations are emulated via MMIO-mapped PCI I/O windows.
 
-== MemoryObject Operations (0x90-0x97)
+== MemoryObject Operations (0x90-0x99)
 
 [cols="1,2,4"]
 |===
@@ -155,6 +183,8 @@ NOTE: On aarch64, I/O port operations are emulated via MMIO-mapped PCI I/O windo
 | `0x95` | `MO_READ` | Read data from MO pages (kernel-mediated read).
 | `0x96` | `MO_WRITE` | Write data to MO pages (kernel-mediated write).
 | `0x97` | `MO_HAS_PAGE` | Check whether a page is committed at a given index.
+| `0x98` | `MO_GET_MAP_COUNT` | Return how many live VSpace mappings reference a given page of this MO.
+| `0x99` | `MO_UPDATE_PAGE_FLAGS` | Atomically set / clear `FrameMeta.flags` bits (`DIRTY`, `REFERENCED`, `PINNED`, `WRITEBACK`, `ACTIVE`) for a committed page and return the previous value.
 |===
 
 == Related Pages

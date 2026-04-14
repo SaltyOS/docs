@@ -85,7 +85,7 @@ A server that handles both client RPCs and asynchronous events (IRQs, timers) in
 
 * xref:../ipc/endpoints.adoc[Endpoint] — for client requests.
 * xref:../ipc/notifications.adoc#bound-notifications[Bound notification] — for async events.
-* `TCB_BIND_NOTIFICATION` (invoke label `0x46`) — binds notification to the server's TCB.
+* `TCB_BIND_NOTIFICATION` (invoke label `0x49`) — binds notification to the server's TCB.
 
 === Server Loop
 

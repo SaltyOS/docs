@@ -41,7 +41,7 @@ At this point, the thread is running kernel code but still using the user stack.
 
 The kernel's assembly entry point does:
 
-. *Switch stacks*: load the per-thread kernel stack pointer from the TCB.  The user stack pointer is saved on the kernel stack (not in a per-CPU global, to prevent corruption during context switches).
+. *Switch stacks*: `swapgs` to the kernel `GS` base, stash the caller's user RSP in `PerCpuData.saved_rsp` (`%gs:16`), then load the current thread's kernel stack pointer from `PerCpuData.kernel_stack` (`%gs:8`) into `RSP`.
 . *Check syscall number*: is it 2 (Call) or 3 (ReplyRecv)?
 .. *Yes*: jump to the xref:../ipc/fastpath.adoc[fastpath].
 .. *No*: save all user registers and call `syscall_handle_rust()`.

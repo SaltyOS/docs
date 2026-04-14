@@ -70,16 +70,25 @@ The linker script (`kernite/arch/x86_64.ld` or `kernite/arch/aarch64.ld`) define
 Each thread has a dedicated kernel stack allocated from the PMM (`FrameOwner::KernelPrivate { KernelStack }`).
 Kernel stacks are used for syscall entry: the `syscall` instruction (x86_64) or `svc #0` (aarch64) switches to the per-thread kernel stack.
 
-On x86_64, the kernel stack pointer is stored in the TCB's `kernel_stack` field and loaded into the TSS RSP0 on context switch.
-User RSP is saved on the per-thread kernel stack (not per-CPU `%gs:16`) to prevent corruption when another thread's syscall overwrites the per-CPU slot.
+On x86_64, the kernel stack pointer is stored in the TCB's `kernel_stack` field and both loaded into the TSS `RSP0` on context switch _and_ mirrored into `PerCpuData.kernel_stack` so the syscall stub can pick it up via `%gs:8` without touching the TCB.
+User RSP is saved into `PerCpuData.saved_rsp` (`%gs:16`) during the syscall entry / exit window; it is a per-CPU transient slot, not a per-thread save area.
 
 === Per-CPU Data
 
-On x86_64, per-CPU data is accessed through `%gs`-relative addressing:
+On x86_64, per-CPU data is accessed through `%gs`-relative addressing into the `PerCpuData` block (see xref:../arch/x86_64.adoc#_syscall_entry[arch/x86_64.adoc: PerCpuData Layout]):
 
-* `%gs:0` — pointer to the per-CPU data structure itself.
-* `%gs:8` — current CPU ID.
-* `%gs:16` — saved RSP (used transiently during syscall entry, not for long-term storage).
+[cols="1,1,2"]
+|===
+| Offset | Field | Purpose
+
+| `%gs:0` | `cpu_id: u32` | Logical CPU index (BSP = 0).  32-bit load only — do not widen to 64 bits.
+| `%gs:8` | `kernel_stack: u64` | Top-of-stack pointer loaded on syscall entry.
+| `%gs:16` | `saved_rsp: u64` | User RSP saved by the syscall stub between `swapgs` pairs.
+| `%gs:24` | `invoke_seq: u64` | Diagnostic invoke counter.
+| `%gs:32` | `stack_canary: u64` | Per-CPU syscall stack canary.
+|===
+
+Any change to `PerCpuData` must keep these offsets in sync with `kernite/src/arch/x86_64/syscall.S`.
 
 On aarch64, per-CPU data is accessed through `TPIDR_EL1` (kernel thread-local pointer).
 

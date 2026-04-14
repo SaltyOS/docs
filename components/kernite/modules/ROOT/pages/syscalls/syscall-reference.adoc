@@ -13,7 +13,7 @@ Syscall instruction: `syscall`.
 |===
 | Register | Direction | Content
 
-| `rax` | in | Syscall number (0-27).
+| `rax` | in | Syscall number (0-30).
 | `rdi` | in | Argument 1 (capability address or operand).
 | `rsi` | in | Argument 2 (message info or operand).
 | `rdx` | in/out | Argument 3 / return value 2.
@@ -24,7 +24,8 @@ Syscall instruction: `syscall`.
 | `rdx` | out | Return value (badge, bits, result).
 |===
 
-Entry point: `syscall.S` saves user RSP on the per-thread kernel stack (not per-CPU `%gs:16`) to prevent corruption during context switches.
+Entry point: `syscall.S` swaps to the kernel `GS` base and stashes the caller's user RSP in `PerCpuData.saved_rsp` (accessed as `%gs:16`).
+After executing the fastpath attempt or dispatching to `syscall_handle_rust()`, the stub restores the user RSP from the same per-CPU slot before `sysretq`.
 The assembly stub checks the syscall number and dispatches Call (2) and ReplyRecv (3) to the xref:../ipc/fastpath.adoc[IPC fastpath] before falling through to `syscall_handle_rust()`.
 
 === aarch64
@@ -75,6 +76,9 @@ Syscall instruction: `svc #0`.
 | 25 | `RecvAnyTimed` | RecvAny with timeout.
 | 26 | `ReplyRecvAnyTimed` | ReplyRecvAny with timeout.
 | 27 | `NotifReturn` | Return from notification dispatcher.
+| 28 | `ThreadExit` | Terminate the calling thread and release its kernel-owned state.
+| 29 | `SysInfo` | Read kernel-wide static info (uptime, online CPU count, tick frequency, version).
+| 30 | `SysMemInfo` | Sample global memory accounting (total / free / used frame counts and allocator watermarks).
 |===
 
 == Message Info Encoding
@@ -116,8 +120,8 @@ case (5-7)
   :Notification ops\n(Signal/Wait/Poll);
 case (9)
   :Capability invocation\n(dispatch by label);
-case (8,10-27)
-  :Utility syscalls\n(Yield, Debug, Clock,\nSleep, Futex, etc.);
+case (8,10-30)
+  :Utility syscalls\n(Yield, Debug, Clock,\nSleep, Futex, ThreadExit,\nSysInfo, SysMemInfo, etc.);
 endswitch
 :Write result to\nuser registers;
 :Return to userspace;
@@ -133,20 +137,28 @@ stop
 |===
 | Value | Name | Meaning
 
-| 0 | `Ok` | Success.
+| 0 | `None` | Success.
 | 1 | `InvalidCapability` | Capability address does not resolve to a valid capability.
-| 2 | `InvalidArgument` | Argument value out of range or semantically invalid.
+| 2 | `InvalidOperation` | Operation not supported for this object type, or the object is in an incompatible state.
 | 3 | `InsufficientRights` | Capability lacks the required right for the operation.
-| 4 | `NotEnoughMemory` | Untyped memory exhausted or no free frames.
-| 5 | `InvalidOperation` | Operation not supported for this object type.
-| 6 | `SlotOccupied` | Destination CNode slot is not empty.
-| 7 | `RangeError` | Retype count exceeds available untyped space or CNode range.
-| 8 | `CapNotFound` | Capability slot is empty.
-| 9 | `HasChildren` | Cannot delete: capability has CDT children (use revoke).
-| 10 | `Timeout` | Timed IPC operation expired.
-| 11 | `Interrupted` | Operation interrupted by a signal/notification.
-| 12 | `NotSupported` | Feature not supported on this architecture.
+| 4 | `InvalidArgument` | Argument value out of range or semantically invalid.
+| 5 | `OutOfMemory` | Untyped memory exhausted, no free frames, or kernel pool saturated.
+| 6 | `NotFound` | Named resource or slot is empty / absent.
+| 7 | `Busy` | Object is in use by another operation and the caller did not request blocking.
+| 8 | `AlreadyExists` | Target identity already assigned (bound notification, mapping, etc.).
+| 9 | `WouldBlock` | Non-blocking variant could not proceed without blocking.
+| 10 | `BadAddress` | User pointer is unmapped, non-canonical, or lacks the required permissions.
+| 11 | `OutOfRange` | Requested index, count, or derivation depth exceeds a kernel limit.
+| 12 | `Cancelled` | Operation aborted because the caller or target was torn down.
+| 13 | `Restart` | Kernel asks userspace to retry (e.g. interrupted notification dispatcher).
+| 14 | `Deadlock` | Requested lock or donation chain would violate the global ordering.
+| 15 | `Interrupted` | Operation interrupted by a signal or notification.
+| 0x18 | `SlotOccupied` | Destination CNode slot is not empty.
+| 0x19 | `AlreadyMapped` | VSpace range already has a mapping installed.
+| 0x1A | `AlreadyBound` | TCB is already bound to a notification / scheduling context.
 |===
+
+Values `16`–`0x17` (decimal 16–23) are reserved for future error codes.
 
 == Invoke Dispatch
 

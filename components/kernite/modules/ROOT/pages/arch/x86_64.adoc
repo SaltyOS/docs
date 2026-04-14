@@ -18,9 +18,9 @@ This page documents the x86_64 architecture backend in `kernite/src/arch/x86_64/
 | `paging.rs` | 4-level page tables (PML4 → PDPT → PD → PT), direct physical map setup, identity map management.
 | `ap_boot.rs` | Application processor trampoline: real mode → protected mode → long mode.  Uses ACPI MADT to find APs.
 | `context.rs` | Context switch: save/restore of `rsp`, `rbx`, `rbp`, `r12`-`r15`, `rflags`, page table switch.
-| `cpu.rs` | Per-CPU data via `%gs` segment, CPU ID, kernel stack management, invoke sequence numbers.
+| `cpu.rs` | Per-CPU `PerCpuData` block accessed via `%gs` segment — CPU ID, kernel stack, saved user RSP, invoke sequence, stack canary.
 | `cpuid.rs` | CPUID feature detection: SSE, AVX, XSAVE, SMAP, SMEP, 1G pages, FSGSBASE.
-| `fpu.rs` | FPU/SSE/AVX lazy context switch via `#NM` trap, XSAVE/XRSTOR.
+| `fpu.rs` | FPU/SSE/AVX eager context switch — XSAVE/XRSTOR on every TCB switch, `CR0.TS` held at `0`.
 | `pit.rs` | Programmable Interval Timer — used for APIC timer calibration, fallback timer.
 | `uaccess.rs` | SMAP/SMEP control: `stac`/`clac` for user memory access windows.
 |===
@@ -138,21 +138,39 @@ The `syscall` instruction is configured via MSRs:
 
 Entry sequence in `syscall.S`:
 
-. Save user `RCX` (return RIP) and `R11` (return RFLAGS) — done by hardware.
-. Swap to the per-thread kernel stack (load from TCB, NOT from per-CPU `%gs:16`).
-. Save user RSP on the kernel stack.
-. Check syscall number: if 2 (Call) or 3 (ReplyRecv), jump to fastpath.
-. Otherwise, save all user registers and call `syscall_handle_rust()`.
+. Hardware saves user `RCX` (return RIP) and `R11` (return RFLAGS).
+. `swapgs` to the kernel `GS` base (which points at `PerCpuData`).
+. Stash the caller's user RSP in `PerCpuData.saved_rsp` (`%gs:16`).
+. Load the current thread's kernel stack pointer from `PerCpuData.kernel_stack` (`%gs:8`) into `RSP`.
+. Check syscall number: if 2 (Call) or 3 (ReplyRecv), jump to the fastpath.
+. Otherwise, save all user registers on the kernel stack and call `syscall_handle_rust()`.
+. On return, restore user RSP from `%gs:16`, `swapgs` back, and execute `sysretq`.
+
+=== PerCpuData Layout
+
+`syscall.S` and the rest of the kernel share the layout below.  Any change to `PerCpuData` must update the corresponding `%gs:OFFSET` references in `syscall.S`.
+
+[cols="1,1,2"]
+|===
+| Offset | Field | Purpose
+
+| `0` | `cpu_id: u32` (+4B pad) | Logical CPU index (BSP = 0).  32-bit load to avoid reading into the next field.
+| `8` | `kernel_stack: u64` | Top-of-stack pointer loaded on syscall entry.
+| `16` | `saved_rsp: u64` | User RSP saved by the syscall stub between `swapgs` pairs.
+| `24` | `invoke_seq: u64` | Monotonic counter incremented on each `Invoke`; used as a diagnostic correlation ID.
+| `32` | `stack_canary: u64` | Per-CPU stack canary seeded from RDSEED/RDRAND during BSP/AP init.
+| `40`-`95` | `_reserved: [u64; 11]` | Reserved for future growth.
+|===
 
 == FPU / SSE / AVX
 
-Lazy context switching:
+Eager context switching:
 
-. On context switch, set `CR0.TS` (or manipulate `CR0.EM`).
-. First FPU/SSE/AVX instruction triggers `#NM` (Device Not Available, exception 7).
-. Handler saves the previous thread's state via `XSAVE` (or `FXSAVE` if XSAVE unavailable).
-. Handler restores the current thread's state via `XRSTOR`.
-. Handler clears `CR0.TS` to allow subsequent FPU instructions without trapping.
+. At boot, `CR0.TS` is cleared (and `CR0.MP` kept set).  `CR0.TS` stays at `0` for the lifetime of the kernel, so the `#NM` vector is never taken for FPU faults.
+. On every TCB switch, `fpu::switch()` calls `XSAVE` on the outgoing TCB and `XRSTOR` on the incoming TCB unconditionally — there is no "fpu_used" fast-exit.
+. `flush_current()` / `reload_current()` keep the live register file in sync after `TCB_COPY_FPU` or similar kernel-side mutations.
+
+`XSAVE`/`XRSTOR` fall back to `FXSAVE`/`FXRSTOR` when CPUID does not advertise XSAVE.
 
 Save area: `XSaveArea` — 832 bytes, 64-byte aligned (x87: 512 + XSAVE header: 64 + AVX: 256).
 

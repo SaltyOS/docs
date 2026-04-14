@@ -18,6 +18,8 @@ pub struct Scheduler {
     context_switches: [u64; MAX_CPUS],            // per-CPU counters
     timer_ticks: [u64; MAX_CPUS],
     idle_ticks: [u64; MAX_CPUS],
+    per_cpu_user_ticks: [u64; MAX_CPUS],          // CPU accounting (see below)
+    per_cpu_system_ticks: [u64; MAX_CPUS],
     ipi_reschedules: [u64; MAX_CPUS],
     online_cpus: u32,
     rebalance_counter: u64,
@@ -86,6 +88,7 @@ Each thread's xref:scheduling/threads.adoc[SchedContext] tracks CPU time:
 | `remaining` | `u64` | Ticks remaining in the current period.
 | `period` | `u64` | Replenishment interval (ticks).
 | `deadline` | `u64` | Absolute deadline for the current period.
+| `consumed` | `u64` | Cumulative ticks consumed across all periods.  Used to feed back into `/proc`-style CPU accounting and to diagnose runaway budget usage.
 |===
 
 === Timer Tick Handler
@@ -104,6 +107,16 @@ On each timer interrupt (`timer_tick()`):
 
 IMPORTANT: `eoi()` (end-of-interrupt) is sent _before_ calling any function that might trigger a context switch.
 If EOI is deferred past a context switch, the interrupt controller blocks all further timer interrupts.
+
+=== CPU Accounting
+
+Every timer tick classifies the interrupted context as user, kernel, or idle and increments the appropriate counters:
+
+* If the interrupted CPU was running the idle thread, bump `idle_ticks[cpu]` and skip the per-thread update.
+* If the interrupted context was EL0 / ring 3, bump `per_cpu_user_ticks[cpu]` and `sc.consumed`, and atomically bump `Tcb.user_ticks` on the current thread.
+* If the interrupted context was EL1 / ring 0 (kernel), bump `per_cpu_system_ticks[cpu]` and `sc.consumed`, and atomically bump `Tcb.system_ticks` on the current thread.
+
+The per-thread `user_ticks` / `system_ticks` counters are `AtomicU64` so the readout path (the `TCB_GET_CPU_TIMES` invoke — label `0x80`) can sample them without taking the scheduler lock.  The per-CPU counters feed `SysInfo` / `SysMemInfo` for system-wide procfs views.
 
 === Replenishment
 

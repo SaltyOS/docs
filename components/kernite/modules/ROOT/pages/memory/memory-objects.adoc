@@ -249,10 +249,27 @@ This is critical for fork performance -- a deep fork tree with many touched page
 | `0x94` | `MO_RESIZE` | Grow or shrink the MO.
 | `0x95` | `MO_READ` | Read data from MO pages (kernel-mediated read).
 | `0x96` | `MO_WRITE` | Write data to MO pages (kernel-mediated write).
-| `0x97` | `MO_HAS_PAGE` / `VSPACE_MAP_MO` | Check if page is committed (MO context) / Map MO pages into VSpace (VSpace context).  Label shared by object type dispatch.
-| `0x98` | `VSPACE_UNMAP_MO` | Unmap MO pages from a VSpace.
-| `0x99` | `VSPACE_SHARE_RO_PAGE` | Share a single read-only page between MOs.
+| `0x97` | `MO_HAS_PAGE` / `VSPACE_MAP_MO` | MO context: check if page is committed.  VSpace context: map MO pages into VSpace.  Label shared — dispatch decided by the invoked capability's object type.
+| `0x98` | `MO_GET_MAP_COUNT` | Return how many live VSpace mappings reference a given page of this MO.
+| `0x99` | `MO_UPDATE_PAGE_FLAGS` / `VSPACE_SHARE_RO_PAGE` | MO context: atomically set/clear `FrameMeta.flags` bits for a committed page.  VSpace context: share a single read-only page between MOs.  Label shared — dispatch decided by the invoked capability's object type.
 | `0x9A` | `VSPACE_FORK_RANGE` | Bulk COW fork: clone MO range and remap.
+|===
+
+There is no dedicated `VSPACE_UNMAP_MO` label.  MO-backed ranges are torn down with the generic `VSPACE_UNMAP` (`0x51`).
+
+=== Per-Page Flags (`MO_UPDATE_PAGE_FLAGS`)
+
+`MO_UPDATE_PAGE_FLAGS` operates on `FrameMeta.flags` for a single committed page (`arg0 = page_index`, `arg1 = set_mask`, `arg2 = clear_mask`).  The previous flag word is returned in `TronaResult.value`.
+
+[cols="1,2,4"]
+|===
+| Bit | Name | Meaning
+
+| `1 << 0` | `MO_PAGE_FLAG_DIRTY` | Page has been modified since the last cleaner pass.
+| `1 << 1` | `MO_PAGE_FLAG_REFERENCED` | Page has been accessed recently; cleared by the aging pass.
+| `1 << 2` | `MO_PAGE_FLAG_PINNED` | Page is pinned into memory and counts toward `VmLck`.
+| `1 << 3` | `MO_PAGE_FLAG_WRITEBACK` | Page is currently being written back to its backing store.
+| `1 << 4` | `MO_PAGE_FLAG_ACTIVE` | Page belongs to the active LRU list.
 |===
 
 == Destruction

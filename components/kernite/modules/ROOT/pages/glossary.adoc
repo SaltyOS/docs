@@ -47,7 +47,7 @@ An assembly-optimized dispatch path for `Call` (syscall 2) and `ReplyRecv` (sysc
 A 4 KB physical memory page.  The unit of allocation in the xref:memory/pmm.adoc[PMM].
 
 [[frame-owner]]FrameOwner::
-An enum tag on each physical frame in the xref:memory/pmm.adoc[PMM] that identifies the frame's current purpose: `Free`, `MoData`, `MoMeta`, `KernelPrivate`, `PageCache`, or `EmergencyReserve`.
+An enum tag on each physical frame in the xref:memory/pmm.adoc[PMM] that identifies the frame's current purpose: `Free`, `UntypedReserved`, `MoData`, `MoMeta`, `KernelPrivate`, `PageCache`, or `EmergencyReserve`.
 
 [[global-slot-array]]Global slot array::
 A boot-time allocated array storing all live xref:concepts/capabilities.adoc[capabilities] and their xref:concepts/cspace.adoc[metadata] (CDT links, untyped links, state).  Sized by `clamp(free_frames / 4, 768, 131_072)`.
@@ -84,6 +84,12 @@ A 4-level tree (512 entries per node, 9 bits per level) used by xref:memory/memo
 
 [[retype]]Retype::
 The operation that carves typed xref:concepts/objects.adoc[kernel objects] from xref:concepts/untyped.adoc[untyped memory].  Invoke label `0x20`.
+
+[[role-cap-table]]Role capability table::
+The startup structure (`TronaCapTableV1`) that binds role IDs to resolved xref:concepts/capabilities.adoc[capabilities] in a spawned process's xref:concepts/cspace.adoc[CSpace].  Delivered to the child through the `AT_TRONA_CAP_TABLE` (`0x101C`) auxv tag.  Child processes look up service endpoints by role — there are no hardcoded CSpace slot numbers.  See xref:concepts/cspace.adoc#role-cap-table[Role-Based Capability Table].
+
+[[role-id]]Role ID::
+A 16-bit identifier used as the key into the <<role-cap-table,role capability table>>.  System roles occupy `0x0001`-`0x00FF`; process-local roles occupy `0x0100`-`0x0FFF` (`LOCAL_ROLE_BASE`..`LOCAL_ROLE_END`).
 
 [[revoke]]Revoke::
 A xref:concepts/capabilities.adoc[capability operation] that recursively destroys all capabilities derived from a given slot (depth-first CDT traversal).  The only operation that tears down an authority subtree.

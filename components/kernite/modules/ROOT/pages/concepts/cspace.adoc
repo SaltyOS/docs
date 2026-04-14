@@ -225,9 +225,15 @@ The kernel populates well-known slots during bootstrap:
 | 16+ | `CAP_UNTYPED_START` | Untyped memory capabilities (one per available region)
 |===
 
-On aarch64, I/O port slots are reused for MMIO-oriented objects (PL011 device untyped, interrupt handler).
+The aarch64 init CNode reuses the same three mandatory slots (0/1/2), then fills the I/O and untyped-range slots with MMIO-oriented objects (PL011 device untyped, interrupt handler).
 
-Child processes spawned by `procmgr` receive a different well-known slot layout:
+Every other slot is an init-only convenience carved by `init.rs`; userland library code MUST NOT hardcode these positions.
+
+[[role-cap-table]]
+== Role-Based Capability Table (Children)
+
+Child processes spawned by `procmgr` no longer receive a fixed slot map.
+Only the three mandatory slots are stable for every child:
 
 [cols="1h,1,3"]
 |===
@@ -236,15 +242,69 @@ Child processes spawned by `procmgr` receive a different well-known slot layout:
 | 0 | `CAP_SELF_TCB` | Thread's own TCB
 | 1 | `CAP_SELF_VSPACE` | Thread's page table root
 | 2 | `CAP_SELF_CSPACE` | Thread's CNode root
-| 3 | `CAP_PROCMGR_EP` | Process manager endpoint
-| 4 | `CAP_VFS_EP` | VFS server endpoint
-| 5 | `CAP_NAMESRV_EP` | Name service endpoint
-| 7 | `CAP_MMSRV_EP` | Memory manager server endpoint
-| 8 | `CAP_COM1_IOPORT` | Serial port I/O
-| 11 | `CAP_CONSOLE_EP` | Console server endpoint
-| 15 | `CAP_PCI_IOPORT` | PCI config space I/O port
-| 16+ | `CAP_UNTYPED_START` | Untyped memory capabilities
+| 16+ | `CAP_UNTYPED_START` | Untyped memory capabilities (procmgr-owned range)
 |===
+
+All service endpoints (procmgr, vfs, namesrv, mmsrv, rsrcsrv, console, win32srv, …) arrive via a _role capability table_ that the spawner builds and attaches to the new process.  Userland resolves the capability by _role_, never by slot number.
+
+=== Delivery: Auxv Tag
+
+The spawner puts a pointer to a `TronaCapTableV1` header on the child's stack and exposes it through a single auxv entry:
+
+[cols="1,3"]
+|===
+| Constant | Value
+
+| `AT_TRONA_CAP_TABLE` | `0x101C`
+| `TRONA_CAP_TABLE_MAGIC` | `0x43544153` (`'SATC'` little-endian)
+| `TRONA_CAP_TABLE_VERSION` | `1`
+|===
+
+Each table row binds a role to a cursor-allocated CSpace slot plus the rights / flags that spawner policy granted.
+
+=== Role ID Space
+
+[cols="1,3"]
+|===
+| Range | Meaning
+
+| `0x0001`-`0x00FF` | _System roles_ — well-known endpoints/notifications/untypeds defined in `lib/trona/uapi/consts/kernel.rs` (`ROLE_PROCMGR_CONTROL`, `ROLE_VFS_CLIENT`, `ROLE_MMSRV_CLIENT`, `ROLE_CONSOLE_CLIENT`, `ROLE_SIGNAL_NTFN`, `ROLE_PCI_IOPORT`, `ROLE_SC_CAP`, …).
+| `0x0100`-`0x0FFF` (`LOCAL_ROLE_BASE`..`LOCAL_ROLE_END`) | _Local roles_ — process-local identifiers reserved by the spawner; not portable across deployments.
+| `0x1000`+ | Reserved for future raw / authority roles.
+|===
+
+Lookup happens at runtime through `trona::caps::*` helpers — callers ask for a role and get back a resolved `Capability`, or `None` when the role was not provisioned.  There are no hardcoded slot numbers anywhere in the child image.
+
+=== Rights Bits (`CAP_TBL_RIGHT_*`)
+
+[cols="1,2,3"]
+|===
+| Bit | Name | Meaning
+
+| `0x01` | `READ` | Row is readable (baseline for every live entry).
+| `0x02` | `WRITE` | Allows operations that mutate receiver state.
+| `0x04` | `GRANT` | Allows forwarding the capability via `CNODE_COPY` with `GRANT`.
+| `0x08` | `INVOKE` | Allows `syscall 9 Invoke` through this capability.
+| `0x10` | `BADGE` | Row carries a badge; receiver must treat source as an authenticated client.
+| `0x20` | `DEVICE` | Capability points at device-class memory (MMIO / I/O port / device untyped).
+|===
+
+=== Flags Bits (`CAP_TBL_FLAG_*`)
+
+[cols="1,2,3"]
+|===
+| Bit | Name | Meaning
+
+| `0x01` | `BADGED` | Row was minted with a non-zero badge.
+| `0x02` | `RAW` | Authority-grade capability (e.g. `ROLE_MMSRV_AUTHORITY_RAW`) — libraries must refuse to leak it.
+| `0x04` | `OPTIONAL` | Absence is legal; callers must tolerate `None`.
+| `0x08` | `NOTIFICATION` | Underlying object is a Notification, not an Endpoint.
+| `0x10` | `UNTYPED` | Untyped memory.
+| `0x20` | `DEVICE_UT` | Device untyped (non-zeroed on retype).
+| `0x40` | `IO_PORT` | IoPort capability (x86_64 port range, aarch64 MMIO window).
+|===
+
+The `BADGED` / `RAW` / `NOTIFICATION` combinations let `trona::caps` pick the right runtime wrapper — a `NOTIFICATION` row returns a `Notification`, a plain endpoint row returns an `Endpoint`, and `RAW` gates access to authority-only operations.
 
 == Error Conditions and Edge Cases
 

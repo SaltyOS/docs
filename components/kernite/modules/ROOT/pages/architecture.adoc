@@ -27,7 +27,7 @@ The kernel source (`kernite/src/`) is organized into the following modules:
 | Scheduling: EDF scheduler, thread control blocks, priority inheritance, sleep queue
 
 | `syscall/`
-| System call dispatch: 28 syscalls, capability invocation, IPC fastpath
+| System call dispatch: 31 syscalls, capability invocation, IPC fastpath
 
 | `arch/x86_64/`
 | x86_64 backend: GDT, IDT, APIC, ACPI, paging, SMP, CPUID, FPU, PIT, SMAP/SMEP, uaccess
@@ -164,12 +164,12 @@ Re-exported sub-modules: `paging`, `fpu`, `cpuid`, `uaccess`.
 | `paging.rs` | 4-level page tables (PML4 -> PDPT -> PD -> PT)
 | `context.rs` | Context switch via register save/restore
 | `cpuid.rs` | CPUID feature detection
-| `fpu.rs` | x87/SSE/AVX lazy context switch via `#NM` trap
+| `fpu.rs` | x87/SSE/AVX eager context switch (XSAVE/XRSTOR on every TCB switch, `CR0.TS` held at `0`)
 | `pit.rs` | Legacy PIT for APIC timer calibration
 | `uaccess.rs` | SMAP/SMEP user memory access control
 |===
 
-Syscall entry: `syscall` instruction.  Entry point in `syscall.S` saves user RSP on the per-thread kernel stack (not per-CPU `%gs:16`) to prevent corruption during context switches.
+Syscall entry: `syscall` instruction.  Entry point in `syscall.S` swaps to the kernel `GS` base and stashes the caller's user RSP in `PerCpuData.saved_rsp` (`%gs:16`), then loads the kernel stack pointer from `PerCpuData.kernel_stack` (`%gs:8`).
 
 === aarch64 Backend
 
@@ -178,13 +178,13 @@ Syscall entry: `syscall` instruction.  Entry point in `syscall.S` saves user RSP
 | File | Content
 
 | `boot.rs` | BSP bootstrap: GICv3, PSCI, generic timer, paging
-| `ap_boot.rs` | AP startup via PSCI `CPU_ON` (HVC) + mailbox handoff
+| `ap_boot.rs` | AP startup via PSCI `CPU_ON` (HVC) with the logical CPU index delivered through PSCI's `context ID` argument (received in `x0`)
 | `gic.rs` | GICv3 distributor (GICD), redistributor (GICR), CPU interface (ICC system registers)
 | `psci.rs` | Power State Coordination Interface (HVC calls)
 | `timer.rs` | Generic timer: EL1 physical timer (CNTP), PPI 30, 10 ms tick
 | `paging.rs` | 4-level page tables (TTBR0 user / TTBR1 kernel)
 | `context.rs` | Context switch via `x0`-`x30`, `sp_el0`, `elr_el1`, `spsr_el1` save/restore
-| `fpu.rs` | NEON Q0-Q31 (512 bytes) lazy switch via `CPACR_EL1` trapping
+| `fpu.rs` | NEON Q0-Q31 + FPCR + FPSR eager switch (save/restore on every TCB switch, `CPACR_EL1.FPEN = 0b11` permanently)
 | `exceptions.rs` | Exception vector table (sync/IRQ/FIQ/SError at EL1/EL0)
 | `pl011.rs` | PL011 UART driver for early serial output
 |===
@@ -258,9 +258,7 @@ Floating-point and SIMD instructions are forbidden in kernel code:
 * x86_64: compiled with `-mno-sse -mno-mmx -mno-avx`
 * aarch64: compiled with `-mgeneral-regs-only`
 
-FPU/SIMD state is managed via lazy context switching.
-On x86_64, the kernel traps `#NM` (Device Not Available) exceptions.
-On aarch64, CPACR_EL1 trapping detects the first FPU use after a context switch.
+FPU/SIMD state is managed via _eager_ context switching on both architectures — every TCB switch unconditionally saves and restores the FPU/SIMD register file, so no `#NM` / CPACR trap vector is used for regular FPU faults.  `CR0.TS` (x86_64) is held at `0` and `CPACR_EL1.FPEN` (aarch64) is held at `0b11` for the lifetime of the kernel.
 
 === Unsafe Code Conventions
 

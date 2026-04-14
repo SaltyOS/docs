@@ -102,12 +102,13 @@ Conditions::
 * PTE has the demand marker (`ENTRY_DEMAND` set, bit 10).
 
 Resolution::
-. Identify the backing MemoryObject from the VmArea.
-. Commit a page in the MO at the faulted page index (allocate a frame, update radix tree).
-. Install the PTE with the new physical address and appropriate permissions from the VmArea.
-. Resume the faulting thread.
+. `handle_demand_fault()` looks up the VmArea and its backing MemoryObject.
+. If the MO is anonymous, a zero-filled frame is allocated on the fault-path source (untyped primary, PMM fallback) and inserted into the MO's radix tree.
+. If the MO is pager-backed, the page is committed at the faulted page index using the MO's normal commit path.
+. The PTE is rewritten with the new physical address, `ENTRY_PRESENT = 1`, `ENTRY_DEMAND = 0`, and permissions drawn from the VmArea.
+. `VSpace.vm_demand_pages` is decremented and the TLB entry is invalidated before resuming the thread.
 
-Demand markers are installed by `VSPACE_MAP_MO` for MO pages that are not yet committed at map time.
+Demand markers are installed by `VSPACE_MAP_DEMAND` (`0x59`), `VSPACE_MAP_DEMAND_RANGE` (`0x5A`), and by `VSPACE_MAP_MO` when the caller passes `VSPACE_FLAG_DEMAND` for MO pages that are not yet committed at map time.
 
 === Stack Growth
 

@@ -141,6 +141,7 @@ Every physical frame carries a `FrameOwner` tag that identifies its current purp
 ----
 pub enum FrameOwner {
     Free,
+    UntypedReserved { ut: *mut UntypedMemory },
     MoData { mo: *mut MemoryObject, page_idx: u32 },
     MoMeta { mo: *mut MemoryObject, subkind: MoMetaKind },
     KernelPrivate { subkind: KernelMetaKind },
@@ -154,6 +155,7 @@ pub enum FrameOwner {
 | Variant | Meaning
 
 | `Free` | Unallocated.  Available for `alloc()`.
+| `UntypedReserved` | Frame is carved out of an `UntypedMemory` watermark but has not been promoted to a typed owner yet (reset / retype windows, device untypeds).  Blocks double allocation while `untyped` still claims the backing range.
 | `MoData` | User-visible data page owned by a MemoryObject.  `page_idx` identifies the page within the MO.  `mo` points to the owning MO struct (valid for system lifetime because kernel objects are never freed).
 | `MoMeta` | MO-internal metadata page.  Sub-kinds: `Radix` (radix tree node), `Rmap` (reverse map overflow page).
 | `KernelPrivate` | Kernel-private page.  Sub-kinds: `PageTable`, `KernelStack`, `MapleNode`, `General`.

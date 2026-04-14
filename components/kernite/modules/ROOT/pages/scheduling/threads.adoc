@@ -30,8 +30,9 @@ The TCB contains all per-thread kernel state:
 | `reply_tcb` | `*mut Tcb` | Saved reply target (for server-side reply capability). Refcount-managed via `set_reply_tcb` / `clear_reply_tcb` + `release_tcb_ref` helpers — the raw pointer is never assigned directly.
 | `blocked_reason` | `Option<BlockedReason>` | Why the thread is blocked.
 | `blocked_endpoint` | `*mut u8` | Endpoint the thread is blocked on.
-| `fpu_state` | `XSaveArea` | Saved FPU/SIMD register state.
-| `fpu_used` | `bool` | Whether this thread has used FPU since last context switch.
+| `fpu_state` | `XSaveArea` | Saved FPU/SIMD register state (always restored on context switch — eager FPU).
+| `user_ticks` | `AtomicU64` | Cumulative ticks spent executing in user mode; exported via `TCB_GET_CPU_TIMES`.
+| `system_ticks` | `AtomicU64` | Cumulative ticks spent executing in kernel mode on behalf of this thread; exported via `TCB_GET_CPU_TIMES`.
 |===
 
 == Thread States
@@ -133,21 +134,19 @@ When a high-priority thread blocks on a resource held by a lower-priority thread
 
 == FPU/SIMD State
 
-FPU and SIMD registers are managed via lazy context switching:
+FPU and SIMD registers use _eager_ context switching: every TCB switch unconditionally saves the outgoing thread's state and restores the incoming thread's state, so no per-thread "dirty" flag is needed.  The lazy `#NM` / `CPACR` trap paths used by previous versions were removed after they raced with the timer interrupt on both architectures.
 
 x86_64::
-The kernel sets `CR0.TS` (or clears `CR0.MP`) after a context switch.
-The first FPU instruction triggers a `#NM` (Device Not Available) exception.
-The handler saves the previous thread's state via `XSAVE` and restores the current thread's state via `XRSTOR`.
+`CR0.TS` is cleared at boot and held at `0` for the lifetime of the kernel — the `#NM` vector is never taken for FPU faults.
+`fpu::switch()` calls `XSAVE` on the outgoing TCB and `XRSTOR` on the incoming TCB.
 Save area: 832 bytes (x87 + XSAVE header + AVX), 64-byte aligned.
 
 aarch64::
-The kernel clears the FPU enable bit in `CPACR_EL1` after a context switch.
-The first NEON/FP instruction triggers a synchronous trap.
-The handler saves/restores Q0-Q31 + FPCR + FPSR.
-Save area: 528 bytes, 16-byte aligned.
+`CPACR_EL1.FPEN` is programmed to `0b11` (no trap from EL0 or EL1).
+`fpu::switch()` calls `aarch64_fpsimd_save_state` / `aarch64_fpsimd_restore_state` unconditionally.
+Save area: 528 bytes (32×V128 + FPCR + FPSR + padding), 16-byte aligned.
 
-The `fpu_used` flag on each TCB tracks whether the thread has touched FPU state since the last context switch, avoiding unnecessary saves.
+`flush_current()` / `reload_current()` keep the live register file in sync when TCB state is mutated outside a context switch (e.g. `TCB_COPY_FPU`).
 
 == Sleep Queue
 
@@ -173,14 +172,16 @@ Whichever event fires first (sleep expiry or partner arrival) wakes the thread; 
 | `0x46` | `TCB_WRITE_REGISTERS` | Write saved register state (IP, SP, arguments).
 | `0x48` | `TCB_SET_IPC_BUFFER` | Set IPC buffer virtual address.
 | `0x49` | `TCB_BIND_NOTIFICATION` | Bind a notification for combined IPC wait.
+| `0x4A` | `TCB_UNBIND_NOTIFICATION` | Break the TCB↔Notification link.
 | `0x4B` | `TCB_SET_FAULT_HANDLER` | Set fault handler endpoint.
 | `0x4C` | `TCB_COPY_FPU` | Copy FPU/SIMD state from another TCB.
 | `0x4D` | `TCB_SET_TLS_BASE` | Set TLS base register (`FS` on x86_64, `TPIDR_EL0` on aarch64).
 | `0x4E` | `TCB_SET_NOTIFICATION_DISPATCHER` | Set notification dispatcher entry point.
 | `0x4F` | `TCB_GET_SPACE_INFO` | Return VSpace, CSpace, and IPC buffer configuration.
+| `0x80` | `TCB_GET_CPU_TIMES` | Sample the target thread's cumulative `user_ticks` and `system_ticks` counters (assigned outside the 0x4X block because that block is saturated).
 |===
 
-NOTE: Labels 0x44, 0x45, 0x47, 0x4A are not assigned.  The numbering is sparse.
+NOTE: Labels 0x44, 0x45, 0x47 are not assigned — the numbering is sparse to leave room for future TCB operations.
 
 == Error Conditions and Edge Cases
 
@@ -212,8 +213,8 @@ This is a known simplification — seL4 has the same limitation.
 
 === FPU State On Thread Destruction
 
-If a thread with `fpu_used = true` is destroyed, its `XSaveArea` memory is reclaimed with the TCB.
-No FPU state leak occurs because the FPU save area is embedded in the TCB struct (not separately allocated).
+The `XSaveArea` is embedded in the TCB struct, so the FPU save area is reclaimed together with the TCB and no separate allocation has to be freed.
+Because the switch is eager, the outgoing save happens before the TCB is ever marked inactive, so no in-flight FPU state can outlive the object.
 
 === SchedContext Without TCB
 
