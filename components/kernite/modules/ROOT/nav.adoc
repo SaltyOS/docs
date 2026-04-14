@@ -33,4 +33,5 @@
 ** xref:internals/unsafe-conventions.adoc[Unsafe Code Conventions]
 ** xref:internals/memory-layout.adoc[Memory Layout]
 ** xref:internals/developer-guide.adoc[Developer Guide]
+** xref:internals/known-debt.adoc[Known Kernel Debt]
 * xref:glossary.adoc[Glossary]

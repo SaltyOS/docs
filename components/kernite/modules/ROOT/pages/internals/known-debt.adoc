@@ -1,0 +1,279 @@
+= Known Kernel Debt
+:description: Tracked structural debts and deferred work in the kernite kernel — items that are consciously left for later, with their blast radius, why they exist, and rough resolution paths.
+
+This page lists structural debts and deferred work inside the kernite kernel.
+Every entry here is _known_ and _being tracked_ — these are not unknown bugs.
+Each entry describes the current state, why it still exists, what it blocks, where to intervene, and when to revisit.
+
+New entries should be added whenever a workaround, latent race, or placeholder is introduced that the author does not intend to fix in the same change.
+
+[[uapi-kernel-drift]]
+== uapi ↔ kernel ABI drift
+
+Status::
+Accumulated (as of the `feat/cpu-accounting-procfs` branch).  Mitigated by convention: every new syscall or invoke label must be added to both sides in the same change.
+
+=== Current state
+
+Kernite's syscall numbers and invoke labels are declared in two places that are not structurally enforced to agree:
+
+[cols="1,2,2"]
+|===
+| Surface | Declared in | Consumed by
+
+| `SYS_*` syscall numbers
+| `lib/trona/uapi/consts/kernel.rs`
+| userland (trona substrate)
+
+| `Syscall` enum + `TryFrom<u64>` (duplicate of `SYS_*`)
+| `kernite/src/syscall/mod.rs`
+| kernel dispatcher
+
+| Invoke label constants (`TCB_*`, `VSPACE_*`, …)
+| `lib/trona/uapi/consts/kernel.rs`
+| userland wrappers
+
+| Invoke label dispatch (same values, written as numeric literals)
+| `kernite/src/syscall/mod.rs::handle_invoke`
+| kernel dispatcher
+|===
+
+Because the kernel does not `include!` uapi, the compiler cannot prove the two tables stay in sync.  Drift is only detectable at runtime, and usually shows up as `InvalidOperation` or silent no-ops.
+
+Server protocol labels (`PM_*`, `MM_*`, `VFS_*`, `net_*`, `dns_*`) do NOT have this problem — servers `use` uapi directly, so a rename breaks compilation.
+
+=== Known concrete drift
+
+* TCB labels `0x44` / `0x45` / `0x47` (`TCB_SET_AFFINITY`, `TCB_READ_REGISTERS`, `TCB_SET_PRIORITY`) exist in the kernel's `handle_invoke` but are not yet exposed in uapi.  Reading uapi alone makes them look "free" — they are not.
+* `TCB_UNBIND_NOTIFICATION = 0x4A` only landed in uapi on this branch; it was a kernel-only label before.
+* `TICKS_PER_SEC = 100` is defined both in `lib/trona/uapi/consts/kernel.rs` and `kernite/src/sched/mod.rs`.
+* `TCB_GET_CPU_TIMES = 0x80` is a workaround: the TCB `0x40-0x4F` block is saturated, so the introspection extension landed outside the range.  Intended to move back into the TCB range once the label blocks are widened (see xref:#uapi-kernel-drift-pr5[PR-5]).
+
+=== Target end state
+
+`lib/trona/uapi/` is the single source of truth; the kernel `include!`s it and the compiler rejects any drift.  Numeric `0xNN` literals in `handle_invoke` are replaced with `crate::uapi::kernel::TCB_*` constants so that label renames show up as build errors.
+
+=== Resolution path (ordered PRs)
+
+PR-1 (small)::
+Expose the four TCB labels (`0x44`, `0x45`, `0x47`, `0x4A`) and add the matching substrate wrappers.  No kernel change.
+
+PR-2::
+Add `pub mod uapi { include!("../../lib/trona/uapi/consts/kernel.rs"); }` to the kernel.  Rewrite `Syscall` enum variants to use `crate::uapi::kernel::SYS_*` as their discriminants.
+
+PR-3::
+Rewrite every `match (ObjectType::X, 0xNN)` arm in `handle_invoke` to use named constants from `crate::uapi::kernel::*`.
+
+PR-4::
+Replace `kernite/src/sched/mod.rs::TICKS_PER_SEC` with `pub use crate::uapi::kernel::TICKS_PER_SEC;`.
+
+[[uapi-kernel-drift-pr5]]
+PR-5 (ABI-breaking)::
+Widen label block size (e.g. TCB `0x40-0x5F`, VSpace `0x60-0x7F`, …) and move `TCB_GET_CPU_TIMES` back into the TCB range.  Acceptable while vNext is pre-release.
+
+=== When to revisit
+
+* Before adding any new syscall or invoke label — double-check both tables.
+* When a new label refuses to land in its natural range — PR-5 may be due.
+* When a "silent no-op" is reported for a syscall or invocation that obviously exists in source.
+
+[[pmm-untyped-dual-inventory]]
+== PMM ↔ untyped dual inventory
+
+Status::
+Latent race.  Currently blocks the x86_64 `handle_demand_fault` / `handle_stack_growth_fault` fast paths; aarch64 runs with the race exposed.
+
+=== Current state
+
+Two allocators describe the same physical frames and do not see each other:
+
+* `FrameAllocator` (`kernite/src/mm/frame.rs`) is a bitmap of free frames; `pmm_alloc` draws from it.
+* `UntypedMemory::retype` (`kernite/src/cap/untyped.rs`) is a bump watermark over a contiguous physical range; it checks only that its target is inside the untyped block and does not consult `FrameMeta.owner_tag`.
+
+A frame can simultaneously be "watermarked but not yet retyped" (so `retype` is about to hand it out) AND "free in the PMM bitmap" (so `pmm_alloc` can hand it out first).  The untyped-side zero-fill then corrupts user data that the PMM-side caller just installed.
+
+=== Blast radius
+
+* `kernite/src/arch/x86_64/idt.rs` deliberately skips the in-kernel demand-fault / stack-growth fast paths and forces a slow-path VMFault IPC to mmsrv to avoid the race.
+* aarch64 takes the fast path and depends on the narrow window not hitting.  `mmap(MAP_LAZY)` + concurrent `untyped_retype` workloads can trigger it.
+* Blocks lazy brk / sbrk, userspace pagers, and unified cross-arch fault dispatch.
+
+=== Required invariant
+
+Every physical frame must be in exactly one of three states:
+
+[cols="1,3"]
+|===
+| State | Rule
+
+| `Free`
+| Only `pmm_alloc` may draw.
+
+| `UntypedReserved`
+| Only `retype` may draw.  Owned by a specific live untyped capability.
+
+| Typed owner (`MoData`, `MoMeta`, `KernelPrivate`, `PageCache`, `EmergencyReserve`)
+| Owned by a single capability / object.
+|===
+
+Transitions:
+
+* Boot: all usable RAM starts `Free`; initial untyped creation moves ranges to `UntypedReserved`.
+* `retype` on `Frame` / `MO`: `UntypedReserved` → typed owner (zero-fill stays).
+* `untype` / object destruction: typed owner → `UntypedReserved` (returned to the parent untyped, never to `Free`).
+* Top-level untyped revoke: the full range returns to `Free` in one step.
+
+Per-frame `FrameOwner` tags alone are not enough — the bug is that the _watermark_ allocator doesn't look at them.  The range-level invariant above is what `retype` must enforce.
+
+=== Resolution path
+
+. Add the `UntypedReserved` `FrameOwner` variant (already present on this branch) and tag every frame an untyped covers at creation time.
+. Teach `UntypedMemory::retype` to refuse when the next watermark slice is not `UntypedReserved`.
+. Teach `pmm_alloc` to assert the drawn frame is `Free` (debug builds) and to skip `UntypedReserved` (release builds).
+. Remove the x86_64 `idt.rs` comment that disables the demand / stack-growth fast paths.
+. Align aarch64's exception dispatch order with x86_64.
+
+=== When to revisit
+
+* Before enabling x86_64 demand fast path — the invariant must be confirmed.
+* On any aarch64 "frame content changed under me" class bug — this race is the first suspect.
+* When adding a new `pmm_alloc` caller or a new `retype` path — verify the state transitions.
+
+[[eager-fpu-lock-in]]
+== Eager FPU lock-in (forward-looking)
+
+Status::
+Policy chosen.  `lazy → eager` transition completed on `feat/cpu-accounting-procfs`.  This entry exists so future work does not reintroduce the race that motivated the switch.
+
+=== Current state
+
+Both architectures save and restore the full FPU / SIMD register file on every TCB switch:
+
+* x86_64: `CR0.TS` is held at `0` for the kernel's lifetime.  `#NM` (vector 7) is configured as a panic regression guard — hitting it means someone re-introduced lazy switching.
+* aarch64: `CPACR_EL1.FPEN` is held at `0b11`.  EC=`0x07` traps are a panic regression guard.
+
+`TCB.fpu_used` and the per-CPU `FPU_OWNER` tracking have been removed — the current thread is always the owner.
+
+=== Why eager was chosen
+
+The previous lazy path had a race between the `#NM` / FP-trap handler and a preemption that occurred between `clear_ts` → `xrstor` → `set_fpu_owner` → `return`:
+
+. Thread A faults, handler clears TS, restores A's state, about to return.
+. Preemption: scheduler picks B, `save_on_switch` sets TS=1 again.
+. A resumes.  TS is now 1 but A believes the restore already completed.  `#NM` fires at the same RIP.  Repeat.
+
+The symptom was RIP drift with apparently-unstable FPU ownership.  Making the switch atomic with `set_ts` inside the `#NM` handler is structurally hard with the current dispatch shape.
+
+=== Why this is "debt"
+
+The eager path costs one `XSAVE` + one `XRSTOR` per context switch even when the outgoing thread did not touch the FPU.  On CPUs that support `XSAVEC` / `XSAVEOPT`, the compressed save is cheap and the cost is small — but on very-hot IPC paths between FP-light threads, it is measurable.
+
+=== Resolution path (if ever needed)
+
+Not a priority.  If lazy FPU becomes worth revisiting:
+
+* The `#NM` handler and the scheduler's `save_on_switch` must enter and leave CR0.TS atomically with respect to preemption.  The easiest shape is a lock-free owner CAS rather than a sequence of separate writes.
+* The aarch64 equivalent must do the same with `CPACR_EL1.FPEN`.
+* The save-on-switch path must be idempotent so that a preemption mid-restore does not double-save an unrelated thread's state.
+
+=== When to revisit
+
+* Only if context-switch latency between FP-light threads becomes a measured hotspot.
+* If a new CPU feature (AMX, etc.) makes full saves prohibitively expensive.
+* Never as a "simple optimization" — the race is subtle and the invariants above MUST be met.
+
+[[percpu-gs-offset-footgun]]
+== PerCpuData GS offset synchronization foot-gun
+
+Status::
+Structural foot-gun.  Hand-maintained contract between `cpu.rs` and `syscall.S`.
+
+=== Current state
+
+The x86_64 `PerCpuData` struct is `#[repr(C)]` and accessed from assembly via hardcoded `%gs:OFFSET` literals.  Rust knows the real offsets, but `syscall.S` embeds numeric offsets that are not derived from the struct at build time.
+
+Current layout (post eager-FPU transition):
+
+[cols="1,2,3"]
+|===
+| Offset | Field | Assembly access
+
+| `0` | `cpu_id: u32` (+4B pad) | `%gs:0` (32-bit load only)
+| `8` | `kernel_stack: u64` | `%gs:8`
+| `16` | `saved_rsp: u64` | `%gs:16`
+| `24` | `invoke_seq: u64` | `%gs:24`
+| `32` | `stack_canary: u64` | `%gs:32`
+| `40-95` | `_reserved: [u64; 11]` | (unused)
+|===
+
+If a field is added, reordered, or resized without updating the assembly, the stack canary check reads the wrong byte and reports a false-positive `[STACK_CORRUPT]` panic.  Silent in CI; loud at runtime.
+
+=== Files that must stay in sync
+
+* `kernite/src/arch/x86_64/cpu.rs` — struct layout + layout doc comment.
+* `kernite/src/arch/x86_64/syscall.S` — header docstring + every `%gs:OFFSET` access.
+* `kernite/src/init.rs`, `kernite/src/sched/thread.rs` — doc comments referencing `%gs:32`.
+
+=== Resolution options
+
+Short term::
+Keep the hand-maintained contract but add a compile-time assertion (`const _: () = assert!(offset_of!(PerCpuData, saved_rsp) == 16);`) for every asm-visible field.  Prevents silent drift.
+
+Long term::
+Replace hardcoded asm offsets with `global_asm!` expressions that reference `offset_of!` at compile time, so the assembly picks up layout changes automatically.
+
+=== Rule for editing `PerCpuData`
+
+. Add new fields at the end, inside `_reserved`.  Never in the first five slots.
+. If an asm-visible slot MUST change, grep `rg "gs:"` across the whole kernel tree and update every match.
+. Compile-time assert the offsets of the first five fields in `cpu.rs` near the struct definition.
+
+=== When to revisit
+
+* Any change to `PerCpuData` size or field order — read this section first.
+* A `[STACK_CORRUPT]` panic that cannot be explained by a real stack overflow — suspect this drift.
+
+[[page-cache-scaffolding]]
+== Page cache scaffolding without implementation
+
+Status::
+Placeholder.  `OwnerTag::PageCache` and `FrameOwner::PageCache` exist; no code ever produces a frame with either tag.
+
+=== Current state
+
+* `read(2)` copies through a VFS-internal buffer that is not retained.
+* `mmap(MAP_SHARED, file)` makes mmsrv allocate a fresh `MoKind::FileBacked` MO per caller.  Two processes that mmap the same file get two distinct MOs and distinct frames.
+* `/proc/meminfo` `Cached:` is therefore always `0`, as is the `pages_page_cache` accounting field.
+* The three-state PMM invariant (see xref:#pmm-untyped-dual-inventory[]) carries a permanently-zero `PageCache` term.
+
+=== Why the scaffolding was kept
+
+The long-term plan is to implement a proper VFS page cache, not to delete the tag.  Removing it now would only be undone later; keeping it zero-valued lets future code slot into place without churning the `FrameOwner` enum.
+
+=== Resolution outline
+
+. VFS / mmsrv shared registry keyed by `(file_id, offset_range) → MO*` so that multiple opens of the same file share one MO.
+. Per-page `FRAME_FLAG_DIRTY` tracking driven by PTE dirty bits, with `msync` / `fsync` / writeback cleaning them.
+. Evict path: pick clean `OwnerTag::PageCache` frames (low `map_count`), drop the MO radix entry, rewrite every reverse-mapped PTE to `ENTRY_DEMAND`, return the frame to `Free`.
+. Writeback queue: background flushes dirty pages; `fsync` / `msync` are synchronous flushes.
+. OOM escalation: try evicting clean cache pages → retry, then fall back to victim kill.
+
+=== Dependencies
+
+* Demand paging must be active (it is, on this branch) so that re-loading an evicted page can fault-in from the backing file.
+* `MemoryObject.reverse_maps` needs per-page granularity, not per-VmArea granularity, for eviction to know which PTE to clear.
+* VFS needs an inode-level identity so that dedup is well-defined.
+
+=== When to revisit
+
+* When a user-visible `Cached:` value is requested from `/proc/meminfo`.
+* When a workload that mmap's the same file from many processes appears.
+* When demand paging is extended with eviction / swap — the two designs share fault-path plumbing.
+
+== See also
+
+* xref:memory/pmm.adoc[Physical Memory Manager]
+* xref:concepts/untyped.adoc[Untyped Memory]
+* xref:arch/x86_64.adoc[x86_64 Backend]
+* xref:scheduling/threads.adoc[Threads and FPU state]
+* xref:syscalls/invoke-reference.adoc[Capability Invocations]
