@@ -16,7 +16,7 @@ content:
     - url: .
       branches: HEAD
       start_path: components/basalt
-    - url: https://github.com/SaltyOS/kernite.git
+    - url: https://github.com/saltyos/kernite.git
       branches: vNext
       start_path: docs
 
