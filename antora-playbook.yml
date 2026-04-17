@@ -16,9 +16,9 @@ content:
     - url: https://github.com/SaltyOS/docs.git
       branches: vNext
       start_path: components/basalt
-    - url: https://github.com/SaltyOS/docs.git
+    - url: https://github.com/SaltyOS/kernite.git
       branches: vNext
-      start_path: components/kernite
+      start_path: docs
 
 antora:
   extensions:
