@@ -1,1 +1,403 @@
-/* Reserved for future SaltyOS-specific UI overrides. */
+/* SaltyOS Documentation Theme */
+
+@font-face {
+  font-family: "Pretendard Variable";
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+  src: url(../font/PretendardVariable.woff2) format("woff2-variations");
+}
+
+:root {
+  --color-bg:          #ffffff;
+  --color-bg-muted:    #f5f7f9;
+  --color-bg-subtle:   #edf0f3;
+  --color-navbar:      #f5f7f9;
+  --color-code-bg:     #f5f7f9;
+
+  --color-text:        #24292f;
+  --color-text-muted:  #57606a;
+  --color-text-faint:  #8b949e;
+
+  --color-border:      #d0d7de;
+  --color-border-muted:#e4e8ec;
+
+  --color-link:        #0969da;
+  --color-link-hover:  #0550ae;
+
+  --color-note:        #0969da;
+  --color-tip:         #1a7f37;
+  --color-warning:     #9a6700;
+  --color-caution:     #cf222e;
+  --color-important:   #8250df;
+
+  --font-body: "Pretendard Variable", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  --radius: 5px;
+}
+
+/* ── Base ── */
+
+body {
+  font-family: var(--font-body);
+  color: var(--color-text);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+code, kbd, pre {
+  font-family: var(--font-mono);
+}
+
+/* ── Navbar ── */
+
+.navbar {
+  background: var(--color-navbar);
+  border-bottom: 1px solid var(--color-border-muted);
+  font-size: 0.875rem;
+}
+
+.navbar-brand .navbar-item,
+.navbar-brand .navbar-item:first-child {
+  color: var(--color-text);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.navbar-burger span {
+  background-color: var(--color-text);
+}
+
+#search-input {
+  font-family: var(--font-body);
+  font-size: 0.8125rem;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  color: var(--color-text);
+  padding: 0.3em 0.6em;
+}
+
+#search-input:focus {
+  border-color: var(--color-link);
+  outline: none;
+}
+
+#search-input::placeholder {
+  color: var(--color-text-faint);
+}
+
+/* ── Sidebar ── */
+
+.nav {
+  background: var(--color-bg-muted);
+}
+
+@media screen and (min-width: 769px) {
+  .nav {
+    box-shadow: none;
+    border-right: 1px solid var(--color-border-muted);
+  }
+}
+
+.nav-menu {
+  padding: 0.75rem 0.875rem;
+  line-height: 1.5;
+}
+
+.nav-menu h3.title {
+  color: var(--color-text);
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+
+.nav-item {
+  margin-top: 0.2em;
+}
+
+.nav-link {
+  color: var(--color-text-muted);
+  padding: 0.15em 0.35em;
+  border-radius: 3px;
+}
+
+.nav a:hover {
+  text-decoration: none;
+}
+
+.nav-link:hover {
+  color: var(--color-text);
+}
+
+.is-current-page > .nav-link {
+  color: var(--color-text);
+  font-weight: 600;
+}
+
+.nav-panel-explore {
+  background: var(--color-bg-muted);
+}
+
+.nav-panel-explore .context {
+  color: var(--color-text-muted);
+  box-shadow: 0 -1px 0 var(--color-border-muted);
+}
+
+.nav-panel-explore .components {
+  background: var(--color-bg-subtle);
+  box-shadow: inset 0 1px 2px rgba(0,0,0,0.03);
+}
+
+.nav-panel-explore .component .version a {
+  background: var(--color-border);
+  border-radius: 3px;
+}
+
+.nav-panel-explore .component .is-current a {
+  background: var(--color-text);
+  color: #fff;
+}
+
+/* ── Toolbar ── */
+
+.toolbar {
+  background: var(--color-bg);
+  border-bottom: 1px solid var(--color-border-muted);
+  box-shadow: none;
+  color: var(--color-text-muted);
+}
+
+.breadcrumbs li::after {
+  color: var(--color-text-faint);
+}
+
+.toolbar .edit-this-page a {
+  color: var(--color-text-faint);
+}
+
+.toolbar .edit-this-page a:hover {
+  color: var(--color-link);
+  text-decoration: none;
+}
+
+/* ── Content ── */
+
+.doc {
+  color: var(--color-text);
+  line-height: 1.7;
+}
+
+@media screen and (min-width: 1024px) {
+  .doc {
+    font-size: 0.9375rem;
+  }
+}
+
+.doc h1, .doc h2, .doc h3, .doc h4, .doc h5, .doc h6 {
+  color: var(--color-text);
+  font-family: var(--font-body);
+}
+
+.doc > h1.page:first-child {
+  font-weight: 700;
+  letter-spacing: -0.015em;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.doc h2:not(.discrete) {
+  font-weight: 600;
+  border-bottom: 1px solid var(--color-border-muted);
+  padding: 0.4rem 0 0.15rem;
+  margin-left: 0;
+  margin-right: 0;
+}
+
+.doc h3:not(.discrete),
+.doc h4:not(.discrete) {
+  font-weight: 600;
+}
+
+.doc a {
+  color: var(--color-link);
+}
+
+.doc a:hover {
+  color: var(--color-link-hover);
+}
+
+.doc .colist > table code,
+.doc p code,
+.doc thead code {
+  color: var(--color-text);
+  background: var(--color-code-bg);
+  border: 1px solid var(--color-border-muted);
+  border-radius: 3px;
+  font-size: 0.875em;
+  padding: 0.125em 0.3em;
+}
+
+/* ── Code Blocks ── */
+
+.doc .listingblock pre:not(.highlight),
+.doc .literalblock pre,
+.doc pre.highlight > code {
+  background: var(--color-code-bg);
+  border: 1px solid var(--color-border-muted);
+  border-radius: var(--radius);
+  box-shadow: none;
+  padding: 0.875rem 1rem;
+  font-size: 0.8125rem;
+  line-height: 1.55;
+}
+
+.doc .source-toolbox {
+  font-family: var(--font-body);
+  font-size: 0.6875rem;
+  color: var(--color-text-faint);
+}
+
+.doc .listingblock .title,
+.doc .literalblock .title {
+  color: var(--color-text-muted);
+  font-size: 0.8125rem;
+  font-style: normal;
+  font-weight: 600;
+}
+
+/* ── Admonitions ── */
+
+.doc .admonitionblock td.content {
+  background: var(--color-bg-muted);
+  border: 1px solid var(--color-border-muted);
+  border-radius: var(--radius);
+  border-left: 3px solid var(--color-note);
+}
+
+.doc .admonitionblock td.icon i {
+  border-radius: 3px;
+  font-size: 0.6875rem;
+}
+
+.doc .admonitionblock td.icon i.icon-note    { background-color: var(--color-note); }
+.doc .admonitionblock td.icon i.icon-tip     { background-color: var(--color-tip); }
+.doc .admonitionblock td.icon i.icon-warning { background-color: var(--color-warning); }
+.doc .admonitionblock td.icon i.icon-caution { background-color: var(--color-caution); }
+.doc .admonitionblock td.icon i.icon-important { background-color: var(--color-important); }
+
+.doc .admonitionblock:has(.icon-tip) td.content     { border-left-color: var(--color-tip); }
+.doc .admonitionblock:has(.icon-warning) td.content  { border-left-color: var(--color-warning); }
+.doc .admonitionblock:has(.icon-caution) td.content  { border-left-color: var(--color-caution); }
+.doc .admonitionblock:has(.icon-important) td.content { border-left-color: var(--color-important); }
+
+/* ── Tables ── */
+
+.doc table.tableblock,
+.doc table.tableblock > * > tr > * {
+  border-color: var(--color-border-muted);
+}
+
+.doc table.tableblock th {
+  background: var(--color-bg-muted);
+  font-weight: 600;
+}
+
+.doc table.stripes-all > tbody > tr,
+.doc table.stripes-even > tbody > tr:nth-of-type(2n),
+.doc table.stripes-odd > tbody > tr:nth-of-type(odd) {
+  background: var(--color-bg-muted);
+}
+
+/* ── TOC ── */
+
+.toc-menu {
+  color: var(--color-text-muted);
+}
+
+.toc .toc-menu h3 {
+  color: var(--color-text);
+}
+
+.toc .toc-menu a {
+  border-left-color: var(--color-border-muted);
+  color: var(--color-text-muted);
+}
+
+.toc .toc-menu a:hover {
+  color: var(--color-link);
+}
+
+.toc .toc-menu a.is-active {
+  color: var(--color-text);
+  border-left-color: var(--color-text);
+  font-weight: 600;
+}
+
+/* ── Definition Lists ── */
+
+.doc .dlist dt {
+  font-style: normal;
+  font-weight: 600;
+}
+
+/* ── Sidebar & Example Blocks ── */
+
+.doc .sidebarblock {
+  background: var(--color-bg-subtle);
+  border: 1px solid var(--color-border-muted);
+  border-radius: var(--radius);
+}
+
+.doc .exampleblock > .content,
+.doc details.result > .content {
+  border-color: var(--color-border);
+  border-radius: var(--radius);
+}
+
+/* ── Quoteblock ── */
+
+.doc .quoteblock,
+.doc .verseblock {
+  background: var(--color-bg-muted);
+  border-left-color: var(--color-border);
+  color: var(--color-text-muted);
+}
+
+/* ── Footer ── */
+
+footer.footer {
+  background: var(--color-bg-muted);
+  border-top: 1px solid var(--color-border-muted);
+  color: var(--color-text-faint);
+  font-size: 0.8125rem;
+  text-align: center;
+}
+
+footer.footer a {
+  color: var(--color-text-muted);
+}
+
+/* ── Pagination ── */
+
+nav.pagination {
+  border-top-color: var(--color-border-muted);
+}
+
+nav.pagination a {
+  color: var(--color-link);
+}
+
+nav.pagination span::before {
+  color: var(--color-text-faint);
+}
+
+/* ── Scrollbar ── */
+
+@media (pointer: fine) {
+  @supports (scrollbar-width: thin) {
+    html {
+      scrollbar-color: var(--color-border) var(--color-bg-muted);
+    }
+  }
+}
